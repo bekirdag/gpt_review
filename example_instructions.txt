@@ -1,0 +1,11 @@
+# Example instruction set for GPT‑Review
+The goal is to upgrade our Flask backend to Python 3.12,
+replace deprecated `flask.ext` imports, and add basic unit tests.
+
+Acceptance criteria:
+1. Code runs under Python 3.12 with zero warnings.
+2. All `flask.ext.*` imports migrated to standalone packages.
+3. `pytest -q` passes with ≥ 90 % coverage.
+
+Focus on one script per reply. Use the JSON patch schema.  
+Ask me to **continue** after each patch.

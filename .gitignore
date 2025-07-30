@@ -1,0 +1,6 @@
+# virtual env
+venv/
+# logs
+logs/
+# Chrome profile (can be large)
+.cache/

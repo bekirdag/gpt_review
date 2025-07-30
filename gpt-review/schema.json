@@ -1,0 +1,57 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GPT‑Review Patch (v3)",
+  "type": "object",
+  "required": ["op", "status"],
+  "additionalProperties": false,
+  "properties": {
+    "op": {
+      "type": "string",
+      "enum": ["create", "update", "delete", "rename", "chmod"],
+      "description": "Filesystem operation to perform"
+    },
+    "file": { "type": "string" },
+    "body": {
+      "type": "string",
+      "description": "Full text contents (UTF‑8). Mutually exclusive with body_b64."
+    },
+    "body_b64": {
+      "type": "string",
+      "description": "Base64‑encoded bytes for binary files."
+    },
+    "target": { "type": "string", "description": "New path when op==rename" },
+    "mode": {
+      "type": "string",
+      "pattern": "^[0-7]{3,4}$",
+      "description": "Octal chmod value when op==chmod (e.g. \"755\")"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["in_progress", "completed"],
+      "description": "Signal if work continues after this patch"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "op": { "enum": ["create", "update"] } } },
+      "then": {
+        "oneOf": [
+          { "required": ["file", "body"] },
+          { "required": ["file", "body_b64"] }
+        ]
+      }
+    },
+    {
+      "if": { "properties": { "op": { "const": "delete" } } },
+      "then": { "required": ["file"] }
+    },
+    {
+      "if": { "properties": { "op": { "const": "rename" } } },
+      "then": { "required": ["file", "target"] }
+    },
+    {
+      "if": { "properties": { "op": { "const": "chmod" } } },
+      "then": { "required": ["file", "mode"] }
+    }
+  ]
+}

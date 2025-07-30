@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpt-review"
+version = "0.1.0"
+description = "Automated browser‑driven code‑review assistant for ChatGPT"
+authors = [{ name = "GPT‑Review", email = "opensource@gpt‑review.dev" }]
+license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.9"
+
+dependencies = [
+    "selenium>=4.21.0",
+    "webdriver-manager>=4.0.1",
+    "jsonschema>=4.22.0",
+    "gitpython>=3.1.43",
+    "requests>=2.32.3"
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=24.4.2",
+    "flake8>=7.0.0",
+    "pytest>=8.2.1",
+    "coverage>=7.5.3",
+    "pre-commit>=3.7.0"
+]
+
+[project.scripts]
+gpt-review = "review:main"
+
+[tool.setuptools]
+py-modules = ["review", "apply_patch", "patch_validator", "logger"]
+
+[tool.setuptools.package-data]
+gpt_review = ["schema.json"]
+
+[tool.black]
+line-length = 88
+
+[tool.flake8]
+max-line-length = 88
+extend-ignore = "E203,W503"
+exclude = [".git", "venv", ".cache", "build", "dist", "logs"]
