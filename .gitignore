@@ -1,6 +1,104 @@
-# virtual env
-venv/
-# logs
+###############################################################################
+# GPT‑Review ▸ Top‑level .gitignore
+###############################################################################
+# This file enumerates **local** artefacts that should never be committed to
+# the repository.  Each section is documented so contributors can understand
+# why a given pattern exists or can easily locate the correct category for
+# new ignores.
+#
+# The list follows “most‑specific‑to‑least” order: project‑specific entries
+# first, then generic Python / editor noise.
+###############################################################################
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  GPT‑Review runtime artefacts
+# ─────────────────────────────────────────────────────────────────────────────
+# State file for crash‑safe resume
+.gpt-review-state.json
+
+# Rotating logs
 logs/
-# Chrome profile (can be large)
+*.log
+
+# Persistent Chrome profile (can be GiBs)
 .cache/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  Python build / virtual environments
+# ─────────────────────────────────────────────────────────────────────────────
+# Virtualenvs
+venv/
+.env/
+.venv/
+# Poetry
+poetry.lock
+# PyInstaller
+dist/
+build/
+*.spec
+# Egg / Wheel metadata
+*.egg-info/
+*.egg
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  Test artefacts & coverage reports
+# ─────────────────────────────────────────────────────────────────────────────
+.tox/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  IDE / Editor folders
+# ─────────────────────────────────────────────────────────────────────────────
+# VS Code
+.vscode/
+# JetBrains
+.idea/
+# Sublime
+*.sublime-*
+# Eclipse / PyCharm
+*.iml
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  Operating‑system noise
+# ─────────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Icon?
+# Vim / Emacs swap files
+*~
+*.swp
+*.swo
+# Windows executables
+*.exe
+*.dll
+# MacOS quarantine metadata
+*.dmg
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  Compiled artefacts
+# ─────────────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.a
+*.o
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7.  Environment / secrets
+# ─────────────────────────────────────────────────────────────────────────────
+.env
+.env.*
+# Private keys
+*.pem
+*.key
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8.  Docker build context exclusions (mirrors .dockerignore)
+# ─────────────────────────────────────────────────────────────────────────────
+docker-build/
+# Build cache layers
+*.tar

@@ -1,11 +1,43 @@
-# Example instruction set for GPT‑Review
-The goal is to upgrade our Flask backend to Python 3.12,
-replace deprecated `flask.ext` imports, and add basic unit tests.
+===============================================================================
+🎯  PROJECT GOAL
+===============================================================================
+Modernise the code‑base for **Python 3.12**, achieving 90 % pytest coverage and
+eliminating all `DeprecationWarning`s.
 
-Acceptance criteria:
-1. Code runs under Python 3.12 with zero warnings.
-2. All `flask.ext.*` imports migrated to standalone packages.
-3. `pytest -q` passes with ≥ 90 % coverage.
+* Migrated libraries:
+    - `flask.ext.*`            ➔  replace with standalone packages
+    - `asyncio.get_event_loop` ➔  use `asyncio.run`
+    - Any `asyncio.coroutine`  ➔  native `async def`
 
-Focus on one script per reply. Use the JSON patch schema.  
-Ask me to **continue** after each patch.
+* CI target in `.github/workflows/ci.yml` *must* pass green with:
+      python-version: ["3.10", "3.11", "3.12"]
+
+-------------------------------------------------------------------------------
+🔨  ACCEPTANCE CRITERIA
+-------------------------------------------------------------------------------
+1.  `pytest -q` reports **≥ 90 % coverage**.
+2.  No warnings when running tests under **Python 3.12**.
+3.  `flake8` passes with **zero** errors or warnings.
+4.  All existing CLI commands keep identical behaviour (BC‑safe).
+
+-------------------------------------------------------------------------------
+📋  WORKFLOW RULES
+-------------------------------------------------------------------------------
+* **One JSON patch per reply** – see schema below.
+* Work *one file at a time* (commit history must stay readable).
+* **After sending a patch, ask me to _continue_** before proceeding.
+* After each patch, set `"status": "in_progress"` until the **last** patch,
+  then use `"status": "completed"`.
+
+```jsonc
+{ "op": "create|update|delete|rename|chmod",
+  "file": "path/inside/repo",
+  // create / update
+  "body": "full file contents",
+  "body_b64": "<base64>",    // optional binary
+  // rename
+  "target": "new/path",
+  // chmod
+  "mode": "755",
+  "status": "in_progress|completed"
+}

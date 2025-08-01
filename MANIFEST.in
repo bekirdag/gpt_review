@@ -1,3 +1,49 @@
+###############################################################################
+# GPT‑Review ▸ Source distribution manifest
+###############################################################################
+# This file defines **additional** files to include in the *sdist* (tar.gz)
+# built by `python -m build` or `pip install .`.
+#
+# Wheel (`.whl`) contents are governed by `pyproject.toml`:
+#     [tool.setuptools.package-data]
+# But *sdist* needs explicit `include` directives – otherwise non‑Python data
+# (LICENSE, docs, JSON schemas) may be missing for downstream users.
+#
+# Guideline:  Include **everything required to run tests or use the package**.
+###############################################################################
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  Licensing & docs (root files)
+# ─────────────────────────────────────────────────────────────────────────────
 include LICENSE
 include README.md
-include gpt_review/schema.json
+include CHANGELOG.md          # ← added
+include CONTRIBUTING.md
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  JSON schema shipped with the package
+# ─────────────────────────────────────────────────────────────────────────────
+recursive-include gpt_review *.json
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  Example instruction and env files
+# ─────────────────────────────────────────────────────────────────────────────
+include example_instructions.txt
+include .env.example
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  Shell helper script
+# ─────────────────────────────────────────────────────────────────────────────
+include software_review.sh     # ← added
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  Tests (so downstream packagers can run pytest)
+# ─────────────────────────────────────────────────────────────────────────────
+recursive-include tests *.py
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  Exclude local rubbish just in case
+# ─────────────────────────────────────────────────────────────────────────────
+global-exclude *.pyc
+global-exclude __pycache__/
+global-exclude *.log

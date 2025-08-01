@@ -1,15 +1,81 @@
+###############################################################################
+# GPT‑Review ▸ Pre‑Commit Hook Configuration
+###############################################################################
+# Why use pre‑commit?
+# -------------------
+# • Ensures that every commit is *auto‑formatted* (Black) and *lint‑clean*
+#   (flake8) before it reaches the remote repository.
+# • Catches trailing whitespace, missing EOF newlines, and other trivial
+#   issues so CI has an easier job and reviews stay focused on logic.
+#
+# Global notes
+# ------------
+# • The exact tag (`rev`) is **pinned** for each repo to guarantee
+#   reproducible local environments and CI runs.
+# • Additional hooks can be added easily; see <https://pre-commit.com/>.
+###############################################################################
+
 repos:
+  # -------------------------------------------------------------------------
+  # 1.  psf/black – uncompromising code formatter
+  # -------------------------------------------------------------------------
   - repo: https://github.com/psf/black
     rev: 24.4.2
     hooks:
       - id: black
-        language_version: python3
+        name: "Black – Python code formatter"
+        language_version: python3            # uses whichever python is in PATH
+        args: ["--safe"]                     # skip if file would be reformatted
+
+  # -------------------------------------------------------------------------
+  # 2.  isort – import sorting (run *before* Black)
+  # -------------------------------------------------------------------------
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        name: "isort – import order sorter"
+        additional_dependencies: ["isort[colors]"]
+
+  # -------------------------------------------------------------------------
+  # 3.  flake8 – static analysis / lint
+  # -------------------------------------------------------------------------
   - repo: https://github.com/pycqa/flake8
     rev: 7.0.0
     hooks:
       - id: flake8
+        name: "flake8 – style & quality"
+        additional_dependencies:
+          - flake8-bugbear
+          - flake8-bandit
+        # Colourful output when run manually
+        args: ["--color", "always"]
+
+  # -------------------------------------------------------------------------
+  # 4.  pre‑commit-hooks – tiny universal sanity checks
+  # -------------------------------------------------------------------------
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
     hooks:
-      - id: end-of-file-fixer
-      - id: trailing-whitespace
+      - id: end-of-file-fixer           # ensure \n at EOF
+      - id: trailing-whitespace         # strip trailing spaces/tabs
+      - id: check-added-large-files     # warn on >500 KB blobs
+
+  # -------------------------------------------------------------------------
+  # 5.  codespell – simple typo checker (docs & comments)
+  # -------------------------------------------------------------------------
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.0
+    hooks:
+      - id: codespell
+        name: "codespell – spell checker"
+        args: ["--ignore-words-list=te,ht", "--skip=\"*.png,*.svg\""]
+
+###############################################################################
+# Hook ordering notes
+# -------------------
+# 1. isort      – reorder imports (may rewrite code)
+# 2. black      – final formatter
+# 3. flake8     – lint **after** formatting
+# 4. misc hooks – whitespace, eof, etc.
+###############################################################################

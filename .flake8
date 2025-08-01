@@ -1,4 +1,57 @@
+###############################################################################
+# GPT‑Review ▸ Flake8 configuration
+###############################################################################
+# Style decisions
+# ---------------
+# * **max‑line‑length 88**   – matches *Black* auto‑formatter.
+# * **E203 / W503 ignored** – recommended by Black’s documentation because
+#   its wrapping strategy intentionally violates those two pep8 checks.
+#
+# Quality gates
+# -------------
+# * `select = C,E,F,W,B,B9` enables:
+#       C  – McCabe complexity
+#       E/W– PEP8 error / warning
+#       F  – pyflakes
+#       B  – flake‑bugbear
+#       B9 – flake‑bandit security checks
+#
+# * `per‑file‑ignores` turns off Bandit’s assertion‑usage rule (S101)
+#   in test modules, where `assert` is expected.
+#
+# Output tweaks
+# -------------
+# * `count = True`      – display total number of issues
+# * `statistics = True` – group counts per error code
+# * `show‑source = True`– print the offending line of code
+###############################################################################
+
 [flake8]
+# Formatting
 max-line-length = 88
-extend-ignore = E203, W503  # keep Black & Flake8 happy together
-exclude = .git, venv, .cache, build, dist, logs
+extend-ignore = E203, W503, E501   # allow long lines in docstrings/comments
+
+# What to lint
+exclude =
+    .git,
+    venv,
+    .cache,
+    build,
+    dist,
+    logs,
+    __pycache__,
+    *.egg-info,
+    .tox,
+    .pytest_cache
+
+# Rulesets
+select = C,E,F,W,B,B9
+
+# Per‑file overrides
+per-file-ignores =
+    tests/*:S101
+
+# Output verbosity
+count = True
+statistics = True
+show-source = True

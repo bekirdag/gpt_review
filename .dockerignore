@@ -1,9 +1,59 @@
+###############################################################################
+# GPT‑Review ▸ Docker build context filter
+###############################################################################
+# The entries below are *excluded* from the build context sent to the Docker
+# daemon.  Smaller context = faster builds & less cache invalidation.
+#
+# Rationale for exclusions
+# ------------------------
+# • Git repository metadata      → not needed at runtime, large.
+# • Python virtual environments  → host‑specific binaries.
+# • CI artefacts / coverage      → irrelevant for production image.
+# • Editor temp files            → clutter.
+# • Local cache & logs           → keep image lean.
+###############################################################################
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Source‑control & build artefacts
+# ─────────────────────────────────────────────────────────────────────────────
 .git/
-venv/
-.cache/
-logs/
+.gitignore
+.github/
+
+# Python distribution / build
 build/
 dist/
+*.egg-info/
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Runtime artefacts (local only)
+# ─────────────────────────────────────────────────────────────────────────────
+venv/
+.env
+.cache/
+logs/
+*.log
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Testing artefacts
+# ─────────────────────────────────────────────────────────────────────────────
+.coverage
+htmlcov/
+.tox/
+.pytest_cache/
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Python __pycache__ folders
+# ─────────────────────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Editor / OS noise
+# ─────────────────────────────────────────────────────────────────────────────
+*.swp
+*.swo
+*~
 .DS_Store
+Thumbs.db
+Icon?

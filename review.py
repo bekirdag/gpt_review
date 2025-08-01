@@ -1,32 +1,29 @@
 #!/usr/bin/env python3
 """
 ===============================================================================
-GPT‑Review – Browser‑driven *edit → run → fix* loop
+GPT‑Review ▸ Main Driver
 ===============================================================================
 
-This driver automates a conversation with ChatGPT to iteratively patch a
-local **Git** repository:
+Automates an **edit → run → fix** conversation between you and ChatGPT.
 
-1. Show ChatGPT your *instructions*.
-2. Receive exactly **one JSON patch** per reply (see schema in README).
-3. Apply the patch, commit it, and **optionally run a shell command**
-   (tests, linter, build, …).
-4. If the command fails, send the *full* log back to ChatGPT and loop.
-5. When the command passes **and** ChatGPT sets `"status": "completed"`,
-   the session ends.
+Flow
+----
+1. Present *instructions* to ChatGPT.
+2. Receive **one JSON patch** per reply (see README for schema).
+3. Apply the patch to a Git repository & commit.
+4. Optionally run *any shell command* (tests, linter, build, …).
+5. If the command fails, send the full log back to ChatGPT.
+6. Repeat until the command passes **and** `"status": "completed"`.
 
-Key features
-------------
-* **All patch ops** – create, update, delete, rename, chmod, binary support.
-* **Big‑log chunking** – splits failing output into safe 15 kB chunks.
-* **Code‑fence tolerant** – accepts ```json … ``` wrappers.
-* **Crash‑safe resume** – survives browser/VM crashes (state file).
-* **Daily‑rotating logs** – see `logger.py`.
-* **Multi‑arch / auto‑driver** – uses *webdriver‑manager*.
+Extra rule (added 2025‑08‑01)
+-----------------------------
+*ChatGPT must:*
 
--------------------------------------------------------------------------------
+* deliver **one script per answer** (chunk‑by‑chunk),
+* explicitly ask the user to **continue** before proceeding.
+
+These constraints ensure deterministic patching and a clean Git history.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -53,35 +50,34 @@ from webdriver_manager.chrome import ChromeDriverManager
 from logger import get_logger
 from patch_validator import validate_patch
 
-# -----------------------------------------------------------------------------
-# Constants
-# -----------------------------------------------------------------------------
+# ════════════════════════════════════════════════════════════════════════════
+# Globals & constants
+# ════════════════════════════════════════════════════════════════════════════
 CHAT_URL: str = "https://chat.openai.com/"
-WAIT_UI: int = 90                     # seconds to wait for chat UI / replies
-CHUNK_SIZE: int = 15_000              # characters per error‑log message
-RETRIES: int = 3                      # browser action retries
+WAIT_UI: int = 90                     # Seconds to wait for UI / replies
+CHUNK_SIZE: int = 15_000              # Error‑log chunk size
+RETRIES: int = 3                      # Browser action retries
 STATE_FILE: str = ".gpt-review-state.json"
 
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
-log = get_logger()                    # daily rotating file + console
+EXTRA_RULES: str = (
+    "Your fixes must be **chunk by chunk**. "
+    "Provide a fix for **one script only** in each answer. "
+    "Ask me to **continue** when you are done with one script."
+)
 
+ROOT = Path(__file__).resolve().parent
+log = get_logger(__name__)
 
-# =============================================================================
-# Utility ‑ Git state persistence
-# =============================================================================
-def _state_path(repo: Path) -> Path:
-    """
-    Returns the path to the JSON state file inside *repo*.
-    """
+# ════════════════════════════════════════════════════════════════════════════
+# State helpers – crash‑safe resume
+# ════════════════════════════════════════════════════════════════════════════
+def _state_path(repo: Path) -> Path:  # noqa: D401
+    """Return path of the persistent state‑file inside *repo*."""
     return repo / STATE_FILE
 
 
 def _load_state(repo: Path) -> Optional[dict]:
-    """
-    Load the previous session state if it exists, otherwise **None**.
-    """
+    """Load state‑file if present, else *None*."""
     try:
         return json.loads(_state_path(repo).read_text())
     except FileNotFoundError:
@@ -89,9 +85,7 @@ def _load_state(repo: Path) -> Optional[dict]:
 
 
 def _current_commit(repo: Path) -> str:
-    """
-    Return HEAD commit SHA as a short string.
-    """
+    """Return SHA of HEAD commit in *repo*."""
     return (
         subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"])
         .decode()
@@ -99,12 +93,10 @@ def _current_commit(repo: Path) -> str:
     )
 
 
-def _save_state(repo: Path, conversation_url: str) -> None:
-    """
-    Persist conversation URL and last commit SHA to the state file.
-    """
+def _save_state(repo: Path, url: str) -> None:
+    """Write resume metadata to disk."""
     data = {
-        "conversation_url": conversation_url,
+        "conversation_url": url,
         "last_commit": _current_commit(repo),
         "timestamp": int(time.time()),
     }
@@ -112,34 +104,25 @@ def _save_state(repo: Path, conversation_url: str) -> None:
 
 
 def _clear_state(repo: Path) -> None:
-    """
-    Remove the state file (called on normal completion).
-    """
+    """Delete state‑file if it exists."""
     try:
         _state_path(repo).unlink()
     except FileNotFoundError:
         pass
 
 
-# =============================================================================
+# ════════════════════════════════════════════════════════════════════════════
 # Selenium helpers
-# =============================================================================
+# ════════════════════════════════════════════════════════════════════════════
 def _chrome_driver() -> webdriver.Chrome:
-    """
-    Configure and launch Chromium.
-
-    * Uses `webdriver‑manager` to auto‑download the correct chromedriver.
-    * Respects environment variables:
-        - `GPT_REVIEW_PROFILE`   – Chrome user‑data dir
-        - `GPT_REVIEW_HEADLESS`  – any value → headless mode
-    """
-    profile_dir = Path(
+    """Launch Chromium with a persistent profile (headless‑optional)."""
+    profile = Path(
         os.getenv("GPT_REVIEW_PROFILE", "~/.cache/gpt-review/chrome")
     ).expanduser()
-    profile_dir.parent.mkdir(parents=True, exist_ok=True)
+    profile.parent.mkdir(parents=True, exist_ok=True)
 
     opts = Options()
-    opts.add_argument(f"--user-data-dir={profile_dir}")
+    opts.add_argument(f"--user-data-dir={profile}")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
     if os.getenv("GPT_REVIEW_HEADLESS"):
@@ -150,9 +133,7 @@ def _chrome_driver() -> webdriver.Chrome:
 
 
 def _retry(action, what: str):
-    """
-    Retry *action* (callable) up to RETRIES times with exponential back‑off.
-    """
+    """Retry *action* up to RETRIES times with exponential back‑off."""
     pause = 2
     for attempt in range(1, RETRIES + 1):
         try:
@@ -166,9 +147,7 @@ def _retry(action, what: str):
 
 
 def _wait_textarea(drv) -> None:
-    """
-    Block until the chat textarea is present (also waits through login).
-    """
+    """Block until chat textarea appears (user may need to sign‑in)."""
     while True:
         try:
             WebDriverWait(drv, 5).until(
@@ -176,49 +155,46 @@ def _wait_textarea(drv) -> None:
             )
             return
         except WebDriverException:
-            log.info("Waiting for user to log in to chat.openai.com …")
+            log.info("Waiting for user to sign in to ChatGPT …")
             time.sleep(5)
 
 
 def _send_message(drv, text: str) -> None:
-    """
-    Type *text* into ChatGPT and press ↵.
-    """
+    """Send *text* to ChatGPT (clears any previous draft)."""
+
     def _inner():
-        textarea = WebDriverWait(drv, 10).until(
+        area = WebDriverWait(drv, 10).until(
             EC.presence_of_element_located((By.TAG_NAME, "textarea"))
         )
-        textarea.clear()
-        textarea.send_keys(text)
-        textarea.send_keys(Keys.ENTER)
+        area.clear()
+        area.send_keys(text)
+        area.send_keys(Keys.ENTER)
 
     _retry(_inner, "send_message")
     log.debug("Sent %d chars", len(text))
 
 
-def _last_assistant_block(drv):
-    """
-    Returns the most recent assistant message WebElement or **None**.
-    """
-    messages = drv.find_elements(By.CSS_SELECTOR, "div[data-message-author-role='assistant']")
-    return messages[-1] if messages else None
+def _assistant_block(drv):
+    """Return the most recent assistant message element (or *None*)."""
+    blocks = drv.find_elements(
+        By.CSS_SELECTOR, "div[data-message-author-role='assistant']"
+    )
+    return blocks[-1] if blocks else None
 
 
-def _wait_for_assistant_reply(drv) -> str:
-    """
-    Wait until the assistant finishes streaming and return its full text.
-    """
+def _wait_reply(drv) -> str:
+    """Wait for ChatGPT to finish streaming and return the reply text."""
     _wait_textarea(drv)
     start = time.time()
-    last_text, last_change = "", time.time()
+    last_txt, last_change = "", time.time()
 
     while time.time() - start < WAIT_UI:
-        block = _last_assistant_block(drv)
+        block = _assistant_block(drv)
         if block:
             txt = block.text
-            if txt != last_text:
-                last_text, last_change = txt, time.time()
-            # consider done if no change for 2 seconds
+            if txt != last_txt:
+                last_txt, last_change = txt, time.time()
+            # 2 s of inactivity ≈ finished streaming
             if time.time() - last_change > 2:
                 return txt
         time.sleep(1)
@@ -226,24 +202,18 @@ def _wait_for_assistant_reply(drv) -> str:
     raise TimeoutError("Assistant reply timeout")
 
 
-# =============================================================================
-# Patch extraction (fence‑tolerant, balanced‑brace)
-# =============================================================================
+# ════════════════════════════════════════════════════════════════════════════
+# Patch extraction – code‑fence tolerant, balanced braces
+# ════════════════════════════════════════════════════════════════════════════
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.S)
 
 
 def _strip_fence(text: str) -> str:
-    """
-    Remove ```json … ``` or ``` … ``` wrappers if present.
-    """
     m = _FENCE_RE.search(text)
     return m.group(1) if m else text
 
 
 def _balanced_json(text: str) -> Optional[str]:
-    """
-    Return the first *balanced* JSON object substring or **None**.
-    """
     start = text.find("{")
     if start == -1:
         return None
@@ -271,11 +241,9 @@ def _balanced_json(text: str) -> Optional[str]:
     return None
 
 
-def _extract_patch(raw_text: str) -> Optional[dict]:
-    """
-    Parse and JSON‑schema‑validate the assistant reply.
-    """
-    blob = _balanced_json(_strip_fence(raw_text))
+def _extract_patch(raw: str) -> Optional[dict]:
+    """Return first valid JSON patch found in *raw* or *None*."""
+    blob = _balanced_json(_strip_fence(raw))
     if not blob:
         return None
     try:
@@ -285,15 +253,13 @@ def _extract_patch(raw_text: str) -> Optional[dict]:
         return None
 
 
-# =============================================================================
+# ════════════════════════════════════════════════════════════════════════════
 # Command execution helpers
-# =============================================================================
-def _run_command(cmd: str, repo: Path, timeout: int) -> Tuple[bool, str]:
-    """
-    Execute *cmd* inside *repo*; return (success, combined_output).
-    """
+# ════════════════════════════════════════════════════════════════════════════
+def _run_cmd(cmd: str, repo: Path, timeout: int) -> Tuple[bool, str]:
+    """Execute *cmd* in *repo*; return (success, combined output)."""
     try:
-        result = subprocess.run(
+        res = subprocess.run(
             cmd,
             cwd=repo,
             shell=True,
@@ -302,86 +268,63 @@ def _run_command(cmd: str, repo: Path, timeout: int) -> Tuple[bool, str]:
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
-        output = (exc.stdout or "") + (exc.stderr or "")
-        return False, f"TIMEOUT after {timeout}s\n{output}"
-    return result.returncode == 0, result.stdout + result.stderr
+        out = (exc.stdout or "") + (exc.stderr or "")
+        return False, f"TIMEOUT after {timeout}s\n{out}"
+    return res.returncode == 0, res.stdout + res.stderr
 
 
 def _chunk(text: str, size: int = CHUNK_SIZE) -> List[str]:
-    """
-    Split *text* into ≤ size‑byte chunks (at least one).
-    """
+    """Split *text* into ≤*size* chunks (never empty list)."""
     return [text[i : i + size] for i in range(0, len(text), size)] or [""]
 
 
-def _send_error_chunks(drv, command: str, log_text: str) -> None:
-    """
-    Post the failing command output back to ChatGPT in safe chunks.
-    """
-    pieces = _chunk(log_text)
+def _send_error_chunks(drv, cmd: str, output: str) -> None:
+    """Post failing log back to ChatGPT in safe‑sized chunks."""
+    chunks = _chunk(output)
     header = textwrap.dedent(
         f"""\
-        The command **{command}** failed (chunk 1/{len(pieces)}). Please fix.
+        The command **{cmd}** failed (chunk 1/{len(chunks)}). Please fix.
 
         ```text
-        {pieces[0]}
+        {chunks[0]}
         ```"""
     )
     _send_message(drv, header)
 
-    for index, part in enumerate(pieces[1:], start=2):
-        follow_up = f"Log chunk {index}/{len(pieces)}:\n```text\n{part}\n```"
-        _send_message(drv, follow_up)
+    for idx, part in enumerate(chunks[1:], start=2):
+        _send_message(drv, f"Log chunk {idx}/{len(chunks)}:\n```text\n{part}\n```")
 
 
-# =============================================================================
-# Main driver routine
-# =============================================================================
-def _parse_args() -> argparse.Namespace:
-    """
-    CLI argument parsing.
-    """
-    parser = argparse.ArgumentParser(prog="gpt-review")
-    parser.add_argument("instructions", help="Plain‑text instructions file")
-    parser.add_argument("repo", help="Path to a local Git repository")
-    parser.add_argument(
-        "--cmd",
-        help="Shell command to run after each patch (e.g. 'pytest -q')",
-    )
-    parser.add_argument(
-        "--auto",
-        action="store_true",
-        help="Auto‑send 'continue' (otherwise press <Enter> each time)",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=300,
-        help="Kill --cmd after N seconds (default: 300)",
-    )
-    return parser.parse_args()
+# ════════════════════════════════════════════════════════════════════════════
+# CLI parsing
+# ════════════════════════════════════════════════════════════════════════════
+def _cli_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="gpt-review")
+    p.add_argument("instructions", help="Plain‑text instructions file")
+    p.add_argument("repo", help="Path to Git repository")
+    p.add_argument("--cmd", help="Shell command to run after each patch")
+    p.add_argument("--auto", action="store_true", help="Auto‑send 'continue'")
+    p.add_argument("--timeout", type=int, default=300, help="Command timeout (s)")
+    return p.parse_args()
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Main routine
+# ════════════════════════════════════════════════════════════════════════════
 def main() -> None:
-    """
-    Program entry‑point. Orchestrates the whole review loop.
-    """
-    args = _parse_args()
+    args = _cli_args()
     repo = Path(args.repo).expanduser().resolve()
 
     if not (repo / ".git").exists():
-        sys.exit("❌  The path is not a git repository.")
+        sys.exit("❌ Not a git repository: " + str(repo))
 
-    # --------------------------------------------------------------------- #
-    # 1. Browser setup & resume / fresh conversation
-    # --------------------------------------------------------------------- #
     state = _load_state(repo)
     driver = _chrome_driver()
 
     try:
-        # -------------------- Resume path --------------------
+        # ── RESUME ─────────────────────────────────────────────────────────
         if state and state.get("last_commit") == _current_commit(repo):
-            log.info("Resuming previous session: %s", state['conversation_url'])
+            log.info("Resuming conversation: %s", state["conversation_url"])
             driver.get(state["conversation_url"])
             _wait_textarea(driver)
             if args.auto:
@@ -390,68 +333,65 @@ def main() -> None:
                 input("Press <Enter> to resume …")
                 _send_message(driver, "continue")
 
-        # -------------------- Fresh session ------------------
+        # ── FRESH SESSION ─────────────────────────────────────────────────
         else:
-            instructions = Path(args.instructions).read_text(encoding="utf-8").strip()
-            json_schema_blurb = (
+            instr = Path(args.instructions).read_text(encoding="utf-8").strip()
+            schema_blurb = (
                 '{ "op": "create|update|delete|rename|chmod", '
                 '"file": "...", "status": "in_progress|completed", ... }'
             )
-            initial_prompt = (
-                f"{instructions}\n\n"
+            prompt = (
+                f"{instr}\n\n"
                 "Work **one file at a time**.\n\n"
-                f"Return *exactly one* JSON object, no prose, matching:\n"
-                f"{json_schema_blurb}\n\n"
+                f"{EXTRA_RULES}\n\n"
+                f"Return *exactly* one JSON object (no extra text):\n{schema_blurb}\n\n"
                 "Use `status = in_progress` while patches remain, "
                 "`status = completed` when done."
             )
 
+            log.debug("Initial prompt built (length=%d chars)", len(prompt))
             driver.get(CHAT_URL)
             _wait_textarea(driver)
-            _send_message(driver, initial_prompt)
-
-            # Save the conversation URL for crash‑safe resume
+            _send_message(driver, prompt)
             _save_state(repo, driver.current_url)
 
-        # ---------------------------------------------------------------- #
-        # 2. Main loop: wait → patch → apply → test → continue / finish
-        # ---------------------------------------------------------------- #
+        # ── MAIN LOOP ─────────────────────────────────────────────────────
         while True:
-            assistant_reply = _wait_for_assistant_reply(driver)
-            patch = _extract_patch(assistant_reply)
+            reply = _wait_reply(driver)
+            patch = _extract_patch(reply)
 
             if not patch:
-                log.warning("No JSON patch found in assistant reply.")
+                log.warning("Assistant reply contained no valid patch.")
                 break
 
-            # Apply patch via auxiliary script (handles safety checks)
+            # Apply patch
             subprocess.run(
                 [
                     sys.executable,
-                    str(Path(__file__).with_name("apply_patch.py")),
+                    str(ROOT / "apply_patch.py"),
                     json.dumps(patch),
                     str(repo),
                 ],
                 check=True,
             )
 
-            # Optional: run user command
+            # Run command if provided
             if args.cmd:
-                success, output = _run_command(args.cmd, repo, args.timeout)
-                if not success:
+                ok, output = _run_cmd(args.cmd, repo, args.timeout)
+                if not ok:
                     _send_error_chunks(driver, args.cmd, output)
-                    continue  # ask ChatGPT to fix and loop again
+                    continue
 
-            # Persist state (conversation URL may change on refresh)
+            # Persist state after successful patch
             _save_state(repo, driver.current_url)
 
             # Finished?
             if patch["status"] == "completed":
-                log.info("🎉  Session completed successfully.")
+                log.info("🎉 All done – tests pass and status=completed.")
                 _clear_state(repo)
                 break
 
-            # Otherwise, request next chunk
+            # Next chunk
             if args.auto:
                 _send_message(driver, "continue")
             else:
@@ -463,8 +403,8 @@ def main() -> None:
             driver.quit()
 
 
-# =============================================================================
+# ════════════════════════════════════════════════════════════════════════════
 # CLI entry‑point
-# =============================================================================
+# ════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     main()

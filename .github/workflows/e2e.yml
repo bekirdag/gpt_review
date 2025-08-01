@@ -1,43 +1,124 @@
-name: End‑to‑End Smoke Test
+# =============================================================================
+# GPT‑Review ▸ End‑to‑End Smoke Test
+# =============================================================================
+#
+# Purpose
+# -------
+# * Launch a **real headless Chromium** via Selenium to guarantee that:
+#     • `webdriver‑manager` can download a matching chromedriver
+#     • The helper `_chrome_driver()` returns a usable driver
+#
+# * Runs on pull‑requests **and** pushes to `main`.
+# * Keeps the workflow lean – no unit tests or linting here (see ci.yml).
+#
+# Rationale
+# ---------
+# The most fragile integration point is the browser automation layer.  Unit
+# tests cannot detect driver‑version mismatches, so we spin up an isolated
+# browser session in CI.  If it fails here, it would fail for end‑users.
+#
+# Implementation notes
+# --------------------
+# • `xvfb-run` provides a virtual X11 display so Chromium’s headless mode
+#   works reliably in GitHub’s Ubuntu runners.
+# • We pin Python 3.12 (latest stable) – matrix is overkill for smoke.
+# =============================================================================
+
+name: E2E Smoke Test
 
 on:
   pull_request:
   push:
     branches: [ main ]
 
+concurrency:
+  group: e2e-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
-  e2e:
+  smoke:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
-      - uses: actions/checkout@v4
+      # -----------------------------------------------------------------------
+      # 0.  Banner
+      # -----------------------------------------------------------------------
+      - name: "🔔  Begin End‑to‑End smoke test"
+        run: echo "👉  Starting E2E browser launch smoke test …"
 
-      - name: Install system deps
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends \
-               chromium-browser xvfb
+      # -----------------------------------------------------------------------
+      # 1.  Checkout repository
+      # -----------------------------------------------------------------------
+      - name: "⬇️  Checkout code"
+        uses: actions/checkout@v4
 
-      - name: Set up Python
+      # -----------------------------------------------------------------------
+      # 2.  Install Python
+      # -----------------------------------------------------------------------
+      - name: "🐍  Set up Python 3.12"
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install package (editable)
+      # -----------------------------------------------------------------------
+      # 3.  Cache pip downloads
+      # -----------------------------------------------------------------------
+      - name: "📦  Cache pip"
+        id: pip-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: >-
+            pip-e2e-${{ runner.os }}-
+            ${{ hashFiles('pyproject.toml') }}
+
+      # -----------------------------------------------------------------------
+      # 4.  Install package (editable mode)
+      # -----------------------------------------------------------------------
+      - name: "📥  Install GPT‑Review"
         run: |
           python -m pip install --upgrade pip
-          pip install .  # pulls selenium + webdriver‑manager
+          pip install .[dev]
 
-      - name: Launch Selenium in headless Xvfb (sanity check)
+      # -----------------------------------------------------------------------
+      # 5.  Install system packages – Chromium + Xvfb
+      # -----------------------------------------------------------------------
+      - name: "🖥️  Install Chromium & Xvfb"
         run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends chromium-browser xvfb
+          chromium-browser --version
+
+      # -----------------------------------------------------------------------
+      # 6.  Launch Selenium inside Xvfb
+      # -----------------------------------------------------------------------
+      - name: "🚀  Start headless browser via selenium"
+        env:
+          GPT_REVIEW_HEADLESS: "1"      # force headless
+        run: |
+          echo "::group::Python smoke test script"
           xvfb-run -a python - <<'PY'
-          from review import chrome_driver
-          drv = chrome_driver()        # webdriver‑manager auto‑installs driver
-          print("[OK] Selenium opened Chromium:", drv.capabilities["browserVersion"])
-          drv.quit()
-          PY
+          from review import _chrome_driver
+          import logging, sys
+          logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
-      - name: Run unit tests
-        run: |
-          pip install pytest coverage
-          coverage run -m pytest -q
-          coverage report -m
+          try:
+              drv = _chrome_driver()
+              logging.info("Browser launched – version: %s", drv.capabilities["browserVersion"])
+              logging.info("Driver version:  %s", drv.capabilities["chrome"]["chromedriverVersion"].split(' ')[0])
+              drv.get("https://www.example.com")
+              logging.info("Page title fetched successfully: %s", drv.title)
+              drv.quit()
+              logging.info("✅  Selenium smoke test passed")
+          except Exception as exc:
+              logging.exception("❌  Selenium smoke test failed: %s", exc)
+              sys.exit(1)
+          PY
+          echo "::endgroup::"
+
+      # -----------------------------------------------------------------------
+      # 7.  Success banner
+      # -----------------------------------------------------------------------
+      - name: "✅  E2E smoke test finished"
+        run: echo "🎉  Browser layer looks good!"
