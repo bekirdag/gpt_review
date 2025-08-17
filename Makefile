@@ -4,12 +4,12 @@
 # Requirements
 # ------------
 # • GNU Make (pre‑installed on most Unix‑like systems)
-# • Python 3.9 +  (virtual‑env optional but recommended)
+# • Python 3.9+  (virtual‑env optional but recommended)
 #
 # Colours
 # -------
 # We add a minimal colour helper ($(C_INFO), $(C_OK), …) to make the output
-# readable.  Falls back to plain text when stdout is not a TTY.
+# readable. Falls back to plain text when stdout is not a TTY.
 ###############################################################################
 
 ifndef NO_COLOR
@@ -26,7 +26,7 @@ C_ERR  :=
 C_END  :=
 endif
 
-# Virtual‑env directory (customise via `make VENV=.venv install`)
+# Virtual‑env directory (customise via: make VENV=.venv install)
 VENV ?= venv
 PIP = $(VENV)/bin/pip
 PY  = $(VENV)/bin/python
@@ -34,20 +34,23 @@ PY  = $(VENV)/bin/python
 # Where coverage writes HTML report
 COV_HTML := htmlcov/index.html
 
-.PHONY: help install lint test cov e2e clean docker
+# Default instruction file for examples / docker-run (inside repo root)
+INSTR ?= example_instructions.txt
+
+.PHONY: help install fmt precommit lint test cov e2e smoke login docker docker-run changelog clean
 
 # ---------------------------------------------------------------------------#
 # Default target
 # ---------------------------------------------------------------------------#
-help:
+help: ## Show this help
 	@echo "$(C_INFO)Available targets:$(C_END)"
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[32m%-10s\033[0m %s\n", $$1, $$2}'
+		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[32m%-12s\033[0m %s\n", $$1, $$2}'
 
 # ---------------------------------------------------------------------------#
 # Environment setup
 # ---------------------------------------------------------------------------#
-$(VENV)/bin/activate: pyproject.toml ## Create a virtualenv and install deps
+$(VENV)/bin/activate: pyproject.toml ## Create a virtualenv and install dev deps
 	@echo "$(C_INFO)[env] Creating venv '$(VENV)'$(C_END)"
 	python -m venv $(VENV)
 	$(PIP) install --upgrade pip
@@ -58,8 +61,20 @@ install: $(VENV)/bin/activate ## Alias for env creation
 	@echo "$(C_OK)✓ Environment ready$(C_END)"
 
 # ---------------------------------------------------------------------------#
-# Static analysis
+# Formatting & static analysis
 # ---------------------------------------------------------------------------#
+fmt: $(VENV)/bin/activate ## Run isort → black
+	@echo "$(C_INFO)[fmt] Sorting imports (isort) …$(C_END)"
+	$(VENV)/bin/isort .
+	@echo "$(C_INFO)[fmt] Formatting code (black) …$(C_END)"
+	$(VENV)/bin/black .
+	@echo "$(C_OK)✓ Formatting complete$(C_END)"
+
+precommit: $(VENV)/bin/activate ## Run all pre‑commit hooks locally
+	@echo "$(C_INFO)[pre-commit] Running hooks …$(C_END)"
+	$(VENV)/bin/pre-commit run --all-files --show-diff-on-failure
+	@echo "$(C_OK)✓ Hooks passed$(C_END)"
+
 lint: $(VENV)/bin/activate ## Run flake8 + codespell
 	@echo "$(C_INFO)[lint] Running flake8 …$(C_END)"
 	$(VENV)/bin/flake8
@@ -91,7 +106,7 @@ from logger import get_logger
 log = get_logger("e2e")
 try:
     drv = _chrome_driver()
-    log.info("Browser version: %s", drv.capabilities["browserVersion"])
+    log.info("Browser version: %s", getattr(drv, "capabilities", {}).get("browserVersion"))
     drv.get("https://example.com")
     log.info("Page title: %s", drv.title)
     drv.quit()
@@ -102,17 +117,64 @@ except Exception as exc:
 PY
 
 # ---------------------------------------------------------------------------#
+# Quick CLI sanity checks
+# ---------------------------------------------------------------------------#
+smoke: $(VENV)/bin/activate ## Check CLI entrypoints (version/help)
+	@echo "$(C_INFO)[smoke] python -m gpt_review --version$(C_END)"
+	@$(PY) -m gpt_review --version
+	@echo "$(C_INFO)[smoke] gpt-review --help$(C_END)"
+	@$(VENV)/bin/gpt-review --help >/dev/null && echo "$(C_OK)✓ CLI help ok$(C_END)"
+
+# ---------------------------------------------------------------------------#
+# Login helper
+# ---------------------------------------------------------------------------#
+login: ## Open visible browser for cookie login (respects GPT_REVIEW_LOGIN_URL)
+	@echo "$(C_INFO)[login] Opening browser for cookie login …$(C_END)"
+	@bash cookie_login.sh
+
+# ---------------------------------------------------------------------------#
 # Docker helpers
 # ---------------------------------------------------------------------------#
-docker: ## Build local docker image
+docker: ## Build local Docker image
 	@echo "$(C_INFO)[docker] Building Docker image 'gpt-review:latest' …$(C_END)"
 	docker build -t gpt-review .
 	@echo "$(C_OK)✓ Docker image built$(C_END)"
+
+docker-run: ## Run Docker image (mount profile & current repo); set INSTR=path if needed
+	@echo "$(C_INFO)[docker] Running container with mounted workspace …$(C_END)"
+	@echo "$(C_INFO)      INSTR file: $(INSTR) (must be inside repo)$(C_END)"
+	@docker run -it --rm \
+		-v "$(HOME)/.cache/gpt-review/chrome:/home/nonroot/.cache/chrome" \
+		-v "$(PWD)":/workspace \
+		gpt-review "/workspace/$(INSTR)" "/workspace" --cmd "pytest -q" --auto
+
+# ---------------------------------------------------------------------------#
+# Changelog helper
+# ---------------------------------------------------------------------------#
+changelog: ## Print “Unreleased” (or latest) section from CHANGELOG.md
+	@echo "$(C_INFO)[changelog] Printing 'Unreleased' (or latest) section from CHANGELOG.md …$(C_END)"
+	@python3 - <<'PY'
+import re, sys, pathlib
+p = pathlib.Path("CHANGELOG.md")
+if not p.exists():
+    print("CHANGELOG.md not found", file=sys.stderr)
+    sys.exit(1)
+text = p.read_text(encoding="utf-8")
+# Prefer the Unreleased section; otherwise fall back to the first release entry.
+m = re.search(r"^##\s+\[Unreleased\].*?(?=^##\s+\[|\Z)", text, re.M | re.S)
+if not m:
+    m = re.search(r"^##\s+\[[^\]]+\].*?(?=^##\s+\[|\Z)", text, re.M | re.S)
+if not m:
+    print("No sections found in CHANGELOG.md", file=sys.stderr)
+    sys.exit(1)
+print(m.group(0).rstrip())
+PY
+	@echo "$(C_OK)✓ Done$(C_END)"
 
 # ---------------------------------------------------------------------------#
 # Clean artefacts
 # ---------------------------------------------------------------------------#
 clean: ## Remove Python cache, coverage & build artefacts
-	rm -rf $(VENV) __pycache__ .pytest_cache .coverage htmlcov build dist *.egg-info
-	find . -name '*.py[cod]' -delete
+	@rm -rf $(VENV) __pycache__ .pytest_cache .coverage htmlcov build dist *.egg-info
+	@find . -name '*.py[cod]' -delete
 	@echo "$(C_OK)✓ Cleaned$(C_END)"

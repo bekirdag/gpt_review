@@ -5,12 +5,12 @@ Unit‑tests for *review._extract_patch*
 
 Scope
 -----
-* Verify that JSON patches are correctly extracted from messy assistant
-  replies, including:
-    • Wrapped in ```json … ``` fences
-    • Curly‑braces inside quoted strings
-    • Multiple JSON objects (first one wins)
-    • Replies without JSON → **None**
+Verify that JSON patches are correctly extracted from messy assistant replies,
+including:
+  • Wrapped in ```json … ``` fences
+  • Curly‑braces inside quoted strings
+  • Multiple JSON objects (first one wins)
+  • Replies without JSON → **None**
 """
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
-def _patch_dict(**kwargs) -> dict:
+def _patch_dict(**overrides) -> dict:
     """
     Return a *minimal valid* patch dict merged with overrides.
     """
@@ -40,15 +40,18 @@ def _patch_dict(**kwargs) -> dict:
         "body": "console.log('{a:1}');",
         "status": "in_progress",
     }
-    base.update(kwargs)
+    base.update(overrides)
     return base
 
 
 def _fence(txt: str, lang: str = "") -> str:
     """
-    Wrap *txt* inside triple‑backtick fences, optional language label.
+    Wrap *txt* inside triple‑backtick fences, with an optional language label.
+    Example: _fence('{"a":1}', 'json') → ```json\n{"a":1}\n```
     """
-    return f"```{lang}\n{txt}\n```"
+    lang = (lang or "").strip()
+    label = lang if lang else ""
+    return f"```{label}\n{txt}\n```"
 
 
 # =============================================================================
@@ -67,7 +70,7 @@ def test_code_fence_extraction():
 
         ASKING‑FOR‑CONTINUE
         """
-    )
+    ).strip()
     result = extract_patch(reply)
     assert result == patch
     log.info("Code‑fence extraction passed.")
@@ -81,6 +84,7 @@ def test_braces_inside_strings():
     patch = _patch_dict(body=body)
     reply = _fence(json.dumps(patch))
     result = extract_patch(reply)
+    assert result is not None
     assert result["body"] == body
     log.info("Balanced‑brace parser handles inner braces.")
 
@@ -93,6 +97,7 @@ def test_multiple_json_objects():
     second = _patch_dict(file="b.txt")
     reply = f"{_fence(json.dumps(first))}\n\nSome text\n\n{_fence(json.dumps(second))}"
     result = extract_patch(reply)
+    assert result is not None
     assert result["file"] == "a.txt"
     log.info("First JSON object wins as expected.")
 
@@ -108,7 +113,7 @@ def test_no_json_returns_none():
 
 def test_invalid_json_fails_gracefully():
     """
-    Malformed JSON should return **None** (extractor logs error).
+    Malformed JSON should return **None** (extractor logs an error).
     """
     broken = "{ this is : not json }"
     reply = _fence(broken)

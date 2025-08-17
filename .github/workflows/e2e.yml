@@ -1,30 +1,29 @@
 # =============================================================================
-# GPT‑Review ▸ End‑to‑End Smoke Test
+# GPT‑Review ▸ End‑to‑End Smoke Test
 # =============================================================================
 #
 # Purpose
 # -------
-# * Launch a **real headless Chromium** via Selenium to guarantee that:
-#     • `webdriver‑manager` can download a matching chromedriver
+# * Launch a **real headless Chrome** via Selenium to guarantee that:
+#     • `webdriver-manager` can download a matching chromedriver
 #     • The helper `_chrome_driver()` returns a usable driver
+# * Add resilience + observability:
+#     • Cache webdriver-manager downloads
+#     • Retry browser launch on transient failures
+#     • Append a compact, useful Job Summary
 #
-# * Runs on pull‑requests **and** pushes to `main`.
-# * Keeps the workflow lean – no unit tests or linting here (see ci.yml).
+# Triggers
+# --------
+# * Runs on pull‑requests and pushes to `main`.
 #
-# Rationale
-# ---------
-# The most fragile integration point is the browser automation layer.  Unit
-# tests cannot detect driver‑version mismatches, so we spin up an isolated
-# browser session in CI.  If it fails here, it would fail for end‑users.
-#
-# Implementation notes
-# --------------------
-# • `xvfb-run` provides a virtual X11 display so Chromium’s headless mode
-#   works reliably in GitHub’s Ubuntu runners.
-# • We pin Python 3.12 (latest stable) – matrix is overkill for smoke.
+# Notes
+# -----
+# • We install **Google Chrome Stable** using `browser-actions/setup-chrome`.
+# • Headless "new" mode does not require X11, but we keep xvfb available
+#   in case the browser switches to non‑headless due to flags in the future.
 # =============================================================================
 
-name: E2E Smoke Test
+name: E2E Smoke Test
 
 on:
   pull_request:
@@ -70,11 +69,10 @@ jobs:
         with:
           path: ~/.cache/pip
           key: >-
-            pip-e2e-${{ runner.os }}-
-            ${{ hashFiles('pyproject.toml') }}
+            pip-e2e-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
 
       # -----------------------------------------------------------------------
-      # 4.  Install package (editable mode)
+      # 4.  Install package (editable mode + dev extras)
       # -----------------------------------------------------------------------
       - name: "📥  Install GPT‑Review"
         run: |
@@ -82,33 +80,102 @@ jobs:
           pip install .[dev]
 
       # -----------------------------------------------------------------------
-      # 5.  Install system packages – Chromium + Xvfb
+      # 5.  Install Google Chrome Stable
       # -----------------------------------------------------------------------
-      - name: "🖥️  Install Chromium & Xvfb"
+      - name: "🌐  Set up Chrome"
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      - name: "🔍  Record CHROME_BIN for the run"
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends chromium-browser xvfb
-          chromium-browser --version
+          echo "CHROME_BIN=${{ steps.chrome.outputs.chrome-path }}" >> "$GITHUB_ENV"
+          echo "Detected Chrome path:"
+          echo "  ${{ steps.chrome.outputs.chrome-path }}"
+          "${{ steps.chrome.outputs.chrome-path }}" --version
+
+      # Extract Chrome version for cache key (more reliable than relying on action outputs)
+      - name: "🔢  Extract Chrome version"
+        id: chromever
+        run: |
+          ver="$("${{ steps.chrome.outputs.chrome-path }}" --version | grep -Eo '[0-9.]+' | head -n1)"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          echo "Chrome version resolved: $ver"
 
       # -----------------------------------------------------------------------
-      # 6.  Launch Selenium inside Xvfb
+      # 6.  Cache webdriver-manager artifacts (~/.wdm)
       # -----------------------------------------------------------------------
-      - name: "🚀  Start headless browser via selenium"
+      - name: "💾  Cache webdriver-manager"
+        uses: actions/cache@v4
+        with:
+          path: ~/.wdm
+          key: wdm-${{ runner.os }}-${{ steps.chromever.outputs.ver }}
+          restore-keys: |
+            wdm-${{ runner.os }}-
+
+      # -----------------------------------------------------------------------
+      # 7.  (Optional) Xvfb for safety – not strictly required for headless=new
+      # -----------------------------------------------------------------------
+      - name: "🖥️  Install Xvfb"
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends xvfb
+
+      # -----------------------------------------------------------------------
+      # 8.  Launch Selenium in headless mode (with retry) and write Job Summary
+      # -----------------------------------------------------------------------
+      - name: "🚀  Start headless browser via selenium (with retry + summary)"
         env:
-          GPT_REVIEW_HEADLESS: "1"      # force headless
+          GPT_REVIEW_HEADLESS: "1"      # force headless=new in the driver
+          CHROME_BIN: "${{ steps.chrome.outputs.chrome-path }}"
         run: |
           echo "::group::Python smoke test script"
           xvfb-run -a python - <<'PY'
+          import logging, os, platform, sys, time
           from review import _chrome_driver
-          import logging, sys
+
           logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+          MAX_ATTEMPTS = 3
+          BACKOFF_SECS = 5
+
+          def attempt_launch():
+              last = None
+              for attempt in range(1, MAX_ATTEMPTS + 1):
+                  try:
+                      logging.info("Launching browser (attempt %d/%d)…", attempt, MAX_ATTEMPTS)
+                      drv = _chrome_driver()
+                      return drv
+                  except Exception as exc:
+                      last = exc
+                      logging.exception("Launch attempt %d failed: %s", attempt, exc)
+                      if attempt < MAX_ATTEMPTS:
+                          time.sleep(BACKOFF_SECS * attempt)
+              raise last
 
           try:
-              drv = _chrome_driver()
-              logging.info("Browser launched – version: %s", drv.capabilities["browserVersion"])
-              logging.info("Driver version:  %s", drv.capabilities["chrome"]["chromedriverVersion"].split(' ')[0])
+              drv = attempt_launch()
+              caps = getattr(drv, "capabilities", {}) or {}
+              browser_version = caps.get("browserVersion", "unknown")
+              chrome_block = caps.get("chrome", {}) if isinstance(caps, dict) else {}
+              driver_version = (chrome_block.get("chromedriverVersion", "unknown").split(" ") or ["unknown"])[0]
+
               drv.get("https://www.example.com")
-              logging.info("Page title fetched successfully: %s", drv.title)
+              title = drv.title
+              logging.info("Page title fetched successfully: %s", title)
+
+              # Write a compact Job Summary
+              summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary_path:
+                  with open(summary_path, "a", encoding="utf-8") as fh:
+                      fh.write("### Selenium E2E summary\\n\\n")
+                      fh.write(f"- **OS**: `{platform.platform()}`\\n")
+                      fh.write(f"- **Python**: `{platform.python_version()}`\\n")
+                      fh.write(f"- **Chrome path**: `{os.environ.get('CHROME_BIN', '<unknown>')}`\\n")
+                      fh.write(f"- **Chrome version**: `{browser_version}`\\n")
+                      fh.write(f"- **Chromedriver version**: `{driver_version}`\\n")
+                      fh.write(f"- **Fetched title**: `{title}`\\n")
+
               drv.quit()
               logging.info("✅  Selenium smoke test passed")
           except Exception as exc:
@@ -118,7 +185,7 @@ jobs:
           echo "::endgroup::"
 
       # -----------------------------------------------------------------------
-      # 7.  Success banner
+      # 9.  Success banner
       # -----------------------------------------------------------------------
       - name: "✅  E2E smoke test finished"
         run: echo "🎉  Browser layer looks good!"

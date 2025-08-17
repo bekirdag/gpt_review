@@ -1,32 +1,38 @@
 ###############################################################################
 # GPT‑Review ▸ Development dependencies
 ###############################################################################
-# This list is an *exact* superset of the optional `[dev]` extra declared in
-# `pyproject.toml`.  Pinning helps CI reproducibility; bump versions together.
+# This list is an *exact* superset of the optional [dev] extra declared in
+# pyproject.toml.  Pinning helps CI reproducibility; bump versions together.
 #
 # Installation (virtual‑env recommended):
 #   pip install -r dev-requirements.txt
 #
+# Notes
+# -----
+# • Keep these pins in sync with [project.optional-dependencies].dev in
+#   pyproject.toml. CI uses pre‑commit + pytest; versions here must match.
+###############################################################################
+
 # ---------------------------------------------------------------------------
 # Formatting & style
 # ---------------------------------------------------------------------------
 black==24.4.2           # opinionated code formatter
 isort==5.13.2           # deterministic import ordering
-flake8==7.0.0           # core linter (PEP 8 + pyflakes)
+flake8==7.0.0           # core linter (PEP 8 + pyflakes)
 flake8-bugbear==24.4.26 # extra bugbear checks (B‑codes)
 flake8-bandit==4.1.1    # security‑oriented lint rules (B9‑codes)
 
 # ---------------------------------------------------------------------------
 # Testing & coverage
 # ---------------------------------------------------------------------------
-pytest==8.2.1           # simple unit‑testing framework
+pytest==8.2.1           # unit‑testing framework
 coverage==7.5.3         # code coverage engine
-pytest-cov==5.0.0       # `pytest --cov`
+pytest-cov==5.0.0       # pytest --cov plugin
 
 # ---------------------------------------------------------------------------
 # Git hooks
 # ---------------------------------------------------------------------------
-pre-commit==3.7.0       # hook runner
+pre-commit==3.7.0       # hook runner (matches CI lint job)
 
 # ---------------------------------------------------------------------------
 # Misc utilities

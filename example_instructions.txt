@@ -1,43 +1,89 @@
 ===============================================================================
 🎯  PROJECT GOAL
 ===============================================================================
-Modernise the code‑base for **Python 3.12**, achieving 90 % pytest coverage and
-eliminating all `DeprecationWarning`s.
+Modernise the code‑base for **Python 3.12**, achieve **≥ 90 % pytest coverage**,
+and eliminate all `DeprecationWarning`s.
 
-* Migrated libraries:
-    - `flask.ext.*`            ➔  replace with standalone packages
-    - `asyncio.get_event_loop` ➔  use `asyncio.run`
-    - Any `asyncio.coroutine`  ➔  native `async def`
+Required migrations / cleanups:
+  • `flask.ext.*`              → replace with standalone packages
+  • `asyncio.get_event_loop`   → prefer `asyncio.run(...)`
+  • Any `asyncio.coroutine`    → native `async def`
+  • Remove / silence outdated APIs flagged by Python 3.12
 
-* CI target in `.github/workflows/ci.yml` *must* pass green with:
-      python-version: ["3.10", "3.11", "3.12"]
-
--------------------------------------------------------------------------------
-🔨  ACCEPTANCE CRITERIA
--------------------------------------------------------------------------------
-1.  `pytest -q` reports **≥ 90 % coverage**.
-2.  No warnings when running tests under **Python 3.12**.
-3.  `flake8` passes with **zero** errors or warnings.
-4.  All existing CLI commands keep identical behaviour (BC‑safe).
+CI target in `.github/workflows/ci.yml` **must** pass green with:
+  python-version: ["3.10", "3.11", "3.12"]
 
 -------------------------------------------------------------------------------
-📋  WORKFLOW RULES
+✅  ACCEPTANCE CRITERIA
 -------------------------------------------------------------------------------
-* **One JSON patch per reply** – see schema below.
-* Work *one file at a time* (commit history must stay readable).
-* **After sending a patch, ask me to _continue_** before proceeding.
-* After each patch, set `"status": "in_progress"` until the **last** patch,
-  then use `"status": "completed"`.
+1) `pytest -q` reports **≥ 90 % coverage**.
+2) Zero warnings under **Python 3.12**.
+3) `flake8` passes with **zero** errors or warnings.
+4) All existing CLI commands keep identical behaviour (BC‑safe).
 
-```jsonc
-{ "op": "create|update|delete|rename|chmod",
+-------------------------------------------------------------------------------
+🧭  SCOPE & CONSTRAINTS
+-------------------------------------------------------------------------------
+• Keep changes **as small as possible** per patch; do not reformat unrelated files.
+• Prefer minimal, targeted refactors that quiet 3.12 warnings.
+• When introducing new deps, pin minimally (PEP 440 compatible) and explain why.
+• If a test is flaky or heavy, mark it appropriately (`pytest.mark.*`) with rationale.
+
+-------------------------------------------------------------------------------
+📋  WORKFLOW RULES
+-------------------------------------------------------------------------------
+You will work **one file at a time** in a chunk‑by‑chunk loop.
+
+After each patch you send:
+  1) You **must** ask me to **continue** before proceeding.
+  2) Wait for logs I may send back; use those to propose the next fix.
+
+**Important output rule**  
+Return **exactly one JSON object** (no extra prose, no markdown/code fences).
+Use `"status": "in_progress"` until the **last** patch, then `"status": "completed"`.
+
+-------------------------------------------------------------------------------
+🧱  REPLY FORMAT (RAW JSON – no fences)
+-------------------------------------------------------------------------------
+The single JSON object you return must conform to this schema:
+
+{
+  "op": "create|update|delete|rename|chmod",
   "file": "path/inside/repo",
-  // create / update
-  "body": "full file contents",
-  "body_b64": "<base64>",    // optional binary
-  // rename
+
+  // create / update (choose exactly one of body or body_b64)
+  "body": "full utf‑8 file contents",
+  "body_b64": "<base64-encoded-bytes>",
+
+  // rename (when op = rename)
   "target": "new/path",
-  // chmod
+
+  // chmod (when op = chmod)
   "mode": "755",
+
+  // session progression
   "status": "in_progress|completed"
+}
+
+Notes:
+• For **binary** files, use `"body_b64"`; for **text** files, use `"body"`.
+• Paths are **relative to the repository root**. Do not escape the repo.
+• Send only **one** JSON object per reply. No surrounding backticks or prose.
+
+-------------------------------------------------------------------------------
+🧪  HINTS
+-------------------------------------------------------------------------------
+• If the tests fail, I will paste the **full failing logs**. Use them to craft
+  the next minimal patch.
+• Prefer safe, incremental fixes. Remove dead code if it blocks progress.
+• If an API replacement affects multiple files, split into small sequential patches.
+
+-------------------------------------------------------------------------------
+🔚  EXAMPLE (for illustration only — DO NOT include fences in your replies)
+-------------------------------------------------------------------------------
+{
+  "op": "update",
+  "file": "src/util/time.py",
+  "body": "from __future__ import annotations\n\nimport asyncio\n\nasync def _main():\n    ...\n\nif __name__ == \"__main__\":\n    asyncio.run(_main())\n",
+  "status": "in_progress"
 }

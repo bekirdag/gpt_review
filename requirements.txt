@@ -3,8 +3,8 @@
 ###############################################################################
 # This file lists *exactly* the packages needed to **run** GPT‑Review at
 # runtime.  Development and CI tools (pytest, black, flake8, etc.) live in
-# `dev-requirements.txt` and the `[project.optional-dependencies].dev` extra
-# inside `pyproject.toml`.
+# dev-requirements.txt and the [project.optional-dependencies].dev extra
+# inside pyproject.toml.
 #
 # Version pinning strategy
 # ------------------------
@@ -19,13 +19,13 @@
 
 # Browser automation
 selenium>=4.21.0
-webdriver-manager>=4.0.1
+webdriver-manager>=4.0.1   # ChromeType import lives under webdriver_manager.core.utils in 4.x
 
 # JSON‑Schema validation
 jsonschema>=4.22.0
 
 # Git plumbing (create commits, check status)
-gitpython>=3.1.43
+GitPython>=3.1.43          # canonical PyPI name uses capital G and P
 
 # HTTP utilities (used for eventual web API integrations)
 requests>=2.32.3

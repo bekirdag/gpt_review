@@ -39,6 +39,8 @@ build/
 # Egg / Wheel metadata
 *.egg-info/
 *.egg
+# PEP 517 build cache
+pip-wheel-metadata/
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3.  Test artefacts & coverage reports
@@ -46,11 +48,12 @@ build/
 .tox/
 .pytest_cache/
 .coverage
+.coverage.*
 coverage.xml
 htmlcov/
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4.  IDE / Editor folders
+# 4.  IDE / Editor / Tooling folders
 # ─────────────────────────────────────────────────────────────────────────────
 # VS Code
 .vscode/
@@ -60,6 +63,12 @@ htmlcov/
 *.sublime-*
 # Eclipse / PyCharm
 *.iml
+# direnv
+.direnv/
+.envrc
+# Type checkers / linters caches
+.mypy_cache/
+.ruff_cache/
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5.  Operating‑system noise
@@ -76,6 +85,8 @@ Icon?
 *.dll
 # MacOS quarantine metadata
 *.dmg
+# pyenv local version file
+.python-version
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6.  Compiled artefacts

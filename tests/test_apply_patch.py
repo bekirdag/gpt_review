@@ -17,7 +17,7 @@ Goals
     • local‑change protection works
 
 All tests run inside a **temporary Git repository** created via the
-`tmp_path` fixture (pytest).
+tmp_path fixture (pytest).
 
 The module prints INFO‑level messages so failures are easier to debug in
 CI job logs.
@@ -27,7 +27,6 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 import subprocess
 from pathlib import Path
 
@@ -46,7 +45,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 # =============================================================================
 # Helpers
 # =============================================================================
-def _git(repo: Path, *args, capture=False) -> str:
+def _git(repo: Path, *args, capture: bool = False) -> str:
     """
     Run *git* in *repo*, optionally capturing stdout.
     """
@@ -84,6 +83,8 @@ def _init_repo(tmp: Path, initial_file: bool = False) -> Path:
 def _apply(patch: dict, repo: Path) -> None:
     """
     Convenience wrapper around apply_patch.apply_patch.
+
+    Accepts a Python dict, serialises to JSON, and invokes the SUT.
     """
     apply_patch(json.dumps(patch), str(repo))
 
@@ -214,9 +215,16 @@ def test_refuse_local_overwrite(tmp_path: Path):
 def test_unsafe_chmod_rejected(tmp_path: Path):
     """
     chmod with mode 777 must raise PermissionError.
+
+    NOTE:
+    -----
+    We create the file **via the SUT** (create op) to avoid double‑create
+    conflicts. Previously the test wrote the file *and* sent a create patch,
+    which would rightfully fail before chmod was exercised.
     """
     repo = _init_repo(tmp_path)
-    (repo / "tool.sh").write_text("#!/bin/sh\necho ok\n")
+
+    # Create the file through apply_patch (SUT)
     _apply(
         {
             "op": "create",
@@ -226,6 +234,9 @@ def test_unsafe_chmod_rejected(tmp_path: Path):
         },
         repo,
     )
+    mode_before = (repo / "tool.sh").stat().st_mode & 0o777
+
+    # Unsafe chmod should be rejected by SAFE_MODES check
     bad_patch = {
         "op": "chmod",
         "file": "tool.sh",
@@ -235,6 +246,9 @@ def test_unsafe_chmod_rejected(tmp_path: Path):
     with pytest.raises(PermissionError):
         _apply(bad_patch, repo)
 
+    # Sanity: mode must be unchanged after the failed chmod
+    mode_after = (repo / "tool.sh").stat().st_mode & 0o777
+    assert mode_after == mode_before
     log.info("Unsafe chmod rejection test passed.")
 
 

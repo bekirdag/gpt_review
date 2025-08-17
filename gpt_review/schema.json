@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "GPT‑Review Patch (v3)",
   "description": "Canonical schema for every JSON patch that ChatGPT must return.",
-  "$comment": "Two fields are always required: `op` (operation) and `status`.",
+  "$comment": "Two fields are always required: op (operation) and status.",
   "type": "object",
   "required": ["op", "status"],
   "additionalProperties": false,
@@ -31,48 +31,48 @@
 
     "target": {
       "type": "string",
-      "description": "Destination path when `op` = `rename`."
+      "description": "Destination path when op = rename."
     },
 
     "mode": {
       "type": "string",
       "pattern": "^[0-7]{3,4}$",
-      "description": "Octal permission bits (e.g. \"755\") when `op` = `chmod`."
+      "description": "Octal permission bits (e.g. \"755\") when op = chmod."
     },
 
     "status": {
       "type": "string",
       "enum": ["in_progress", "completed"],
-      "description": "`in_progress` → more patches will follow; `completed` → task done."
+      "description": "in_progress → more patches will follow; completed → task done."
     }
   },
 
   "allOf": [
     {
-      "$comment": "`create` & `update` need `file` plus exactly one of body/body_b64",
+      "$comment": "create & update need file plus exactly one of body/body_b64",
       "if": { "properties": { "op": { "enum": ["create", "update"] } } },
       "then": {
         "oneOf": [
-          { "required": ["file", "body"],  "not": { "required": ["body_b64"] } },
+          { "required": ["file", "body"], "not": { "required": ["body_b64"] } },
           { "required": ["file", "body_b64"], "not": { "required": ["body"] } }
         ]
       }
     },
 
     {
-      "$comment": "`delete` requires only the source path",
+      "$comment": "delete requires only the source path",
       "if": { "properties": { "op": { "const": "delete" } } },
       "then": { "required": ["file"] }
     },
 
     {
-      "$comment": "`rename` requires both source and target paths",
+      "$comment": "rename requires both source and target paths",
       "if": { "properties": { "op": { "const": "rename" } } },
       "then": { "required": ["file", "target"] }
     },
 
     {
-      "$comment": "`chmod` requires source path and octal mode (644 / 755 allowed in code)",
+      "$comment": "chmod requires source path and octal mode (644 / 755 allowed in code)",
       "if": { "properties": { "op": { "const": "chmod" } } },
       "then": { "required": ["file", "mode"] }
     }

@@ -11,6 +11,11 @@
 # • CI artefacts / coverage      → irrelevant for production image.
 # • Editor temp files            → clutter.
 # • Local cache & logs           → keep image lean.
+# • Project tests & docs         → not required inside the runtime image.
+#
+# Note:
+# • Duplicate patterns for `.env` have been removed (kept under the secrets
+#   section below).
 ###############################################################################
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -29,10 +34,10 @@ dist/
 #  Runtime artefacts (local only)
 # ─────────────────────────────────────────────────────────────────────────────
 venv/
-.env
 .cache/
 logs/
 *.log
+.gpt-review-state.json
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Testing artefacts
@@ -41,6 +46,12 @@ logs/
 htmlcov/
 .tox/
 .pytest_cache/
+tests/                      # exclude project tests from runtime image
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Documentation (not needed in runtime image)
+# ─────────────────────────────────────────────────────────────────────────────
+docs/
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Python __pycache__ folders
@@ -57,3 +68,19 @@ __pycache__/
 .DS_Store
 Thumbs.db
 Icon?
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Environment / secrets
+# ─────────────────────────────────────────────────────────────────────────────
+.env
+.env.*
+# Private keys
+*.pem
+*.key
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Docker build cache / local artefacts
+# ─────────────────────────────────────────────────────────────────────────────
+docker-build/
+# Build cache layers
+*.tar

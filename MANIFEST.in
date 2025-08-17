@@ -1,48 +1,50 @@
 ###############################################################################
 # GPT‑Review ▸ Source distribution manifest
 ###############################################################################
-# This file defines **additional** files to include in the *sdist* (tar.gz)
+# Controls which **additional** files are included in the *sdist* (tar.gz)
 # built by `python -m build` or `pip install .`.
 #
-# Wheel (`.whl`) contents are governed by `pyproject.toml`:
-#     [tool.setuptools.package-data]
-# But *sdist* needs explicit `include` directives – otherwise non‑Python data
-# (LICENSE, docs, JSON schemas) may be missing for downstream users.
+# Wheels (.whl) are governed by pyproject.toml:
+#   [tool.setuptools.package-data]  and  [tool.setuptools]
 #
-# Guideline:  Include **everything required to run tests or use the package**.
+# Guideline: Include **everything required to run tests, use the package,
+# and reproduce CI locally** – licenses, docs, example files, schemas, and
+# helper scripts.
 ###############################################################################
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1.  Licensing & docs (root files)
+# 1) Licensing & top‑level docs
 # ─────────────────────────────────────────────────────────────────────────────
 include LICENSE
 include README.md
-include CHANGELOG.md          # ← added
+include CHANGELOG.md
 include CONTRIBUTING.md
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2.  JSON schema shipped with the package
+# 2) JSON schema shipped inside the package
+#    (Wheel inclusion handled via [tool.setuptools.package-data])
 # ─────────────────────────────────────────────────────────────────────────────
 recursive-include gpt_review *.json
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3.  Example instruction and env files
+# 3) Example instruction and environment files
 # ─────────────────────────────────────────────────────────────────────────────
 include example_instructions.txt
 include .env.example
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4.  Shell helper script
+# 4) Shell helper scripts (installed alongside the package)
 # ─────────────────────────────────────────────────────────────────────────────
-include software_review.sh     # ← added
+include software_review.sh
+include cookie_login.sh
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5.  Tests (so downstream packagers can run pytest)
+# 5) Tests (so downstream packagers/users can run `pytest`)
 # ─────────────────────────────────────────────────────────────────────────────
 recursive-include tests *.py
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6.  Exclude local rubbish just in case
+# 6) Exclude local rubbish just in case
 # ─────────────────────────────────────────────────────────────────────────────
 global-exclude *.pyc
 global-exclude __pycache__/

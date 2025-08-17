@@ -1,9 +1,17 @@
 ###############################################################################
 # GPT‑Review ▸ Project Metadata & Build Configuration
 ###############################################################################
-# This file powers **PEP 517/518** builds (`python -m build`) as well as
+# This file powers **PEP 517/518** builds (`python -m build`) as well as
 # editable installs (`pip install -e .`).  Comments are verbose by design so
 # newcomers can understand *why* each section exists.
+#
+# Changes in this revision
+# ------------------------
+# • Explicitly include the **gpt_review** package in wheels/sdists so that
+#   bundled resources (schema.json) and `python -m gpt_review` work reliably.
+# • Keep top‑level modules (`review`, `apply_patch`, `patch_validator`, `logger`)
+#   via `py-modules` – these back the console entry‑point `gpt-review`.
+# • Leave dev tools and style configs unchanged (mirrors repo tooling).
 ###############################################################################
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -18,7 +26,7 @@ build-backend = "setuptools.build_meta"
 # ─────────────────────────────────────────────────────────────────────────────
 [project]
 name            = "gpt-review"
-version         = "0.3.0"                        # ↞ bumped from 0.2.0
+version         = "0.3.0"                        # ↞ keep in sync with gpt_review/__init__.py fallback
 description     = "Browser‑driven, ChatGPT‑powered code‑review loop with auto‑test execution."
 readme          = "README.md"
 license         = { file = "LICENSE" }
@@ -57,7 +65,7 @@ dependencies = [
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Optional extras – `pip install .[dev]`
+#  Optional extras – pip install .[dev]
 # ─────────────────────────────────────────────────────────────────────────────
 [project.optional-dependencies]
 dev = [
@@ -90,13 +98,18 @@ Issues = "https://github.com/your-org/gpt-review/issues"
 #  Console script entry‑point
 # ─────────────────────────────────────────────────────────────────────────────
 [project.scripts]
+# Provides the CLI command `gpt-review`, which calls review.main()
 gpt-review = "review:main"
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  setuptools‑specific tweaks
 # ─────────────────────────────────────────────────────────────────────────────
 [tool.setuptools]
-# Top‑level modules (sibling .py files) that live outside the package dir
+# Include the package that holds resources (schema.json) and module entrypoint
+packages = ["gpt_review"]               # ← ensures `gpt_review` package is in the wheel
+include-package-data = true             # ← cooperate with MANIFEST.in when building sdists
+
+# Top‑level modules that live outside the package dir
 py-modules = ["review", "apply_patch", "patch_validator", "logger"]
 
 [tool.setuptools.package-data]
@@ -114,12 +127,12 @@ target-version = ["py39", "py310", "py311", "py312"]
 #  isort (import sorter) – configured to play nice with Black
 # ─────────────────────────────────────────────────────────────────────────────
 [tool.isort]
-profile            = "black"
-line_length        = 88
-multi_line_output  = 3
-include_trailing_comma = true
-combine_as_imports     = true
-force_grid_wrap        = 0
+profile                 = "black"
+line_length             = 88
+multi_line_output       = 3
+include_trailing_comma  = true
+combine_as_imports      = true
+force_grid_wrap         = 0
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  flake8 (linter)

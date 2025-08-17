@@ -3,14 +3,16 @@
 Unit‑tests for *patch_validator.validate_patch*
 ===============================================================================
 
-The validator enforces the JSON‑Schema defined in
-`gpt_review/schema.json`.  We exercise representative *valid* and
-*invalid* patches for every operation to ensure:
+The validator enforces the JSON‑Schema defined in gpt_review/schema.json.
+We exercise representative *valid* and *invalid* patches for every operation to
+ensure:
 
 * Required keys are enforced
-* Mutual exclusivity of `body` / `body_b64`
+* Mutual exclusivity of body / body_b64
 * Enum / pattern constraints (op, status, mode)
-* `jsonschema.ValidationError` is raised on bad input
+* Bytes input is accepted
+* Unknown properties are rejected (additionalProperties=false)
+* jsonschema.ValidationError is raised on bad input
 """
 from __future__ import annotations
 
@@ -64,7 +66,7 @@ def _expect_error(patch: dict):
 @pytest.mark.parametrize(
     "patch",
     [
-        _good_base(),  # basic create
+        _good_base(),  # basic create (text)
         {
             "op": "update",
             "file": "demo.md",
@@ -73,6 +75,12 @@ def _expect_error(patch: dict):
         },
         {
             "op": "create",
+            "file": "logo.png",
+            "body_b64": base64.b64encode(b"\x89PNG").decode(),
+            "status": "in_progress",
+        },
+        {
+            "op": "update",
             "file": "logo.png",
             "body_b64": base64.b64encode(b"\x89PNG").decode(),
             "status": "in_progress",
@@ -94,14 +102,23 @@ def _expect_error(patch: dict):
             "mode": "755",
             "status": "completed",
         },
+        {
+            # 4‑digit mode is allowed by the schema (apply layer enforces safe list)
+            "op": "chmod",
+            "file": "script.sh",
+            "mode": "0755",
+            "status": "in_progress",
+        },
     ],
     ids=[
         "create_text",
         "update_text",
         "create_binary",
+        "update_binary",
         "delete",
         "rename",
-        "chmod",
+        "chmod_755",
+        "chmod_0755",
     ],
 )
 def test_valid_patches(patch):
@@ -110,6 +127,16 @@ def test_valid_patches(patch):
     """
     assert validate_patch(_as_json(patch)) == patch
     log.info("Valid patch passed schema: %s", patch["op"])
+
+
+def test_accepts_bytes_payload():
+    """
+    Validator should accept bytes as well as str JSON payloads.
+    """
+    payload = _as_json(_good_base()).encode("utf-8")
+    parsed = validate_patch(payload)
+    assert parsed["op"] == "create"
+    log.info("Bytes input validated successfully.")
 
 
 # =============================================================================
@@ -161,7 +188,16 @@ def test_mode_pattern():
     bad = {
         "op": "chmod",
         "file": "ex.sh",
-        "mode": "abc",
+        "mode": "abc",  # must be octal digits only
         "status": "in_progress",
     }
+    _expect_error(bad)
+
+
+def test_rejects_unknown_property():
+    """
+    Schema sets additionalProperties=false → unknown keys must be rejected.
+    """
+    bad = _good_base()
+    bad["unexpected"] = "nope"
     _expect_error(bad)

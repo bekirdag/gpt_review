@@ -4,9 +4,15 @@
 #
 # Jobs
 # ----
-# 1. **Lint**        – static analysis with flake8 (fast feedback).
-# 2. **Unit Tests**  – pytest + coverage on Linux for three CPython versions:
-#                      3.10, 3.11, 3.12.
+# 1. **Lint (pre‑commit)** – run all configured hooks (isort → black → flake8,
+#    codespell, JSON/YAML checks, etc.) for fast, comprehensive feedback.
+# 2. **Unit Tests** – pytest + coverage on Linux for three CPython versions:
+#    3.10, 3.11, 3.12.
+#
+# Observability
+# -------------
+# • On Python 3.12, append coverage and a Changelog excerpt (Unreleased or the
+#   latest release) to the **Job Summary** for quick PR review.
 #
 # Other workflows
 # ---------------
@@ -15,6 +21,7 @@
 # Performance
 # -----------
 # • pip cache keyed on OS + python‑version + hash of pyproject.toml
+# • pre‑commit cache keyed on OS + .pre-commit-config.yaml hash
 # • Concurrency cancels stale runs on same branch / PR.
 # • Log groups keep GitHub UI readable.
 # =============================================================================
@@ -32,13 +39,13 @@ concurrency:
   cancel-in-progress: true
 
 # -----------------------------------------------------------------------------#
-#  LINT JOB
+#  LINT JOB (pre‑commit)
 # -----------------------------------------------------------------------------#
 jobs:
   lint:
-    name: "Lint (flake8)"
+    name: "Lint (pre‑commit)"
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: "⬇️  Checkout repository"
@@ -56,24 +63,31 @@ jobs:
           path: ~/.cache/pip
           key: pip-lint-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
 
-      - name: "📥  Install flake8"
+      - name: "💾  Restore pre‑commit cache"
+        id: precommit-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: precommit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: "📥  Install pre‑commit"
         run: |
           python -m pip install --upgrade pip
-          pip install flake8
+          pip install pre-commit
 
-      - name: "🔎  Run flake8"
+      - name: "🧹  Run pre‑commit hooks"
         env:
           PY_COLORS: "1"
         run: |
-          echo "::group::flake8 output"
-          flake8
+          echo "::group::pre-commit"
+          pre-commit run --all-files --show-diff-on-failure
           echo "::endgroup::"
 
   # ---------------------------------------------------------------------------#
   #  UNIT‑TEST MATRIX
   # ---------------------------------------------------------------------------#
   test:
-    name: "Unit Tests (py${{ matrix.python-version }})"
+    name: "Unit Tests (py${{ matrix.python-version }})"
     runs-on: ubuntu-latest
     needs: lint
     timeout-minutes: 25
@@ -117,7 +131,42 @@ jobs:
       - name: "📊  Add coverage to job summary (3.12 only)"
         if: matrix.python-version == '3.12'
         run: |
-          echo '### Coverage report (Python 3.12)' >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          coverage report -m >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo '### Coverage report (Python 3.12)' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          coverage report -m >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # --------------------------------------------------------------------- #
+      # Changelog excerpt (Unreleased or latest) → Job Summary, 3.12 only
+      # --------------------------------------------------------------------- #
+      - name: "📝  Append changelog excerpt to summary (3.12 only)"
+        if: matrix.python-version == '3.12'
+        run: |
+          echo "::group::changelog-summary"
+          python - <<'PY'
+          import os, re, pathlib, sys
+          p = pathlib.Path("CHANGELOG.md")
+          if not p.exists():
+              print("CHANGELOG.md not found", file=sys.stderr)
+              sys.exit(0)  # don't fail the job; just skip
+
+          text = p.read_text(encoding="utf-8")
+
+          # Prefer the Unreleased section; otherwise fall back to the first release entry.
+          m = re.search(r"^##\s+\[Unreleased\].*?(?=^##\s+\[|\Z)", text, re.M | re.S)
+          if not m:
+              m = re.search(r"^##\s+\[[^\]]+\].*?(?=^##\s+\[|\Z)", text, re.M | re.S)
+
+          if not m:
+              print("No sections matched in CHANGELOG.md; skipping.")
+              sys.exit(0)
+
+          # Append to GitHub Job Summary
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as fh:
+                  fh.write("\n### Changelog excerpt\n\n")
+                  fh.write(m.group(0).strip() + "\n")
+          print("Changelog excerpt appended to Job Summary.")
+          PY
+          echo "::endgroup::"

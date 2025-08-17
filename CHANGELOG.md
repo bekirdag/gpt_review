@@ -1,147 +1,58 @@
-###############################################################################
-# GPT‑Review ▸ Project Metadata & Build Configuration
-###############################################################################
-# This file powers **PEP 517/518** builds (`python -m build`) as well as
-# editable installs (`pip install -e .`).  Comments are verbose by design so
-# newcomers can understand *why* each section exists.
-###############################################################################
+# Changelog
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Build back‑end
-# ─────────────────────────────────────────────────────────────────────────────
-[build-system]
-requires      = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+All notable changes to **GPT‑Review** are documented in this file.  
+The format is inspired by [Keep a Changelog](https://keepachangelog.com/) and the project follows [Semantic Versioning](https://semver.org/).
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Core package metadata
-# ─────────────────────────────────────────────────────────────────────────────
-[project]
-name            = "gpt-review"
-version         = "0.3.0"                        # ↞ bumped from 0.2.0
-description     = "Browser‑driven, ChatGPT‑powered code‑review loop with auto‑test execution."
-readme          = "README.md"
-license         = { file = "LICENSE" }
-requires-python = ">=3.9"
+---
 
-authors = [
-  { name = "GPT‑Review Team", email = "opensource@gpt-review.dev" }
-]
+## [Unreleased]
 
-keywords = ["chatgpt", "selenium", "code‑review", "automation", "dev‑tool"]
+### Changed
+- **cookie_login.sh** — honors `GPT_REVIEW_LOGIN_URL` for the primary tab (default remains `https://chatgpt.com/`), keeps a `chat.openai.com` fallback with de‑duplication, and improves user guidance; login stays **non‑headless** by design.
+- **review.py** — increased DOM resilience (additional textarea selectors with aria/placeholder hints and a contenteditable fallback), robust draft clearing (Select‑All + Backspace) before sending, safer assistant‑block selection, and reply completion gated on non‑empty text.
+- **.env.example** — clarified the distinction between `GPT_REVIEW_LOGIN_URL` (login helper) and `GPT_REVIEW_CHAT_URL` (driver navigation).
+- **README.md** — documented the login override and aligned first‑time login guidance.
+- **Dockerfile** — cosmetic cleanups, consistent indentation, explicit `set -eux` build logging, and minor environment flag improvements.
 
-classifiers = [
-  "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3 :: Only",
-  "License :: OSI Approved :: MIT License",
-  "Intended Audience :: Developers",
-  "Operating System :: OS Independent",
-]
+### Fixed
+- **.dockerignore** — removed duplicate `.env` pattern and tightened comments.
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Runtime dependencies (PyPI)
-# ─────────────────────────────────────────────────────────────────────────────
-dependencies = [
-  # Browser automation
-  "selenium>=4.21.0",
-  "webdriver-manager>=4.0.1",
+> Note: Version remains **0.3.0** in `pyproject.toml` / `__init__.py`. These entries will be rolled into the next tagged release (e.g., `0.3.1`).
 
-  # JSON‑Schema validation
-  "jsonschema>=4.22.0",
+---
 
-  # Git plumbing
-  "gitpython>=3.1.43",
+## [0.3.0] — 2025‑08‑01
 
-  # Misc HTTP helpers
-  "requests>=2.32.3"
-]
+### Added
+- **Chrome/Chromium auto‑detection** and correct driver stream selection (Google vs Chromium) in `review.py`. Logs browser & driver versions for support.
+- **Environment tunables** (documented in `.env.example` and README):
+  - `GPT_REVIEW_CHAT_URL`, `GPT_REVIEW_WAIT_UI`, `GPT_REVIEW_STREAM_IDLE_SECS`,
+    `GPT_REVIEW_RETRIES`, `GPT_REVIEW_CHUNK_SIZE`, `GPT_REVIEW_COMMAND_TIMEOUT`.
+- **CLI smoke tests** for entry points (`tests/test_cli_entrypoints.py`).
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Optional extras – `pip install .[dev]`
-# ─────────────────────────────────────────────────────────────────────────────
-[project.optional-dependencies]
-dev = [
-  # Formatting & style
-  "black==24.4.2",
-  "isort==5.13.2",
-  "flake8==7.0.0",
-  "flake8-bugbear==24.4.26",
-  "flake8-bandit==4.1.1",
+### Changed
+- **Primary login domain → `https://chatgpt.com/`** with `https://chat.openai.com/` fallback in `cookie_login.sh` and driver navigation.
+- **Dockerfile** rebuilt on **Debian 12 (slim)** with system **Chromium**; sets `CHROME_BIN=/usr/bin/chromium`, headless by default, non‑root user.
+- **CI**: Lint job now runs **pre‑commit** (isort, black, flake8, codespell, JSON/YAML/TOML checks). Unit test matrix kept for py3.10/3.11/3.12.
+- **E2E workflow** installs **Google Chrome Stable** via `browser-actions/setup-chrome` and validates Selenium startup.
+- **Makefile**: new targets `fmt`, `precommit`, `smoke`, `login`, `docker-run`; clearer logging.
+- **Wrapper** (`software_review.sh`): dotenv support, environment dump, fresh-session flag, tee logs, robust runner fallback.
+- **Module entrypoint** (`gpt_review/__main__.py`): non‑recursive, fast `--version`, structured logging.
+- **README** overhauled: updated domains, Docker, env vars, troubleshooting.
 
-  # Testing & coverage
-  "pytest==8.2.1",
-  "coverage==7.5.3",
-  "pytest-cov==5.0.0",
+### Fixed
+- **JSON fence parsing** in extractor tests: proper ```json fences; improved robustness.
+- **Unsafe chmod test**: avoids double‑create; asserts permissions unchanged on failure.
+- Minor typos and logging improvements across scripts.
+- Installer hardening (`install.sh`): idempotent, best‑effort Chromium install, clearer guidance.
 
-  # Git hooks & misc
-  "pre-commit==3.7.0",
-  "codespell==2.4.0"
-]
+---
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Handy links on PyPI project page
-# ─────────────────────────────────────────────────────────────────────────────
-[project.urls]
-Homepage = "https://github.com/your-org/gpt-review"
-Documentation = "https://github.com/your-org/gpt-review#readme"
-Issues = "https://github.com/your-org/gpt-review/issues"
+## [0.2.0]
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Console script entry‑point
-# ─────────────────────────────────────────────────────────────────────────────
-[project.scripts]
-gpt-review = "review:main"
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  setuptools‑specific tweaks
-# ─────────────────────────────────────────────────────────────────────────────
-[tool.setuptools]
-# Top‑level modules (sibling .py files) that live outside the package dir
-py-modules = ["review", "apply_patch", "patch_validator", "logger"]
-
-[tool.setuptools.package-data]
-# Ship JSON schema inside the wheel
-"gpt_review" = ["schema.json"]
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Black (auto‑formatter)
-# ─────────────────────────────────────────────────────────────────────────────
-[tool.black]
-line-length = 88
-target-version = ["py39", "py310", "py311", "py312"]
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  isort (import sorter) – configured to play nice with Black
-# ─────────────────────────────────────────────────────────────────────────────
-[tool.isort]
-profile            = "black"
-line_length        = 88
-multi_line_output  = 3
-include_trailing_comma = true
-combine_as_imports     = true
-force_grid_wrap        = 0
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  flake8 (linter)
-# ─────────────────────────────────────────────────────────────────────────────
-[tool.flake8]
-max-line-length = 88
-extend-ignore   = "E203,W503,E501"
-exclude         = [
-  ".git",
-  "venv",
-  ".cache",
-  "build",
-  "dist",
-  "logs",
-  "__pycache__",
-]
-select          = "C,E,F,W,B,B9"
-per-file-ignores = "tests/*:S101"
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  coverage.py
-# ─────────────────────────────────────────────────────────────────────────────
-[tool.coverage.run]
-branch = true
-source = ["gpt_review", "review", "apply_patch", "patch_validator"]
+Foundational release with the browser‑driven **edit → run → fix** loop:
+- One‑file‑at‑a‑time patching protocol (create/update/delete/rename/chmod).
+- JSON‑Schema validation for assistant patches.
+- Git commit per operation with safety checks (path traversal, local changes).
+- Error log chunking back to ChatGPT.
+- Basic CI (flake8 + pytest) and packaging metadata.
