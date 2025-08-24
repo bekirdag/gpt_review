@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 ###############################################################################
-# GPT‑Review ▸ One‑shot installer  (Debian/Ubuntu & derivatives)
+# GPT‑Review ▸ One‑shot installer (Debian/Ubuntu & derivatives)
 ###############################################################################
 #
 # What it does (idempotent; safe to rerun)
 # ----------------------------------------
-# 1) Installs prerequisite **system packages** (Python, Git, Chromium/Chrome,
+# 1) Installs prerequisite **system packages** (Python, Git, Chrome/Chromium,
 #    Xvfb, etc.)
 # 2) Clones or updates GPT‑Review to /opt/gpt-review   (override via $REPO_DIR)
 # 3) Creates a **Python virtual‑environment** at        /opt/gpt-review/venv
@@ -15,17 +15,17 @@
 #       • /usr/local/bin/software_review.sh → convenience Bash wrapper
 #       • /usr/local/bin/cookie_login.sh    → visible browser login helper
 #
+# New in this revision
+# --------------------
+# • Optional non‑snap **Google Chrome** install when INSTALL_GOOGLE_CHROME=1.
+# • Clear guidance for Snap Chromium vs non‑snap Chrome.
+# • No need to create a root wrapper: cookie_login.sh auto‑adds --no-sandbox.
+#
 # Usage
 # -----
 #   curl -sSL https://raw.githubusercontent.com/bekirdag/gpt_review/main/install.sh \
-#     | sudo bash
+#     | sudo INSTALL_GOOGLE_CHROME=1 bash
 #
-# Notes
-# -----
-# • We try to install **chromium** (APT) automatically; if it’s unavailable,
-#   we fall back to **chromium-browser**. If neither is available, we warn and
-#   you may install Chrome/Chromium manually; GPT‑Review can still run if a
-#   browser is already present on PATH or set via CHROME_BIN.
 ###############################################################################
 
 set -euo pipefail
@@ -46,22 +46,21 @@ fatal() { echo -e "${RED}✖${RESET} $*" >&2; exit 1; }
 # ────────────────────────────────────────────────────────────────────────────
 # Require root
 # ────────────────────────────────────────────────────────────────────────────
-[[ $EUID -eq 0 ]] || fatal "Please run as root (use sudo)."
+[[ ${EUID:-$(id -u)} -eq 0 ]] || fatal "Please run as root (use sudo)."
 
 # ────────────────────────────────────────────────────────────────────────────
 # Variables (override by exporting before running)
 # ────────────────────────────────────────────────────────────────────────────
-# Default to your public repo; allow REPO_URL to override.
 REPO_URL="${REPO_URL:-https://github.com/bekirdag/gpt_review.git}"
 REPO_DIR="${REPO_DIR:-/opt/gpt-review}"
 VENV_DIR="${VENV_DIR:-$REPO_DIR/venv}"
+INSTALL_GOOGLE_CHROME="${INSTALL_GOOGLE_CHROME:-0}"
 
 WRAPPER_BIN="/usr/local/bin/gpt-review"             # console entrypoint
 WRAPPER_SH="/usr/local/bin/software_review.sh"      # thin bash helper
 LOGIN_HELPER="/usr/local/bin/cookie_login.sh"       # visible login helper
 
 info "Installing GPT‑Review into $REPO_DIR"
-info "Repository URL: $REPO_URL"
 
 # ────────────────────────────────────────────────────────────────────────────
 # System packages
@@ -71,22 +70,46 @@ apt-get update -y
 # Base tools
 apt-get install -y --no-install-recommends \
   python3 python3-venv python3-pip git curl wget unzip ca-certificates \
-  xvfb
+  gnupg xvfb
 
-# Best effort browser install (Chromium from APT)
-if ! command -v chromium >/dev/null 2>&1 && \
-   ! command -v chromium-browser >/dev/null 2>&1 && \
-   ! command -v google-chrome >/dev/null 2>&1; then
-  if apt-get install -y --no-install-recommends chromium; then
-    ok "Installed chromium"
-  elif apt-get install -y --no-install-recommends chromium-browser; then
-    ok "Installed chromium-browser"
+# ────────────────────────────────────────────────────────────────────────────
+# Browser: Google Chrome (optional) or Chromium (fallback)
+# ────────────────────────────────────────────────────────────────────────────
+arch="$(dpkg --print-architecture || echo amd64)"
+if [[ "$INSTALL_GOOGLE_CHROME" == "1" ]]; then
+  if [[ "$arch" != "amd64" ]]; then
+    warn "INSTALL_GOOGLE_CHROME=1 requested, but arch is '$arch' (Google Chrome apt repo is amd64). Skipping Chrome install."
   else
-    warn "Could not install Chromium via APT. You can install Chrome/Chromium manually later."
-    warn "If installed in a non-default location, set CHROME_BIN=/path/to/browser"
+    info "Adding Google Chrome APT repository (amd64) …"
+    wget -qO- https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor > /usr/share/keyrings/google-linux.gpg
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
+    apt-get update -y
+    info "Installing Google Chrome Stable …"
+    if apt-get install -y --no-install-recommends google-chrome-stable; then
+      ok "Installed google-chrome-stable"
+    else
+      warn "Failed to install google-chrome-stable. Falling back to Chromium."
+    fi
+  fi
+fi
+
+# Fallback to Chromium if Chrome not present
+if ! command -v google-chrome >/dev/null 2>&1; then
+  if ! command -v chromium >/dev/null 2>&1 && ! command -v chromium-browser >/dev/null 2>&1; then
+    info "Installing Chromium (APT) …"
+    if apt-get install -y --no-install-recommends chromium; then
+      ok "Installed chromium"
+    elif apt-get install -y --no-install-recommends chromium-browser; then
+      ok "Installed chromium-browser"
+    else
+      warn "Could not install Chromium via APT. You can install Chrome/Chromium later."
+      warn "If installed in a non-default location, set CHROME_BIN=/path/to/browser"
+    fi
+  else
+    ok "Chromium already present on system PATH"
   fi
 else
-  ok "Browser already present on system PATH"
+  ok "Google Chrome detected on PATH"
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -94,16 +117,9 @@ fi
 # ────────────────────────────────────────────────────────────────────────────
 if [[ -d "$REPO_DIR/.git" ]]; then
   info "Repository exists – pulling latest changes"
-  # Harden pull: fetch with depth to keep it quick, then fast-forward only.
-  if git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    git -C "$REPO_DIR" fetch --tags --force --prune --depth 1 origin || true
-    git -C "$REPO_DIR" pull --ff-only || fatal "Unable to fast-forward in $REPO_DIR (local changes?)"
-  else
-    fatal "$REPO_DIR exists but is not a git repository."
-  fi
+  git -C "$REPO_DIR" pull --ff-only
 else
   info "Cloning repository …"
-  install -d -m 0755 "$(dirname "$REPO_DIR")"
   git clone "$REPO_URL" "$REPO_DIR"
 fi
 
@@ -121,37 +137,22 @@ deactivate
 ok "Virtualenv ready"
 
 # ────────────────────────────────────────────────────────────────────────────
-# Launchers (symlinks)
+# Launchers
 # ────────────────────────────────────────────────────────────────────────────
-# Use `install -d` to ensure /usr/local/bin exists and is writable.
-install -d -m 0755 /usr/local/bin
-
 # Console script – symlink the venv entrypoint
-if [[ -x "$VENV_DIR/bin/gpt-review" ]]; then
-  info "Linking CLI → $WRAPPER_BIN"
-  ln -sf "$VENV_DIR/bin/gpt-review" "$WRAPPER_BIN"
-  chmod +x "$WRAPPER_BIN"
-else
-  fatal "Console entrypoint not found at $VENV_DIR/bin/gpt-review"
-fi
+info "Linking CLI → $WRAPPER_BIN"
+ln -sf "$VENV_DIR/bin/gpt-review" "$WRAPPER_BIN"
+chmod +x "$WRAPPER_BIN"
 
 # Bash helper – thin wrapper for convenience
-if [[ -f "$REPO_DIR/software_review.sh" ]]; then
-  info "Linking Bash helper → $WRAPPER_SH"
-  ln -sf "$REPO_DIR/software_review.sh" "$WRAPPER_SH"
-  chmod +x "$WRAPPER_SH"
-else
-  warn "software_review.sh not found in repo; skipping link"
-fi
+info "Linking Bash helper → $WRAPPER_SH"
+ln -sf "$REPO_DIR/software_review.sh" "$WRAPPER_SH"
+chmod +x "$WRAPPER_SH"
 
 # Visible login helper – opens a real browser to save cookies
-if [[ -f "$REPO_DIR/cookie_login.sh" ]]; then
-  info "Linking login helper → $LOGIN_HELPER"
-  ln -sf "$REPO_DIR/cookie_login.sh" "$LOGIN_HELPER"
-  chmod +x "$LOGIN_HELPER"
-else
-  warn "cookie_login.sh not found in repo; skipping link"
-fi
+info "Linking login helper → $LOGIN_HELPER"
+ln -sf "$REPO_DIR/cookie_login.sh" "$LOGIN_HELPER"
+chmod +x "$LOGIN_HELPER"
 
 # ────────────────────────────────────────────────────────────────────────────
 # Final hints
@@ -162,7 +163,9 @@ echo "Login :  cookie_login.sh    # opens a visible browser to save cookies"
 echo "Update:  sudo $0            # rerun this script anytime"
 echo
 echo "Tips:"
-echo "  • If your browser isn’t auto-detected, export CHROME_BIN=/path/to/chrome"
-echo "  • For CI/servers, set GPT_REVIEW_HEADLESS=1"
+echo "  • If your browser isn’t auto-detected, export CHROME_BIN=/usr/bin/google-chrome (or /usr/bin/chromium)"
+echo "  • For CI/servers, set GPT_REVIEW_HEADLESS=1 (headless runs after cookies exist)"
+echo "  • On Snap Chromium, prefer a snap‑writable profile:"
+echo "        export GPT_REVIEW_PROFILE=\"\$HOME/snap/chromium/current/gpt-review-profile\""
 echo "  • To change the login domain for the helper, set GPT_REVIEW_LOGIN_URL"
-echo "      (default: https://chatgpt.com/ ; fallback tab: https://chat.openai.com/)"
+echo "        (default: https://chatgpt.com/ ; fallback: https://chat.openai.com/)"

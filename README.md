@@ -23,14 +23,23 @@ Edit → Run → Fix — until your tests pass.
 | Multi‑arch Docker (Debian + Chromium) | ✅ |
 | Pre‑commit in CI + E2E Selenium smoke test | ✅ |
 | **Login helper URL override** (`GPT_REVIEW_LOGIN_URL`) | ✅ |
+| **Root‑safe visible login** (`--no-sandbox` auto) | ✅ |
+| **Snap‑aware profile defaults** (Chromium confinement) | ✅ |
 
 ---
 
 ## Table of Contents
+
 1. [How it works](#how-it-works)  
 2. [Quick start](#quick-start)  
 3. [Installation](#installation)  
+   - [Debian/Ubuntu (one‑liner)](#debianubuntu-one-liner)  
+   - [pip / virtual‑env](#pip--virtual-env)  
+   - [Docker](#docker)  
 4. [First‑time login](#first-time-login)  
+   - [macOS client (XQuartz) + SSH X‑forwarding](#macos-client-xquartz--ssh-x-forwarding)  
+   - [Headless servers (Xvfb + VNC alternative)](#headless-servers-xvfb--vnc-alternative)  
+   - [Browser choices: Google Chrome (recommended) vs Snap Chromium](#browser-choices-google-chrome-recommended-vs-snap-chromium)  
 5. [Usage](#usage)  
 6. [Session rules](#session-rules)  
 7. [Environment & configuration](#environment--configuration)  
@@ -76,18 +85,25 @@ sequenceDiagram
 
 ```bash
 # 1) Install system deps + package (needs sudo)
-curl -sSL https://raw.githubusercontent.com/bekirdag/gpt_review/main/install.sh | sudo bash
+#    Add INSTALL_GOOGLE_CHROME=1 to install non‑snap Google Chrome (recommended).
+curl -sSL https://raw.githubusercontent.com/bekirdag/gpt_review/main/install.sh | sudo INSTALL_GOOGLE_CHROME=1 bash
 
-# 2) Log in to ChatGPT once (saves cookies to a persistent profile)
+# 2) One‑time visible login (saves cookies)
 cookie_login.sh
-# (Optional) If your region/SSO requires a different login domain:
+# (Optional) If your SSO/region needs a different entrypoint:
 #   export GPT_REVIEW_LOGIN_URL="https://your-entrypoint.example/"
-# and re-run cookie_login.sh
+#   cookie_login.sh
 
-# 3) Run interactive review (wrapper script)
+# 3) Run the review loop
 software_review.sh instructions.txt  /path/to/git/repo  --cmd "pytest -q"
 # Add --auto to auto‑press "continue" after each chunk.
 ```
+
+> After cookies exist, headless is fine:
+> ```bash
+> export GPT_REVIEW_HEADLESS=1
+> software_review.sh instructions.txt /repo --cmd "pytest -q" --auto
+> ```
 
 ---
 
@@ -96,15 +112,15 @@ software_review.sh instructions.txt  /path/to/git/repo  --cmd "pytest -q"
 ### Debian/Ubuntu (one‑liner)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/bekirdag/gpt_review/main/install.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/bekirdag/gpt_review/main/install.sh | sudo INSTALL_GOOGLE_CHROME=1 bash
 ```
 
 The installer:
-* Installs Python, Git, **Chromium** (best‑effort), Xvfb
-* Clones to `/opt/gpt-review` (override with `REPO_DIR`)
-* Creates a virtual‑env at `/opt/gpt-review/venv`
-* Installs the package in editable mode
-* Adds launchers: `gpt-review`, `software_review.sh`, and `cookie_login.sh`
+* Installs Python, Git, **Google Chrome** (if `INSTALL_GOOGLE_CHROME=1`) or **Chromium** (fallback), Xvfb.
+* Clones to `/opt/gpt-review` (override with `REPO_DIR`).
+* Creates a virtual‑env at `/opt/gpt-review/venv`.
+* Installs the package in editable mode.
+* Adds launchers: `gpt-review`, `software_review.sh`, and `cookie_login.sh`.
 
 ### pip / virtual‑env
 
@@ -122,7 +138,11 @@ The official image is Debian‑based and uses system **Chromium** (headless by d
 ```bash
 docker build -t gpt-review .
 
-docker run -it --rm   -v $HOME/.cache/gpt-review/chrome:/home/nonroot/.cache/chrome   -v "$(pwd)":/workspace   gpt-review /workspace/example_instructions.txt /workspace   --cmd "pytest -q" --auto
+docker run -it --rm \
+  -v $HOME/.cache/gpt-review/chrome:/home/nonroot/.cache/chrome \
+  -v "$(pwd)":/workspace \
+  gpt-review /workspace/example_instructions.txt /workspace \
+  --cmd "pytest -q" --auto
 ```
 
 ---
@@ -142,14 +162,67 @@ Sign in, verify you can chat, then **close** the window. Cookies are stored unde
 ~/.cache/gpt-review/chrome   # override with GPT_REVIEW_PROFILE
 ```
 
-**Tip:** If your corporate SSO, regional routing, or network policies require a different entrypoint, set:
-
+Tip: For corporate SSO or regional routing, set a custom URL:
 ```bash
 export GPT_REVIEW_LOGIN_URL="https://your-entrypoint.example/"
 cookie_login.sh
 ```
 
-When `GPT_REVIEW_LOGIN_URL` equals the fallback (`https://chat.openai.com/`), the helper will avoid opening a duplicate tab.
+### macOS client (XQuartz) + SSH X‑forwarding
+
+1. Install **XQuartz** (macOS 14+ supported):
+   ```bash
+   brew install --cask xquartz
+   ```
+2. **Log out** of macOS and log back in (required by XQuartz).
+3. Open XQuartz → Preferences → **Security** → check **“Allow connections from network clients.”**
+4. In Terminal:
+   ```bash
+   open -a XQuartz
+   xhost +localhost
+   ssh -Y <user>@<server>      # trusted X11 forwarding
+   ```
+5. On the server:
+   ```bash
+   echo $DISPLAY                # expect localhost:10.0 (or similar)
+   sudo apt-get update && sudo apt-get install -y x11-apps
+   xclock                       # clock should render on your Mac
+   cookie_login.sh              # this will open Chrome/Chromium on your Mac
+   ```
+
+### Headless servers (Xvfb & VNC alternative)
+
+If SSH X‑forwarding isn’t available, create a virtual display and VNC session:
+
+```bash
+sudo apt-get install -y xvfb x11vnc fluxbox
+export DISPLAY=:99
+Xvfb :99 -screen 0 1280x900x24 &
+fluxbox >/dev/null 2>&1 &
+x11vnc -display :99 -nopw -forever -shared -rfbport 5900 >/dev/null 2>&1 &
+cookie_login.sh
+# On your laptop: ssh -L 5900:localhost:5900 <user>@<server> ; then open vnc://localhost:5900
+```
+
+### Browser choices: Google Chrome (recommended) vs Snap Chromium
+
+**Google Chrome (non‑snap, recommended)** on Ubuntu:
+```bash
+sudo apt-get update && sudo apt-get install -y wget gpg
+wget -qO- https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor | sudo tee /usr/share/keyrings/google-linux.gpg >/dev/null
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+sudo apt-get update && sudo apt-get install -y google-chrome-stable
+export CHROME_BIN=/usr/bin/google-chrome
+```
+
+**Snap Chromium** is confined. Prefer a **snap‑writable** profile path:
+```bash
+export CHROME_BIN=/snap/bin/chromium
+export GPT_REVIEW_PROFILE="$HOME/snap/chromium/current/gpt-review-profile"
+mkdir -p "$GPT_REVIEW_PROFILE"
+```
+
+> The login helper detects root and **auto‑adds `--no-sandbox`** to Chrome/Chromium.
 
 ---
 
@@ -212,8 +285,10 @@ A `.env.example` is provided. Common tunables (read by the driver and logger):
     Fallback to `https://chat.openai.com/` is automatic.
   * `GPT_REVIEW_LOGIN_URL` – primary login URL for **`cookie_login.sh`** (default: `https://chatgpt.com/`).  
     A fallback tab to `https://chat.openai.com/` is opened unless the URLs are identical.
-  * `GPT_REVIEW_PROFILE` – Chrome profile dir for cookies (default: `~/.cache/gpt-review/chrome`)
-  * `CHROME_BIN` – explicit browser binary (`/usr/bin/chromium`, Google Chrome app path, etc.)
+  * `GPT_REVIEW_PROFILE` – Chrome profile dir for cookies  
+    - Non‑snap default: `~/.cache/gpt-review/chrome`  
+    - Snap Chromium: `~/snap/chromium/current/gpt-review-profile`
+  * `CHROME_BIN` – explicit browser binary (`/usr/bin/google-chrome`, `/usr/bin/chromium`, `/snap/bin/chromium`)
   * `GPT_REVIEW_HEADLESS` – any non‑empty value enables new headless mode
 
 * **Timings & retries**
@@ -296,13 +371,29 @@ Two GitHub Actions workflows:
 
 ## Troubleshooting
 
-* **“No composer textarea found”** – ensure you’re logged in (`cookie_login.sh`). The driver searches for both `<textarea>` and contenteditable rich textboxes and clears drafts before sending.
-* **Driver/browser mismatch** – set `CHROME_BIN` to the exact browser binary; the
-  driver auto‑detects **Chromium vs Google Chrome** and downloads a matching driver.
-* **CI headless stability** – keep `GPT_REVIEW_HEADLESS=1` and avoid custom flags.
-* **Long logs not fully received by ChatGPT** – consider lowering `GPT_REVIEW_CHUNK_SIZE`.
-* **Stuck session** – remove `.gpt-review-state.json` and re‑run.
-* **Regional/SSO login quirks** – set `GPT_REVIEW_LOGIN_URL` to your organisation’s ChatGPT entrypoint; a fallback tab to `https://chat.openai.com/` opens unless identical.
+* **No window / instant Chrome exit (SSH)**  
+  - Ensure `echo $DISPLAY` prints something like `localhost:10.0`.  
+  - Test with `xclock`.  
+  - If Snap Chromium, move profile to a snap‑writable path.  
+  - For root sessions, the login helper auto‑adds `--no-sandbox`.
+
+* **“No composer textarea found”**  
+  - Ensure you’re logged in (`cookie_login.sh`). The driver searches for `<textarea>` and clears drafts before sending.
+
+* **Driver/browser mismatch**  
+  - Set `CHROME_BIN` to the exact browser binary; the driver auto‑selects a matching chromedriver.
+
+* **CI headless stability**  
+  - Keep `GPT_REVIEW_HEADLESS=1` and avoid custom flags.
+
+* **Long logs not fully received by ChatGPT**  
+  - Consider lowering `GPT_REVIEW_CHUNK_SIZE`.
+
+* **Stuck session**  
+  - Remove `.gpt-review-state.json` and re‑run.
+
+* **Regional/SSO login quirks**  
+  - Set `GPT_REVIEW_LOGIN_URL` to your organisation’s entrypoint; a fallback tab to `https://chat.openai.com/` opens unless identical.
 
 ---
 
