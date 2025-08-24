@@ -23,12 +23,14 @@ Session rule
 
 These constraints ensure deterministic patching and a clean Git history.
 
-High‑impact robustness in this revision
----------------------------------------
-• **Driver provisioning**:
-  - Respect **CHROMEDRIVER** env (use that binary via `Service`).
-  - Else try **webdriver‑manager** (Chrome vs Chromium).
-  - If that fails (offline/blocked), **fall back to Selenium Manager**.
+High‑impact robustness
+----------------------
+• **Driver provisioning order (most reliable first)**:
+  1) Respect **CHROMEDRIVER** env (absolute path to chromedriver).
+  2) Try **Selenium Manager** (built into Selenium 4.6+).
+  3) Fall back to **webdriver‑manager** (works online).
+  This avoids fragile imports like `ChromeType` whose locations change between
+  webdriver‑manager releases.
 
 • **Composer detection/clearing**:
   - Prefer `<textarea>`; fall back to `div[contenteditable="true"]`.
@@ -42,7 +44,7 @@ High‑impact robustness in this revision
   - Use `"-"` argument and `input=...` to avoid OS argv length limits.
 
 • **Safe commit lookup**:
-  - `_current_commit()` now returns `"<no-commits-yet>"` on fresh repos instead
+  - `_current_commit()` returns `"<no-commits-yet>"` on fresh repos instead
     of crashing, so error reporting works before the first commit.
 """
 from __future__ import annotations
@@ -69,8 +71,14 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC  # noqa: F401
 from selenium.webdriver.support.ui import WebDriverWait  # noqa: F401
-from webdriver_manager.chrome import ChromeDriverManager
-from webdriver_manager.core.utils import ChromeType
+
+# webdriver-manager is optional; import guarded and only used as a fallback.
+try:  # pragma: no cover - availability differs by env
+    from webdriver_manager.chrome import ChromeDriverManager  # type: ignore
+    _WDM_AVAILABLE = True
+except Exception:  # pragma: no cover
+    ChromeDriverManager = None  # type: ignore
+    _WDM_AVAILABLE = False
 
 from logger import get_logger
 from patch_validator import validate_patch
@@ -100,7 +108,7 @@ RAW_JSON_REMINDER: str = (
     "Format reminder: return exactly **one** JSON object — raw JSON only, "
     "no prose, no markdown, no code fences. "
     "Keys: op, file, (body|body_b64), target, mode, status. "
-    'Use status="in_progress" until the last patch, then "completed".'
+    'Use status=\"in_progress\" until the last patch, then \"completed\".'
 )
 
 PROBE_FILE_MAGIC = "__gpt_review_probe__"
@@ -186,8 +194,8 @@ def _detect_browser_binary() -> Optional[str]:
 
     Priority:
     1) Explicit CHROME_BIN (if executable)
-    2) Common CLI names on Linux (google-chrome[-stable], chromium, chromium-browser)
-    3) macOS app bundles (Google Chrome / Chromium)
+    2) Common PATH names on Linux
+    3) macOS app bundles
     """
     env_bin = os.getenv("CHROME_BIN", "")
     if env_bin and os.path.exists(env_bin) and os.access(env_bin, os.X_OK):
@@ -206,13 +214,6 @@ def _detect_browser_binary() -> Optional[str]:
             if os.path.exists(p) and os.access(p, os.X_OK):
                 return p
     return None
-
-
-def _chrome_type_for_binary(binary: Optional[str]) -> ChromeType:
-    """Decide which ChromeType to ask webdriver-manager to download."""
-    if binary and "chromium" in os.path.basename(binary).lower():
-        return ChromeType.CHROMIUM
-    return ChromeType.GOOGLE
 
 
 def _log_driver_versions(drv) -> None:
@@ -236,9 +237,7 @@ def _chrome_driver() -> webdriver.Chrome:
     • GPT_REVIEW_HEADLESS – any non‑empty value enables headless
     • CHROME_BIN – explicit browser binary location (google‑chrome/chromium)
     • CHROMEDRIVER – explicit chromedriver binary (takes precedence)
-    • Auto‑detection of browser binary if CHROME_BIN is not set
-    • Correct ChromeDriver selection for Chromium vs Google Chrome
-    • Fallback to **Selenium Manager** when webdriver‑manager cannot install
+    • Provisioning order: CHROMEDRIVER → Selenium Manager → webdriver‑manager
     """
     profile = Path(
         os.getenv("GPT_REVIEW_PROFILE", "~/.cache/gpt-review/chrome")
@@ -259,8 +258,7 @@ def _chrome_driver() -> webdriver.Chrome:
     else:
         log.info("No explicit browser binary found; relying on Selenium defaults.")
 
-    chrome_type = _chrome_type_for_binary(binary)
-
+    # 1) Explicit chromedriver from env
     explicit_driver = os.getenv("CHROMEDRIVER")
     if explicit_driver and os.path.exists(explicit_driver) and os.access(explicit_driver, os.X_OK):
         log.info("Using CHROMEDRIVER from env: %s", explicit_driver)
@@ -269,17 +267,30 @@ def _chrome_driver() -> webdriver.Chrome:
         _log_driver_versions(drv)
         return drv
 
+    # 2) Selenium Manager (best default; works with system Chrome/Chromium)
     try:
-        service = Service(ChromeDriverManager(chrome_type=chrome_type).install())
-        drv = webdriver.Chrome(service=service, options=opts)
+        drv = webdriver.Chrome(options=opts)
         _log_driver_versions(drv)
         return drv
-    except Exception as exc:  # pragma: no cover
-        log.warning("webdriver‑manager failed (%s). Falling back to Selenium Manager.", exc)
+    except Exception as exc:
+        log.warning("Selenium Manager failed to provision driver: %s", exc)
 
-    drv = webdriver.Chrome(options=opts)
-    _log_driver_versions(drv)
-    return drv
+    # 3) Fallback: webdriver‑manager (online only)
+    if _WDM_AVAILABLE:
+        try:
+            service = Service(ChromeDriverManager().install())  # no ChromeType dependency
+            drv = webdriver.Chrome(service=service, options=opts)
+            _log_driver_versions(drv)
+            return drv
+        except Exception as exc:  # pragma: no cover
+            log.warning("webdriver‑manager failed as fallback: %s", exc)
+
+    # All strategies failed
+    raise RuntimeError(
+        "Unable to provision a Chrome driver. "
+        "Set CHROMEDRIVER to a working chromedriver path, or ensure Selenium "
+        "Manager can download drivers (internet access), or install webdriver-manager."
+    )
 
 
 def _retry(action, what: str):
