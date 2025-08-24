@@ -10,10 +10,10 @@
 # 2) Clones or updates GPT‑Review to /opt/gpt-review   (override via $REPO_DIR)
 # 3) Creates a **Python virtual‑environment** at        /opt/gpt-review/venv
 # 4) Installs the package in *editable* mode (pip install -e .)
-# 5) Creates three launchers (BIN_DIR can be overridden; defaults to /usr/local/bin):
-#       • gpt-review         → console script from the venv
-#       • software_review.sh → convenience Bash wrapper
-#       • cookie_login.sh    → visible browser login helper
+# 5) Creates three launchers:
+#       • /usr/local/bin/gpt-review         → console script from the venv
+#       • /usr/local/bin/software_review.sh → convenience Bash wrapper
+#       • /usr/local/bin/cookie_login.sh    → visible browser login helper
 #
 # Usage
 # -----
@@ -29,7 +29,6 @@
 ###############################################################################
 
 set -euo pipefail
-umask 022
 
 # ────────────────────────────────────────────────────────────────────────────
 # Pretty colours (fallback to plain if not TTY)
@@ -52,48 +51,17 @@ fatal() { echo -e "${RED}✖${RESET} $*" >&2; exit 1; }
 # ────────────────────────────────────────────────────────────────────────────
 # Variables (override by exporting before running)
 # ────────────────────────────────────────────────────────────────────────────
+# Default to your public repo; allow REPO_URL to override.
 REPO_URL="${REPO_URL:-https://github.com/bekirdag/gpt_review.git}"
 REPO_DIR="${REPO_DIR:-/opt/gpt-review}"
 VENV_DIR="${VENV_DIR:-$REPO_DIR/venv}"
 
-# Preferred installation directory for launchers (override with BIN_DIR)
-BIN_DIR_DESIRED="${BIN_DIR:-/usr/local/bin}"
-
-# Resolved at runtime by _choose_bindir()
-BIN_DIR_CHOSEN=""
-
-# Target launcher paths (filled after BIN_DIR_CHOSEN is set)
-WRAPPER_BIN=""   # console entrypoint
-WRAPPER_SH=""    # thin bash helper
-LOGIN_HELPER=""  # visible login helper
+WRAPPER_BIN="/usr/local/bin/gpt-review"             # console entrypoint
+WRAPPER_SH="/usr/local/bin/software_review.sh"      # thin bash helper
+LOGIN_HELPER="/usr/local/bin/cookie_login.sh"       # visible login helper
 
 info "Installing GPT‑Review into $REPO_DIR"
-
-# ────────────────────────────────────────────────────────────────────────────
-# Helper: choose a writable BIN directory
-# ────────────────────────────────────────────────────────────────────────────
-_choose_bindir() {
-  local desired="$1"
-  local chosen="$desired"
-
-  # If desired is writable, use it
-  if [[ -d "$desired" && -w "$desired" ]]; then
-    echo "$desired"; return 0
-  fi
-
-  # Try /usr/bin as a fallback
-  if [[ "$desired" != "/usr/bin" && -d "/usr/bin" && -w "/usr/bin" ]]; then
-    warn "BIN_DIR '$desired' not writable. Falling back to /usr/bin"
-    echo "/usr/bin"; return 0
-  fi
-
-  # Final fallback: create a local bin inside the repo and advise PATH update
-  local local_bin="$REPO_DIR/bin"
-  mkdir -p "$local_bin"
-  warn "Neither '$desired' nor '/usr/bin' is writable."
-  warn "Falling back to: $local_bin"
-  echo "$local_bin"; return 0
-}
+info "Repository URL: $REPO_URL"
 
 # ────────────────────────────────────────────────────────────────────────────
 # System packages
@@ -106,7 +74,9 @@ apt-get install -y --no-install-recommends \
   xvfb
 
 # Best effort browser install (Chromium from APT)
-if ! command -v chromium >/dev/null 2>&1 && ! command -v chromium-browser >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1; then
+if ! command -v chromium >/dev/null 2>&1 && \
+   ! command -v chromium-browser >/dev/null 2>&1 && \
+   ! command -v google-chrome >/dev/null 2>&1; then
   if apt-get install -y --no-install-recommends chromium; then
     ok "Installed chromium"
   elif apt-get install -y --no-install-recommends chromium-browser; then
@@ -124,9 +94,16 @@ fi
 # ────────────────────────────────────────────────────────────────────────────
 if [[ -d "$REPO_DIR/.git" ]]; then
   info "Repository exists – pulling latest changes"
-  git -C "$REPO_DIR" pull --ff-only
+  # Harden pull: fetch with depth to keep it quick, then fast-forward only.
+  if git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "$REPO_DIR" fetch --tags --force --prune --depth 1 origin || true
+    git -C "$REPO_DIR" pull --ff-only || fatal "Unable to fast-forward in $REPO_DIR (local changes?)"
+  else
+    fatal "$REPO_DIR exists but is not a git repository."
+  fi
 else
   info "Cloning repository …"
+  install -d -m 0755 "$(dirname "$REPO_DIR")"
   git clone "$REPO_URL" "$REPO_DIR"
 fi
 
@@ -144,37 +121,36 @@ deactivate
 ok "Virtualenv ready"
 
 # ────────────────────────────────────────────────────────────────────────────
-# Launchers
+# Launchers (symlinks)
 # ────────────────────────────────────────────────────────────────────────────
-BIN_DIR_CHOSEN="$(_choose_bindir "$BIN_DIR_DESIRED")"
-WRAPPER_BIN="$BIN_DIR_CHOSEN/gpt-review"
-WRAPPER_SH="$BIN_DIR_CHOSEN/software_review.sh"
-LOGIN_HELPER="$BIN_DIR_CHOSEN/cookie_login.sh"
-
-info "Using launcher directory: $BIN_DIR_CHOSEN"
-mkdir -p "$BIN_DIR_CHOSEN"
+# Use `install -d` to ensure /usr/local/bin exists and is writable.
+install -d -m 0755 /usr/local/bin
 
 # Console script – symlink the venv entrypoint
-info "Linking CLI → $WRAPPER_BIN"
-ln -sf "$VENV_DIR/bin/gpt-review" "$WRAPPER_BIN" || fatal "Failed to link $WRAPPER_BIN"
-chmod +x "$WRAPPER_BIN" || true
+if [[ -x "$VENV_DIR/bin/gpt-review" ]]; then
+  info "Linking CLI → $WRAPPER_BIN"
+  ln -sf "$VENV_DIR/bin/gpt-review" "$WRAPPER_BIN"
+  chmod +x "$WRAPPER_BIN"
+else
+  fatal "Console entrypoint not found at $VENV_DIR/bin/gpt-review"
+fi
 
 # Bash helper – thin wrapper for convenience
-info "Linking Bash helper → $WRAPPER_SH"
-ln -sf "$REPO_DIR/software_review.sh" "$WRAPPER_SH" || fatal "Failed to link $WRAPPER_SH"
-chmod +x "$WRAPPER_SH" || true
+if [[ -f "$REPO_DIR/software_review.sh" ]]; then
+  info "Linking Bash helper → $WRAPPER_SH"
+  ln -sf "$REPO_DIR/software_review.sh" "$WRAPPER_SH"
+  chmod +x "$WRAPPER_SH"
+else
+  warn "software_review.sh not found in repo; skipping link"
+fi
 
 # Visible login helper – opens a real browser to save cookies
-info "Linking login helper → $LOGIN_HELPER"
-ln -sf "$REPO_DIR/cookie_login.sh" "$LOGIN_HELPER" || fatal "Failed to link $LOGIN_HELPER"
-chmod +x "$LOGIN_HELPER" || true
-
-# If we had to fall back to a repo-local bin/, guide the user to update PATH
-if [[ "$BIN_DIR_CHOSEN" == "$REPO_DIR/bin" ]]; then
-  echo
-  warn "Your PATH may not include '$BIN_DIR_CHOSEN'."
-  echo "To make the launchers available, add this to your shell profile:"
-  echo "  export PATH=\"$BIN_DIR_CHOSEN:\$PATH\""
+if [[ -f "$REPO_DIR/cookie_login.sh" ]]; then
+  info "Linking login helper → $LOGIN_HELPER"
+  ln -sf "$REPO_DIR/cookie_login.sh" "$LOGIN_HELPER"
+  chmod +x "$LOGIN_HELPER"
+else
+  warn "cookie_login.sh not found in repo; skipping link"
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -190,4 +166,3 @@ echo "  • If your browser isn’t auto-detected, export CHROME_BIN=/path/to/ch
 echo "  • For CI/servers, set GPT_REVIEW_HEADLESS=1"
 echo "  • To change the login domain for the helper, set GPT_REVIEW_LOGIN_URL"
 echo "      (default: https://chatgpt.com/ ; fallback tab: https://chat.openai.com/)"
-echo "  • Override the launcher directory with:  BIN_DIR=/custom/bin sudo $0"

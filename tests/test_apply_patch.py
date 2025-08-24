@@ -15,7 +15,8 @@ Goals
     • commits created as expected
     • path‑traversal attempts blocked
     • local‑change protection works
-    • **staging is scoped** – unrelated sibling changes are not swept in
+    • **no writes inside .git/** (high‑impact safety)
+    • **path‑scoped staging**: unrelated files are not swept into commits
 
 All tests run inside a **temporary Git repository** created via the
 tmp_path fixture (pytest).
@@ -95,6 +96,14 @@ def _commit_count(repo: Path) -> int:
     Return the number of commits in *repo*.
     """
     return int(_git(repo, "rev-list", "--count", "HEAD", capture=True).strip())
+
+
+def _last_commit_paths(repo: Path) -> list[str]:
+    """
+    Return the paths modified in the last commit (name-only).
+    """
+    out = _git(repo, "diff", "--name-only", "HEAD~1..HEAD", capture=True)
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
 
 
 # =============================================================================
@@ -270,39 +279,94 @@ def test_path_traversal_blocked(tmp_path: Path):
     log.info("Path traversal protection test passed.")
 
 
-def test_staging_scoped_no_sibling_sweep(tmp_path: Path):
+# =============================================================================
+# New high‑impact safety tests: **block any writes inside .git/**
+# =============================================================================
+def test_reject_create_inside_dot_git(tmp_path: Path):
     """
-    Creating a file under a directory that also contains a **modified** sibling
-    must NOT stage that sibling. Only the target path should be included.
+    Creating a file inside `.git/` must be rejected with PermissionError.
+    """
+    repo = _init_repo(tmp_path)
+    bad = {
+        "op": "create",
+        "file": ".git/hook.sh",
+        "body": "#!/bin/sh\necho hacked\n",
+        "status": "in_progress",
+    }
+    with pytest.raises(PermissionError):
+        _apply(bad, repo)
+    # Nothing under working tree should have changed
+    assert not (repo / "hook.sh").exists()
+    log.info("Create inside .git/ correctly rejected.")
+
+
+def test_reject_update_inside_dot_git(tmp_path: Path):
+    """
+    Updating a file under `.git/` (e.g., config) must be rejected.
+    """
+    repo = _init_repo(tmp_path)
+    bad = {
+        "op": "update",
+        "file": ".git/config",
+        "body": "[core]\n\teditor = vim\n",
+        "status": "in_progress",
+    }
+    with pytest.raises(PermissionError):
+        _apply(bad, repo)
+    log.info("Update inside .git/ correctly rejected.")
+
+
+def test_reject_rename_target_into_dot_git(tmp_path: Path):
+    """
+    Renaming a normal file **into** `.git/` must be rejected.
+    """
+    repo = _init_repo(tmp_path)
+
+    # Create a safe file first (through the SUT) so the rename source exists
+    _apply(
+        {"op": "create", "file": "safe.txt", "body": "ok", "status": "in_progress"},
+        repo,
+    )
+    assert (repo / "safe.txt").exists()
+
+    bad = {
+        "op": "rename",
+        "file": "safe.txt",
+        "target": ".git/evil.txt",
+        "status": "in_progress",
+    }
+    with pytest.raises(PermissionError):
+        _apply(bad, repo)
+
+    # Ensure source remains intact after rejection
+    assert (repo / "safe.txt").exists()
+    assert not (repo / ".git/evil.txt").exists()
+    log.info("Rename target into .git/ correctly rejected.")
+
+
+# =============================================================================
+# New high‑impact correctness test: **path‑scoped staging**
+# =============================================================================
+def test_staging_is_path_scoped(tmp_path: Path):
+    """
+    When creating a file, any unrelated modified files must **not** be pulled
+    into the commit. This guards against parent‑dir 'git add -A' staging.
     """
     repo = _init_repo(tmp_path, initial_file=True)
 
-    # Add a sibling file and commit it
-    (repo / "docs").mkdir(parents=True, exist_ok=True)
-    (repo / "docs" / "kept.txt").write_text("keep\n")
-    _git(repo, "add", "docs/kept.txt")
-    _git(repo, "commit", "-m", "add kept")
+    # Make an unrelated local change (unstaged)
+    (repo / "unrelated.txt").write_text("dirty\n")
 
-    # Modify kept.txt locally (leave it unstaged)
-    (repo / "docs" / "kept.txt").write_text("local change\n")
-
-    # Apply a create patch for a different file in the same directory
+    # Apply a create patch for a different path
     _apply(
-        {
-            "op": "create",
-            "file": "docs/new.txt",
-            "body": "new",
-            "status": "in_progress",
-        },
+        {"op": "create", "file": "docs/only_me.txt", "body": "data", "status": "in_progress"},
         repo,
     )
 
-    # The modified sibling must remain unstaged after the commit
-    status = _git(repo, "status", "--porcelain", capture=True)
-    assert " M docs/kept.txt" in status.splitlines()
+    changed = set(_last_commit_paths(repo))
+    assert changed == {"docs/only_me.txt"}, f"Unexpected paths in commit: {changed}"
 
-    # Last commit should only contain the new file
-    name_status = _git(
-        repo, "diff-tree", "--no-commit-id", "--name-status", "-r", "HEAD", capture=True
-    ).strip()
-    assert name_status.splitlines() == ["A\tdocs/new.txt"]
+    # The unrelated change remains untracked/unstaged
+    status = _git(repo, "status", "--porcelain", capture=True)
+    assert "unrelated.txt" in status
+    log.info("Path‑scoped staging verified: no collateral files committed.")

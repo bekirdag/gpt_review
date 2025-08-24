@@ -4,8 +4,7 @@
 Edit → Run → Fix — until your tests pass.
 
 <p align="center">
-  <!-- If this image doesn't render (e.g. on PyPI), open the repository on GitHub where docs/ is available. -->
-  <img src="docs/assets/diagram.svg" width="600" alt="GPT‑Review architecture diagram"/>
+  <img src="https://raw.githubusercontent.com/bekirdag/gpt_review/main/docs/assets/diagram.svg" width="600" alt="GPT‑Review architecture diagram"/>
 </p>
 
 | Feature | Status |
@@ -73,10 +72,11 @@ sequenceDiagram
 
 ## Quick start
 
+> **Requirements:** Python **3.10+**, Git, and a Chromium/Chrome browser.
+
 ```bash
 # 1) Install system deps + package (needs sudo)
-# NOTE: replace 'your-org' with your actual GitHub org/user if you forked.
-curl -sSL https://raw.githubusercontent.com/bekirdag/gpt-review/main/install.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/bekirdag/gpt_review/main/install.sh | sudo bash
 
 # 2) Log in to ChatGPT once (saves cookies to a persistent profile)
 cookie_login.sh
@@ -96,7 +96,7 @@ software_review.sh instructions.txt  /path/to/git/repo  --cmd "pytest -q"
 ### Debian/Ubuntu (one‑liner)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/bekirdag/gpt-review/main/install.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/bekirdag/gpt_review/main/install.sh | sudo bash
 ```
 
 The installer:
@@ -117,7 +117,7 @@ pip install -e .[dev]
 
 ### Docker
 
-The container image is Debian‑based and uses system **Chromium** (headless by default). Build it locally:
+The official image is Debian‑based and uses system **Chromium** (headless by default).
 
 ```bash
 docker build -t gpt-review .

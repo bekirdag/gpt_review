@@ -33,8 +33,8 @@ CLI usage
 Design notes
 ------------
 * The schema is loaded **once** at import time via `importlib.resources`.
-* We compile a `Draft7Validator` for speed and nicer error messages.
-* Log output is concise but includes JSON pointers for failing fields.
+* We compile a `Draft7Validator` for speed and structured errors.
+* Logging is centralised via the project logger.
 """
 from __future__ import annotations
 
@@ -47,12 +47,12 @@ from typing import Any, Dict
 import jsonschema
 from jsonschema import Draft7Validator, ValidationError
 
-from gpt_review import get_logger
+from logger import get_logger
 
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
-log = get_logger(__name__)
+log = get_logger("patch_validator")
 
 # -----------------------------------------------------------------------------
 # Load schema at import‑time (fast & safe)
@@ -82,6 +82,9 @@ def _load_schema() -> Dict[str, Any]:
         raise SystemExit(1) from exc
     except json.JSONDecodeError as exc:  # pragma: no cover
         log.critical("schema.json is invalid JSON: %s", exc)
+        raise SystemExit(1) from exc
+    except Exception as exc:  # pragma: no cover
+        log.critical("Failed to load schema.json: %s", exc)
         raise SystemExit(1) from exc
 
 
@@ -121,7 +124,12 @@ def validate_patch(patch_json: str | bytes) -> Dict[str, Any]:
         If *patch_json* is not valid JSON.
     """
     if isinstance(patch_json, bytes):
-        patch_json = patch_json.decode()
+        try:
+            patch_json = patch_json.decode()
+        except Exception as exc:
+            # Mirror json.JSONDecodeError semantics for non‑utf8 bytes
+            log.error("Failed to decode bytes payload as UTF‑8: %s", exc)
+            raise
 
     data = json.loads(patch_json)
 
@@ -206,6 +214,9 @@ def _cli(argv: list[str] | None = None) -> int:
         return 1
     except json.JSONDecodeError as exc:
         log.error("❌ Payload is not valid JSON: %s", exc)
+        return 1
+    except Exception as exc:  # pragma: no cover
+        log.exception("❌ Unexpected error: %s", exc)
         return 1
 
 

@@ -6,11 +6,15 @@
 # • GNU Make (pre‑installed on most Unix‑like systems)
 # • Python 3.9+  (virtual‑env optional but recommended)
 #
-# Colours
-# -------
-# We add a minimal colour helper ($(C_INFO), $(C_OK), …) to make the output
-# readable. Falls back to plain text when stdout is not a TTY.
+# Quality‑of‑life
+# ---------------
+# • Use bash with strict flags for reliability in recipes.
+# • Configurable Docker binary and image tag via variables.
 ###############################################################################
+
+# Use bash with "strict mode" for every recipe
+SHELL := /bin/bash
+.SHELLFLAGS := -euo pipefail -c
 
 ifndef NO_COLOR
 C_INFO := \033[34m
@@ -37,6 +41,10 @@ COV_HTML := htmlcov/index.html
 # Default instruction file for examples / docker-run (inside repo root)
 INSTR ?= example_instructions.txt
 
+# Docker knobs
+DOCKER ?= docker
+IMAGE  ?= gpt-review:latest
+
 .PHONY: help install fmt precommit lint test cov e2e smoke login docker docker-run changelog clean
 
 # ---------------------------------------------------------------------------#
@@ -44,7 +52,7 @@ INSTR ?= example_instructions.txt
 # ---------------------------------------------------------------------------#
 help: ## Show this help
 	@echo "$(C_INFO)Available targets:$(C_END)"
-	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | \
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[32m%-12s\033[0m %s\n", $$1, $$2}'
 
 # ---------------------------------------------------------------------------#
@@ -135,18 +143,21 @@ login: ## Open visible browser for cookie login (respects GPT_REVIEW_LOGIN_URL)
 # ---------------------------------------------------------------------------#
 # Docker helpers
 # ---------------------------------------------------------------------------#
-docker: ## Build local Docker image
-	@echo "$(C_INFO)[docker] Building Docker image 'gpt-review:latest' …$(C_END)"
-	docker build -t gpt-review .
+docker: ## Build local Docker image (set IMAGE=mytag if desired)
+	@echo "$(C_INFO)[docker] Building Docker image '$(IMAGE)' …$(C_END)"
+	$(DOCKER) build -t $(IMAGE) .
 	@echo "$(C_OK)✓ Docker image built$(C_END)"
 
 docker-run: ## Run Docker image (mount profile & current repo); set INSTR=path if needed
 	@echo "$(C_INFO)[docker] Running container with mounted workspace …$(C_END)"
-	@echo "$(C_INFO)      INSTR file: $(INSTR) (must be inside repo)$(C_END)"
-	@docker run -it --rm \
+	@echo "$(C_INFO)      INSTR file: $(INSTR) (must exist inside repo root)$(C_END)"
+	@if [[ ! -f "$(INSTR)" ]]; then \
+		echo "$(C_ERR)✖ INSTR '$(INSTR)' not found in $(PWD)$(C_END)"; exit 1; \
+	fi
+	$(DOCKER) run -it --rm \
 		-v "$(HOME)/.cache/gpt-review/chrome:/home/nonroot/.cache/chrome" \
 		-v "$(PWD)":/workspace \
-		gpt-review "/workspace/$(INSTR)" "/workspace" --cmd "pytest -q" --auto
+		$(IMAGE) "/workspace/$(INSTR)" "/workspace" --cmd "pytest -q" --auto
 
 # ---------------------------------------------------------------------------#
 # Changelog helper
@@ -157,16 +168,13 @@ changelog: ## Print “Unreleased” (or latest) section from CHANGELOG.md
 import re, sys, pathlib
 p = pathlib.Path("CHANGELOG.md")
 if not p.exists():
-    print("CHANGELOG.md not found", file=sys.stderr)
-    sys.exit(1)
+    print("CHANGELOG.md not found", file=sys.stderr); sys.exit(1)
 text = p.read_text(encoding="utf-8")
-# Prefer the Unreleased section; otherwise fall back to the first release entry.
 m = re.search(r"^##\s+\[Unreleased\].*?(?=^##\s+\[|\Z)", text, re.M | re.S)
 if not m:
     m = re.search(r"^##\s+\[[^\]]+\].*?(?=^##\s+\[|\Z)", text, re.M | re.S)
 if not m:
-    print("No sections found in CHANGELOG.md", file=sys.stderr)
-    sys.exit(1)
+    print("No sections found in CHANGELOG.md", file=sys.stderr); sys.exit(1)
 print(m.group(0).rstrip())
 PY
 	@echo "$(C_OK)✓ Done$(C_END)"

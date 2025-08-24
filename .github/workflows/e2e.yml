@@ -8,8 +8,7 @@
 #     • `webdriver-manager` can download a matching chromedriver
 #     • The helper `_chrome_driver()` returns a usable driver
 # * Add resilience + observability:
-#     • Built‑in pip caching (actions/setup-python cache)
-#     • Cache webdriver-manager downloads keyed by **Chrome major** version
+#     • Cache webdriver-manager downloads
 #     • Retry browser launch on transient failures
 #     • Append a compact, useful Job Summary
 #
@@ -35,13 +34,13 @@ concurrency:
   group: e2e-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      PIP_NO_INPUT: "1"
 
     steps:
       # -----------------------------------------------------------------------
@@ -57,14 +56,13 @@ jobs:
         uses: actions/checkout@v4
 
       # -----------------------------------------------------------------------
-      # 2.  Install Python (with built‑in pip cache)
+      # 2.  Install Python
       # -----------------------------------------------------------------------
       - name: "🐍  Set up Python 3.12"
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
-          cache-dependency-path: "pyproject.toml"
 
       # -----------------------------------------------------------------------
       # 3.  Install package (editable mode + dev extras)
@@ -90,24 +88,22 @@ jobs:
           echo "  ${{ steps.chrome.outputs.chrome-path }}"
           "${{ steps.chrome.outputs.chrome-path }}" --version
 
-      # Extract Chrome version and major for cache keying
+      # Extract Chrome version for cache key (more reliable than relying on action outputs)
       - name: "🔢  Extract Chrome version"
         id: chromever
         run: |
           ver="$("${{ steps.chrome.outputs.chrome-path }}" --version | grep -Eo '[0-9.]+' | head -n1)"
-          major="${ver%%.*}"
           echo "ver=$ver" >> "$GITHUB_OUTPUT"
-          echo "major=$major" >> "$GITHUB_OUTPUT"
-          echo "Chrome version resolved: $ver (major: $major)"
+          echo "Chrome version resolved: $ver"
 
       # -----------------------------------------------------------------------
-      # 5.  Cache webdriver-manager artifacts (~/.wdm), keyed by Chrome **major**
+      # 5.  Cache webdriver-manager artifacts (~/.wdm)
       # -----------------------------------------------------------------------
       - name: "💾  Cache webdriver-manager"
         uses: actions/cache@v4
         with:
           path: ~/.wdm
-          key: wdm-${{ runner.os }}-v${{ steps.chromever.outputs.major }}
+          key: wdm-${{ runner.os }}-${{ steps.chromever.outputs.ver }}
           restore-keys: |
             wdm-${{ runner.os }}-
 
@@ -126,6 +122,7 @@ jobs:
         env:
           GPT_REVIEW_HEADLESS: "1"      # force headless=new in the driver
           CHROME_BIN: "${{ steps.chrome.outputs.chrome-path }}"
+          PY_COLORS: "1"
         run: |
           echo "::group::Python smoke test script"
           xvfb-run -a python - <<'PY'

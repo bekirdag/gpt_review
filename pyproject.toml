@@ -7,12 +7,11 @@
 #
 # Changes in this revision
 # ------------------------
-# • Explicitly include the **gpt_review** package in wheels/sdists so that
-#   bundled resources (schema.json) and `python -m gpt_review` work reliably.
-# • Keep top‑level modules (`review`, `apply_patch`, `patch_validator`, `logger`)
-#   via `py-modules` – these back the console entry‑point `gpt-review`.
-# • Project URLs now point to the canonical repo:
-#     https://github.com/bekirdag/gpt_review
+# • **Single source of truth for Flake8**: keep lint settings in `.flake8`.
+#   The previous duplicate `[tool.flake8]` table has been removed to avoid
+#   precedence ambiguity.
+# • Canonical dependency casing: `GitPython` (PyPI name) for clarity.
+# • Project URLs point at `https://github.com/bekirdag/gpt_review`.
 ###############################################################################
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -59,7 +58,7 @@ dependencies = [
   "jsonschema>=4.22.0",
 
   # Git plumbing
-  "gitpython>=3.1.43",
+  "GitPython>=3.1.43",
 
   # Misc HTTP helpers
   "requests>=2.32.3"
@@ -110,7 +109,7 @@ gpt-review = "review:main"
 packages = ["gpt_review"]               # ← ensures `gpt_review` package is in the wheel
 include-package-data = true             # ← cooperate with MANIFEST.in when building sdists
 
-# Top‑level modules that live outside the package dir (shim for legacy imports)
+# Top‑level modules that live outside the package dir
 py-modules = ["review", "apply_patch", "patch_validator", "logger"]
 
 [tool.setuptools.package-data]
@@ -136,26 +135,13 @@ combine_as_imports      = true
 force_grid_wrap         = 0
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  flake8 (linter)
-# ─────────────────────────────────────────────────────────────────────────────
-[tool.flake8]
-max-line-length = 88
-extend-ignore   = "E203,W503,E501"
-exclude         = [
-  ".git",
-  "venv",
-  ".cache",
-  "build",
-  "dist",
-  "logs",
-  "__pycache__",
-]
-select          = "C,E,F,W,B,B9"
-per-file-ignores = "tests/*:S101"
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  coverage.py
 # ─────────────────────────────────────────────────────────────────────────────
 [tool.coverage.run]
 branch = true
 source = ["gpt_review", "review", "apply_patch", "patch_validator"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Flake8 lives in `.flake8`
+# ─────────────────────────────────────────────────────────────────────────────
+# Intentionally no [tool.flake8] here to avoid config duplication.

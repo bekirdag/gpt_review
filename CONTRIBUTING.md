@@ -49,8 +49,11 @@ Before opening an Issue:
 ---
 
 ## Development Quick‑Start
+
+> **Requires Python 3.10+** (the codebase uses PEP 604 `|` unions).
+
 ```bash
-git clone https://github.com/your‑org/gpt-review.git
+git clone https://github.com/bekirdag/gpt_review.git
 cd gpt-review
 python -m venv venv && . venv/bin/activate
 pip install -e .[dev]           # pytest, black, flake8, pre‑commit

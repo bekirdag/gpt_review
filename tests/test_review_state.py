@@ -1,47 +1,49 @@
 """
 ===============================================================================
-Unit‑tests ▸ review.py empty‑repo (unborn HEAD) behavior
+Unit‑tests for review.py repo state helpers
 ===============================================================================
-Ensures the driver tolerates repositories with no commits yet and persists
-a sensible state file.
+
+Covers:
+* _current_commit() on an empty repository (unborn HEAD)
+* _current_commit() after an initial commit
 """
 from __future__ import annotations
 
-import json
+import logging
+import re
 import subprocess
 from pathlib import Path
 
-from review import HEAD_UNBORN, _current_commit  # type: ignore[attr-defined]
+from review import _current_commit, HEAD_UNBORN
+
+log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
 
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(repo), *args], check=True, text=True)
 
 
-def _init_empty_repo(tmp: Path) -> Path:
-    repo = tmp / "empty"
+def _init_repo(tmp: Path, do_commit: bool = False) -> Path:
+    repo = tmp / "repo_state"
     repo.mkdir()
     _git(repo, "init", "-q")
     _git(repo, "config", "user.email", "t@example.com")
     _git(repo, "config", "user.name", "Test")
+    if do_commit:
+        (repo / "a.txt").write_text("x\n")
+        _git(repo, "add", "a.txt")
+        _git(repo, "commit", "-m", "init")
     return repo
 
 
-def test_unborn_head_reports_sentinel(tmp_path: Path) -> None:
-    repo = _init_empty_repo(tmp_path)
-    assert _current_commit(repo) == HEAD_UNBORN
+def test_unborn_head_returns_sentinel(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path, do_commit=False)
+    sha = _current_commit(repo)
+    assert sha == HEAD_UNBORN
 
 
-def test_state_file_uses_unborn_head(tmp_path: Path) -> None:
-    # Re‑implement tiny helper to avoid importing private state writers
-    repo = _init_empty_repo(tmp_path)
-    state_path = repo / ".gpt-review-state.json"
-    data = {
-        "conversation_url": "https://chatgpt.com/",
-        "last_commit": _current_commit(repo),
-        "timestamp": 0,
-    }
-    state_path.write_text(json.dumps(data), encoding="utf-8")
-
-    loaded = json.loads(state_path.read_text(encoding="utf-8"))
-    assert loaded["last_commit"] == HEAD_UNBORN
+def test_after_initial_commit_returns_sha(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path, do_commit=True)
+    sha = _current_commit(repo)
+    assert re.fullmatch(r"[0-9a-f]{40}", sha) is not None

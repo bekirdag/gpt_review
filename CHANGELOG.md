@@ -7,18 +7,18 @@ The format is inspired by [Keep a Changelog](https://keepachangelog.com/) and th
 
 ## [Unreleased]
 
-### Added
-- Tests: **unborn HEAD** handling in `review.py` (`tests/test_review_state.py`).
-- Docs: README notes on **scoped staging** and **empty‑repo safety**.
-
 ### Changed
-- **apply_patch.py** — **scoped staging** for create/update: only the exact pathspecs are staged (no sibling sweep). Deletion staging remains safe and precise.
-- **review.py** — improved composer detection (contenteditable + aria/placeholder hints), reliable draft clearing (Select‑All + Backspace), and **unborn‑HEAD** safety.
-- **CI** — validates that packaged **`gpt_review/schema.json`** is importable.
-- **Dockerfile** — fixed invalid leading indentation before `FROM` and kept logs/chatty build output consistent.
+- **Runtime** — set `requires-python` to **>= 3.10** (drop 3.9); code uses 3.10‑only syntax (PEP 604 `|` unions).
+- **cookie_login.sh** — honors `GPT_REVIEW_LOGIN_URL` for the primary tab (default remains `https://chatgpt.com/`), keeps a `chat.openai.com` fallback with de‑duplication, and improves user guidance; login stays **non‑headless** by design.
+- **review.py** — increased DOM resilience (additional textarea selectors with aria/placeholder hints and a contenteditable fallback), robust draft clearing (Select‑All + Backspace) before sending, safer assistant‑block selection, and reply completion gated on non‑empty text.
+- **.env.example** — clarified the distinction between `GPT_REVIEW_LOGIN_URL` (login helper) and `GPT_REVIEW_CHAT_URL` (driver navigation).
+- **README.md** — documented the login override and aligned first‑time login guidance.
+- **Dockerfile** — cosmetic cleanups, consistent indentation, explicit `set -eux` build logging, and minor environment flag improvements.
 
 ### Fixed
-- Minor doc inconsistencies; unified `GitPython` naming across configs.
+- **apply_patch.py** — precise staging to avoid unrelated files in commits; accept `0755`/`0644` as well as `755`/`644`.
+- **review.py** — safe commit lookup on fresh repos during error reporting.
+- **.dockerignore** — removed duplicate `.env` pattern and tightened comments.
 
 > Note: Version remains **0.3.0** in `pyproject.toml` / `__init__.py`. These entries will be rolled into the next tagged release (e.g., `0.3.1`).
 

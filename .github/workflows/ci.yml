@@ -14,10 +14,14 @@
 # • On Python 3.12, append coverage and a Changelog excerpt (Unreleased or the
 #   latest release) to the **Job Summary** for quick PR review.
 #
+# Other workflows
+# ---------------
+# • End‑to‑End browser smoke test lives in *e2e.yml* and runs separately.
+#
 # Performance
 # -----------
-# • Built‑in pip caching via `actions/setup-python` keyed by `pyproject.toml`
-# • pre‑commit cache keyed on OS + .pre-commit-config.yaml hash
+# • Built‑in pip cache via setup‑python.
+# • Pre‑commit cache keyed on OS + .pre-commit-config.yaml hash.
 # • Concurrency cancels stale runs on same branch / PR.
 # • Log groups keep GitHub UI readable.
 # =============================================================================
@@ -34,32 +38,29 @@ concurrency:
   group: ci-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
+# -----------------------------------------------------------------------------#
+#  LINT JOB (pre‑commit)
+# -----------------------------------------------------------------------------#
 jobs:
-  # ---------------------------------------------------------------------------#
-  #  LINT JOB (pre‑commit)
-  # ---------------------------------------------------------------------------#
   lint:
     name: "Lint (pre‑commit)"
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      PIP_NO_INPUT: "1"
-      PY_COLORS: "1"
 
     steps:
       - name: "⬇️  Checkout repository"
         uses: actions/checkout@v4
 
-      - name: "🐍  Set up Python 3.12 (with pip cache)"
+      - name: "🐍  Set up Python 3.12"
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
-          cache-dependency-path: "pyproject.toml"
 
       - name: "💾  Restore pre‑commit cache"
-        id: precommit-cache
         uses: actions/cache@v4
         with:
           path: ~/.cache/pre-commit
@@ -86,10 +87,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: lint
     timeout-minutes: 25
-    env:
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      PIP_NO_INPUT: "1"
-      PY_COLORS: "1"
 
     strategy:
       matrix:
@@ -99,12 +96,11 @@ jobs:
       - name: "⬇️  Checkout repository"
         uses: actions/checkout@v4
 
-      - name: "🐍  Set up Python ${{ matrix.python-version }} (with pip cache)"
+      - name: "🐍  Set up Python ${{ matrix.python-version }}"
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: "pip"
-          cache-dependency-path: "pyproject.toml"
 
       - name: "📥  Install package with dev extras"
         run: |
@@ -112,6 +108,8 @@ jobs:
           pip install .[dev]
 
       - name: "🧪  Run pytest with coverage"
+        env:
+          PY_COLORS: "1"
         run: |
           echo "::group::pytest"
           coverage run -m pytest -q
@@ -121,10 +119,12 @@ jobs:
       - name: "📊  Add coverage to job summary (3.12 only)"
         if: matrix.python-version == '3.12'
         run: |
-          echo '### Coverage report (Python 3.12)' >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          coverage report -m >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '### Coverage report (Python 3.12)';
+            echo '```';
+            coverage report -m;
+            echo '```';
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # --------------------------------------------------------------------- #
       # Changelog excerpt (Unreleased or latest) → Job Summary, 3.12 only

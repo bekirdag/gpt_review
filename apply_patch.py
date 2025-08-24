@@ -18,17 +18,15 @@ Supported operations
 | update  | file, body | body_b64         | Fails if *file* missing or locally dirty|
 | delete  | file                         | Fails if missing or directory           |
 | rename  | file, target                 | Target must not exist                   |
-| chmod   | file, mode (644 / 755)       | Safe‑list prevents 777 etc.             |
+| chmod   | file, mode (644 / 755)       | Accepts 3‑ or 4‑digit octal (0755 ok)   |
 
 Safety nets
 -----------
 * **Path traversal** – rejects any path escaping repo root (../ tricks).
-* **Local modifications** – refuses destructive ops when file differs from
-  *HEAD* (staged *or* unstaged).
-* **Safe chmod** – allows only 644/755 (**accepts** both "755" and "0755").
-* **No‑op commits** – skips commit when there is nothing to stage (idempotent).
-* **CRLF→LF normalization** – text bodies are normalized to LF + trailing \n
-  to avoid noisy diffs when patches are authored on Windows.
+* **Local modifications** – refuses destructive ops when file differs from HEAD.
+* **Safe chmod** – only 0644 or 0755 allowed (accept both 3/4‑digit forms).
+* **Precise staging** – stage only the affected path(s); never parent dirs.
+* **No‑op commits** – skip commit when there is nothing to stage (idempotent).
 
 Logging
 -------
@@ -42,6 +40,7 @@ import base64
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -54,8 +53,7 @@ from logger import get_logger
 # -----------------------------------------------------------------------------
 # Constants & logger
 # -----------------------------------------------------------------------------
-# Accept "755" and "0755" (same for 644). Using numeric set avoids string drift.
-_ALLOWED_MODES = {0o644, 0o755}
+SAFE_MODES = {"644", "755"}  # normalized (no leading zero) whitelist
 log = get_logger(__name__)
 
 # -----------------------------------------------------------------------------
@@ -97,45 +95,51 @@ def _is_tracked(repo: Path, rel_path: str) -> bool:
     return _git_ok(repo, "ls-files", "--error-unmatch", "--", rel_path)
 
 
-def _index_has_changes(repo: Path) -> bool:
+def _index_has_changes(repo: Path, paths: Iterable[str] | None = None) -> bool:
     """
-    True if there are staged changes in the index (pending commit).
+    True if there are **staged** changes for the given *paths* (or any, if None).
+    Uses `git diff --cached --quiet` which exits 0 when no staged changes exist.
     """
-    # `git diff --cached --quiet` → exit 0 when no staged changes.
-    res = subprocess.run(
-        ["git", "-C", str(repo), "diff", "--cached", "--quiet"],
-        text=True,
-    )
+    cmd = ["git", "-C", str(repo), "diff", "--cached", "--quiet"]
+    path_list = [p for p in (paths or []) if p]
+    if path_list:
+        cmd.extend(["--", *path_list])
+    res = subprocess.run(cmd, text=True)
     return res.returncode != 0
 
 
-def _stage(repo: Path, *paths: str) -> None:
+def _stage_exact(repo: Path, *paths: str) -> None:
     """
-    Stage only the given *paths* (or their parent dirs for deletions).
-    Uses `git add` to avoid picking up unrelated local changes.
+    Stage **only** the given file paths (no parent‑dir sweeping, no -A).
+
+    Notes
+    -----
+    • For deletions staged via `git rm`, re‑adding a missing path is a no‑op.
+    • We skip missing paths here to avoid accidental adds of non-existent files.
     """
-    # Filter duplicates and empties
-    unique: list[str] = [p for p in dict.fromkeys(paths) if p]
-    for p in unique:
-        # For deletions, the exact file path may no longer exist. `git add -A`
-        # with the parent directory is the reliable way to capture the removal
-        # without touching unrelated parts of the tree.
-        parent = str(Path(p).parent) or "."
-        # Use `-A` so removals are also noticed under that parent.
-        _git(repo, "add", "-A", "--", parent)
+    to_add: list[str] = []
+    for p in dict.fromkeys(paths):  # de‑dupe while preserving order
+        if not p:
+            continue
+        if (repo / p).exists():
+            to_add.append(p)
+    if to_add:
+        _git(repo, "add", "--", *to_add)
 
 
 def _commit(repo: Path, message: str, paths: Iterable[str]) -> None:
     """
-    Stage *paths* and commit with *message* if there is anything to commit.
+    Stage *paths* precisely and commit with *message* **restricted** to those paths.
     """
-    _stage(repo, *paths)
+    path_list = [p for p in paths if p]
+    _stage_exact(repo, *path_list)
 
-    if not _index_has_changes(repo):
+    if not _index_has_changes(repo, path_list):
         log.info("No changes detected for commit: %s (skipping)", message)
         return
 
-    _git(repo, "commit", "-m", message)
+    # Restrict commit to the exact pathspecs so unrelated staged changes never bleed in.
+    _git(repo, "commit", "-m", message, "--", *path_list)
     log.info("Committed: %s", message)
 
 
@@ -152,26 +156,9 @@ def _ensure_inside(repo: Path, target: Path) -> None:
         raise ValueError("Patch path escapes repository root") from exc
 
 
-def _normalize_newlines(text: str) -> str:
-    """
-    Normalize newlines to LF only.
-
-    Converts:
-      • CRLF (\r\n) → LF (\n)
-      • CR (\r)    → LF (\n)
-    """
-    return text.replace("\r\n", "\n").replace("\r", "\n")
-
-
 def _normalize_text(text: str) -> str:
-    """
-    Prepare a text body for writing to disk:
-
-    1) Normalize newlines to LF only
-    2) Ensure a single trailing newline (POSIX)
-    """
-    norm = _normalize_newlines(text)
-    return norm if norm.endswith("\n") else norm + "\n"
+    """Ensure trailing newline (POSIX)."""
+    return text if text.endswith("\n") else text + "\n"
 
 
 def _write_file(p: Path, body: Optional[str], body_b64: Optional[str]) -> tuple[int, int]:
@@ -193,27 +180,18 @@ def _write_file(p: Path, body: Optional[str], body_b64: Optional[str]) -> tuple[
 
     # text
     text = _normalize_text(body or "")
-    p.write_text(text, encoding="utf-8", newline="\n")  # explicit LF on write
+    p.write_text(text, encoding="utf-8")
     log.debug("Wrote text file %s (%d chars)", p, len(text))
     return len(text.encode("utf-8")), prev_size
 
 
 def _same_contents_text(p: Path, new_text: str) -> bool:
-    """
-    Return True if file *p* already equals *new_text* (after normalization).
-
-    Note: comparison is **EOL-insensitive** on the incoming *new_text*:
-    the incoming text is normalized to LF and compared to the on-disk bytes
-    **as written**. If the repository file already matches the normalized
-    text, we avoid a no-op update even if the incoming payload contained CRLF.
-    """
+    """Return True if file *p* already equals *new_text* (after normalization)."""
     if not p.exists():
         return False
     try:
         current = p.read_text(encoding="utf-8")
-        current_norm = _normalize_text(current)
-        incoming_norm = _normalize_text(new_text)
-        return current_norm == incoming_norm
+        return current == _normalize_text(new_text)
     except UnicodeDecodeError:
         return False
 
@@ -227,6 +205,30 @@ def _same_contents_binary(p: Path, new_b64: str) -> bool:
         return current == base64.b64decode(new_b64)
     except Exception:
         return False
+
+
+def _normalize_mode(mode: str) -> str:
+    """
+    Accept both 3‑digit and 4‑digit octal strings and normalize to 3‑digit.
+
+    Examples
+    --------
+    "0755" → "755", "644" → "644"
+
+    Raises
+    ------
+    PermissionError if the normalized mode is not in SAFE_MODES.
+    """
+    s = (mode or "").strip()
+    if not re.fullmatch(r"[0-7]{3,4}", s):
+        raise PermissionError(f"Invalid chmod mode {mode!r} (must be octal)")
+
+    normalized = s.lstrip("0") or "0"
+    if normalized not in SAFE_MODES:
+        raise PermissionError(
+            f"Unsafe chmod mode {mode!r} (allowed: 0644/644 or 0755/755)"
+        )
+    return normalized
 
 
 # -----------------------------------------------------------------------------
@@ -266,7 +268,7 @@ def apply_patch(patch_json: str, repo_path: str) -> None:
             if not src.exists():
                 raise FileNotFoundError(src)
 
-            # No‑op fast‑path: if contents are identical (EOL-insensitive), skip
+            # No‑op fast‑path: if contents are identical, skip writing + commit
             if body is not None and _same_contents_text(src, body):
                 log.info("No content change for %s – skipping update.", rel)
                 return
@@ -286,14 +288,14 @@ def apply_patch(patch_json: str, repo_path: str) -> None:
         if src.is_dir():
             raise IsADirectoryError(src)
 
-        # Remove from working tree, then stage deletion precisely.
-        src.unlink()
-        # Use git rm --cached only if path still tracked; otherwise `git add -A`
-        # on parent will notice the removal. Prefer an exact rm to avoid
-        # sweeping unrelated paths.
         if _is_tracked(repo, rel):
-            _git(repo, "rm", "--cached", "--force", "--", rel)
-        _commit(repo, f"GPT delete: {rel}", paths=[rel])
+            # Precise staging of deletion (removes from index and working tree)
+            _git(repo, "rm", "-f", "--", rel)
+            _commit(repo, f"GPT delete: {rel}", paths=[rel])
+        else:
+            # Untracked file – remove from working tree only, no commit produced.
+            src.unlink()
+            log.info("Deleted untracked file %s (no commit needed).", rel)
         return
 
     # ---------------------------- rename -----------------------------------
@@ -309,43 +311,35 @@ def apply_patch(patch_json: str, repo_path: str) -> None:
 
         target.parent.mkdir(parents=True, exist_ok=True)
 
-        # Prefer `git mv` when the source is tracked to stage the rename cleanly.
         if _is_tracked(repo, rel):
-            _git(repo, "mv", rel, target_rel)
+            # Use git mv for accurate rename staging
+            _git(repo, "mv", "--", rel, target_rel)
             log.debug("Used git mv for rename: %s -> %s", rel, target_rel)
+            # Both sides are already staged by git mv; commit them precisely.
+            _commit(repo, f"GPT rename: {rel} -> {target_rel}", paths=[rel, target_rel])
         else:
-            # Fallback to filesystem move + stage both sides (parent dirs).
+            # Filesystem move, then stage the new path only (old path was untracked)
             shutil.move(src, target)
             log.debug("Filesystem move performed: %s -> %s", rel, target_rel)
-
-        _commit(repo, f"GPT rename: {rel} -> {target_rel}", paths=[rel, target_rel])
+            _commit(repo, f"GPT add (rename of untracked): {target_rel}", paths=[target_rel])
         return
 
     # ---------------------------- chmod ------------------------------------
     if op == "chmod":
-        mode_str = patch["mode"]
+        mode_raw = patch["mode"]
+        mode = _normalize_mode(mode_raw)  # accept "0755" or "755"
         if not src.exists():
             raise FileNotFoundError(src)
 
-        # Accept "755" and "0755" (same for 644). Validate against allowed set.
-        try:
-            desired = int(mode_str, 8)
-        except ValueError as exc:
-            raise PermissionError(f"Invalid chmod mode {mode_str!r}") from exc
-
-        if desired not in _ALLOWED_MODES:
-            raise PermissionError(
-                f"Unsafe chmod mode {mode_str!r} (allowed: 644 / 755)"
-            )
-
+        desired = int(mode, 8)
         current = src.stat().st_mode & 0o777
         if current == desired:
-            log.info("Mode for %s already %s – skipping chmod.", rel, mode_str)
+            log.info("Mode for %s already %s – skipping chmod.", rel, mode)
             return
 
         os.chmod(src, desired)
-        # Stage the path to ensure mode change is recorded (git tracks mode bits)
-        _commit(repo, f"GPT chmod {mode_str}: {rel}", paths=[rel])
+        # Stage and commit only this path so the mode bit change is recorded.
+        _commit(repo, f"GPT chmod {mode}: {rel}", paths=[rel])
         return
 
     # -----------------------------------------------------------------------

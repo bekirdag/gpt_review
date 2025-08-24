@@ -15,31 +15,35 @@ Flow
 5. If the command fails, send the full log back to ChatGPT.
 6. Repeat until the command passes **and** "status": "completed".
 
-Session rule (v0.3.0)
----------------------
+Session rule
+------------
 *ChatGPT must:*
 * deliver **one script per answer** (chunk‑by‑chunk),
 * explicitly ask the user to **continue** before proceeding.
 
 These constraints ensure deterministic patching and a clean Git history.
 
-Enhancements in this revision
------------------------------
-• **Early state persistence** (resume‑safe).
-• **Composer robustness**:
-  - Finds both `<textarea>` and `div[contenteditable="true"]`.
-  - Ignores hidden/disabled clones.
-  - **Clears drafts reliably** (Select‑All + Backspace), not just `.clear()`.
-• **Structured error‑log chunking** with stable session id.
-• **Fence‑free formatting guard** + automatic **raw‑JSON nudge** on parse failure.
-• **Capability probe & self‑heal**:
-  - After `NUDGE_RETRIES`, send a minimal schema echo probe.
-  - Accept either the exact probe‑patch (skip applying; ask for real patch)
-    or a real valid patch — bounded by `PROBE_RETRIES`.
-• **Selenium resilience (this patch)**:
-  - Add `--disable-dev-shm-usage` for Docker/CI stability.
-  - Suppress first‑run prompts (`--no-first-run`, `--no-default-browser-check`).
-  - Use `page_load_strategy = "eager"` to reduce unnecessary waits.
+High‑impact robustness in this revision
+---------------------------------------
+• **Driver provisioning**:
+  - Respect **CHROMEDRIVER** env (use that binary via `Service`).
+  - Else try **webdriver‑manager** (Chrome vs Chromium).
+  - If that fails (offline/blocked), **fall back to Selenium Manager**.
+
+• **Composer detection/clearing**:
+  - Prefer `<textarea>`; fall back to `div[contenteditable="true"]`.
+  - Always clear drafts safely (Select‑All + Backspace) before sending.
+
+• **Apply‑failure reporting (non‑fatal)**:
+  - If `apply_patch.py` fails, send a concise report (includes the **patch JSON**
+    and the tool’s **stdout/stderr**) and continue the loop.
+
+• **Patch delivery to apply tool via STDIN**:
+  - Use `"-"` argument and `input=...` to avoid OS argv length limits.
+
+• **Safe commit lookup**:
+  - `_current_commit()` now returns `"<no-commits-yet>"` on fresh repos instead
+    of crashing, so error reporting works before the first commit.
 """
 from __future__ import annotations
 
@@ -68,41 +72,30 @@ from selenium.webdriver.support.ui import WebDriverWait  # noqa: F401
 from webdriver_manager.chrome import ChromeDriverManager
 from webdriver_manager.core.utils import ChromeType
 
-from gpt_review import get_logger
+from logger import get_logger
 from patch_validator import validate_patch
 
 # ════════════════════════════════════════════════════════════════════════════
 # Tunables & constants (env‑overridable)
 # ════════════════════════════════════════════════════════════════════════════
-# Prefer chatgpt.com; allow explicit override and fallback to chat.openai.com.
 CHAT_URL: str = os.getenv("GPT_REVIEW_CHAT_URL", "https://chatgpt.com/")
 CHAT_URL_FALLBACK: str = "https://chat.openai.com/"
 
-# Wait for UI/replies (seconds)
 WAIT_UI: int = int(os.getenv("GPT_REVIEW_WAIT_UI", "90"))
-# Idle time (seconds) to consider streaming completed
 IDLE_SECS: float = float(os.getenv("GPT_REVIEW_STREAM_IDLE_SECS", "2"))
-# Error‑log chunk size (characters)
 CHUNK_SIZE: int = int(os.getenv("GPT_REVIEW_CHUNK_SIZE", "15000"))
-# Command timeout default (seconds) – can be overridden by CLI --timeout
 DEFAULT_TIMEOUT: int = int(os.getenv("GPT_REVIEW_COMMAND_TIMEOUT", "300"))
-# Browser action retries
 RETRIES: int = int(os.getenv("GPT_REVIEW_RETRIES", "3"))
-# Max times to ask assistant to resend raw JSON if parsing failed
 NUDGE_RETRIES: int = int(os.getenv("GPT_REVIEW_NUDGE_RETRIES", "2"))
-# Max capability‑probe attempts once nudges are exhausted
 PROBE_RETRIES: int = int(os.getenv("GPT_REVIEW_PROBE_RETRIES", "1"))
-# Persistent state file (written inside target repo)
 STATE_FILE: str = ".gpt-review-state.json"
 
-# Extra guardrails injected into the initial prompt.
 EXTRA_RULES: str = (
     "Your fixes must be **chunk by chunk**. "
     "Provide a fix for **one script only** in each answer. "
     "Ask me to **continue** when you are done with one script."
 )
 
-# Short, consistent reminder used in initial prompt and recovery nudges
 RAW_JSON_REMINDER: str = (
     "Format reminder: return exactly **one** JSON object — raw JSON only, "
     "no prose, no markdown, no code fences. "
@@ -110,7 +103,6 @@ RAW_JSON_REMINDER: str = (
     'Use status="in_progress" until the last patch, then "completed".'
 )
 
-# Capability‑probe marker (recognised and **never applied** if received)
 PROBE_FILE_MAGIC = "__gpt_review_probe__"
 PROBE_BODY_EXPECTED = "ok"
 
@@ -134,12 +126,23 @@ def _load_state(repo: Path) -> Optional[dict]:
 
 
 def _current_commit(repo: Path) -> str:
-    """Return SHA of HEAD commit in *repo*."""
-    return (
-        subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"])
-        .decode()
-        .strip()
-    )
+    """
+    Return HEAD SHA for *repo*.
+
+    Robust: returns the literal string "<no-commits-yet>" when the repository
+    has no commits (so callers like error reporters don't crash).
+    """
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "-q", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        sha = (res.stdout or "").strip()
+        return sha if res.returncode == 0 and sha else "<no-commits-yet>"
+    except Exception:
+        return "<no-commits-yet>"
 
 
 def _save_state(repo: Path, url: str) -> None:
@@ -186,24 +189,15 @@ def _detect_browser_binary() -> Optional[str]:
     2) Common CLI names on Linux (google-chrome[-stable], chromium, chromium-browser)
     3) macOS app bundles (Google Chrome / Chromium)
     """
-    # 1) Env override
     env_bin = os.getenv("CHROME_BIN", "")
     if env_bin and os.path.exists(env_bin) and os.access(env_bin, os.X_OK):
         return env_bin
 
-    # 2) Common PATH candidates
-    for name in (
-        "google-chrome-stable",
-        "google-chrome",
-        "chromium",
-        "chromium-browser",
-        "chrome",
-    ):
+    for name in ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser", "chrome"):
         p = shutil.which(name)
         if p:
             return p
 
-    # 3) macOS app bundles
     if sys.platform == "darwin":
         for p in (
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -221,6 +215,18 @@ def _chrome_type_for_binary(binary: Optional[str]) -> ChromeType:
     return ChromeType.GOOGLE
 
 
+def _log_driver_versions(drv) -> None:
+    """Best‑effort capability logging (version numbers)."""
+    try:
+        caps = getattr(drv, "capabilities", {}) or {}
+        browser_version = caps.get("browserVersion", "unknown")
+        chrome_block = caps.get("chrome", {}) if isinstance(caps, dict) else {}
+        driver_version = (chrome_block.get("chromedriverVersion", "unknown").split(" ") or ["unknown"])[0]
+        log.info("Browser launched – version=%s, driver=%s", browser_version, driver_version)
+    except Exception:
+        log.info("Browser launched.")
+
+
 def _chrome_driver() -> webdriver.Chrome:
     """
     Launch Chromium/Chrome with a persistent profile (headless‑optional).
@@ -229,8 +235,10 @@ def _chrome_driver() -> webdriver.Chrome:
     • GPT_REVIEW_PROFILE – persistent user‑data dir (cookies live here)
     • GPT_REVIEW_HEADLESS – any non‑empty value enables headless
     • CHROME_BIN – explicit browser binary location (google‑chrome/chromium)
+    • CHROMEDRIVER – explicit chromedriver binary (takes precedence)
     • Auto‑detection of browser binary if CHROME_BIN is not set
     • Correct ChromeDriver selection for Chromium vs Google Chrome
+    • Fallback to **Selenium Manager** when webdriver‑manager cannot install
     """
     profile = Path(
         os.getenv("GPT_REVIEW_PROFILE", "~/.cache/gpt-review/chrome")
@@ -241,16 +249,6 @@ def _chrome_driver() -> webdriver.Chrome:
     opts.add_argument(f"--user-data-dir={profile}")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")  # CI/Docker stability
-    opts.add_argument("--no-first-run")
-    opts.add_argument("--no-default-browser-check")
-    # Faster navigation: don't wait for all subresources
-    try:
-        opts.page_load_strategy = "eager"  # Selenium 4+
-    except Exception:
-        pass
-
-    # New headless mode is more stable across versions
     if os.getenv("GPT_REVIEW_HEADLESS"):
         opts.add_argument("--headless=new")
 
@@ -263,25 +261,24 @@ def _chrome_driver() -> webdriver.Chrome:
 
     chrome_type = _chrome_type_for_binary(binary)
 
-    # Install a matching chromedriver for the detected browser (Chrome vs Chromium).
-    service = Service(ChromeDriverManager(chrome_type=chrome_type).install())
-    drv = webdriver.Chrome(service=service, options=opts)
+    explicit_driver = os.getenv("CHROMEDRIVER")
+    if explicit_driver and os.path.exists(explicit_driver) and os.access(explicit_driver, os.X_OK):
+        log.info("Using CHROMEDRIVER from env: %s", explicit_driver)
+        service = Service(explicit_driver)
+        drv = webdriver.Chrome(service=service, options=opts)
+        _log_driver_versions(drv)
+        return drv
 
-    # Log versions for easier support/debugging
-    caps = getattr(drv, "capabilities", {})
-    browser_version = caps.get("browserVersion")
-    chrome_block = caps.get("chrome", {}) if isinstance(caps, dict) else {}
-    driver_version = (
-        (chrome_block.get("chromedriverVersion", "unknown").split(" ") or ["unknown"])[0]
-        if isinstance(chrome_block, dict)
-        else "unknown"
-    )
-    log.info(
-        "Browser launched – type=%s version=%s, driver=%s",
-        chrome_type.name,
-        browser_version,
-        driver_version,
-    )
+    try:
+        service = Service(ChromeDriverManager(chrome_type=chrome_type).install())
+        drv = webdriver.Chrome(service=service, options=opts)
+        _log_driver_versions(drv)
+        return drv
+    except Exception as exc:  # pragma: no cover
+        log.warning("webdriver‑manager failed (%s). Falling back to Selenium Manager.", exc)
+
+    drv = webdriver.Chrome(options=opts)
+    _log_driver_versions(drv)
     return drv
 
 
@@ -300,14 +297,13 @@ def _retry(action, what: str):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-#  Composer detection
+#  Composer detection & interaction
 # ────────────────────────────────────────────────────────────────────────────
 def _is_interactable(el) -> bool:
     """
     Return True if *el* is visible and enabled, and not aria-hidden.
 
-    ChatGPT sometimes renders hidden/disabled clones during UI re-mounts.
-    We avoid sending keystrokes to such offscreen elements.
+    ChatGPT sometimes renders hidden/disabled inputs during UI re-mounts.
     """
     try:
         if not el.is_displayed():
@@ -325,45 +321,43 @@ def _is_interactable(el) -> bool:
 
 
 def _find_composer(drv):
-    """
-    Return the **most recent visible** composer element (textarea or contenteditable).
+    """Return the most recent visible composer element (textarea or contenteditable)."""
+    # 1) Known ChatGPT selector
+    try:
+        els = drv.find_elements(By.CSS_SELECTOR, "textarea[data-testid='composer-textarea']")
+    except WebDriverException:
+        els = []
+    visible = [e for e in els if _is_interactable(e)]
+    if visible:
+        return visible[-1]
 
-    Strategy (in order):
-      1) <textarea data-testid="composer-textarea">
-      2) any visible <textarea>
-      3) visible contenteditable region that looks like the composer
-         (div[contenteditable="true"] with plausible aria/placeholder)
-    """
-    selectors = [
-        (By.CSS_SELECTOR, "textarea[data-testid='composer-textarea']"),
-        (By.CSS_SELECTOR, "textarea"),
-        (
-            By.CSS_SELECTOR,
-            "div[contenteditable='true'][aria-label], div[contenteditable='true'][placeholder]",
-        ),
-    ]
-    for by, sel in selectors:
-        try:
-            els = drv.find_elements(by, sel)
-        except WebDriverException:
-            els = []
-        visible = [e for e in els if _is_interactable(e)]
-        if visible:
-            return visible[-1]  # prefer the last (typically the active composer)
+    # 2) Any visible textarea
+    try:
+        els = drv.find_elements(By.CSS_SELECTOR, "textarea")
+    except WebDriverException:
+        els = []
+    visible = [e for e in els if _is_interactable(e)]
+    if visible:
+        return visible[-1]
+
+    # 3) Rich editor contenteditable
+    try:
+        els = drv.find_elements(By.CSS_SELECTOR, "div[contenteditable='true']")
+    except WebDriverException:
+        els = []
+    visible = [e for e in els if _is_interactable(e)]
+    if visible:
+        return visible[-1]
+
     return None
 
 
 def _wait_composer(drv, *, bounded: bool = False, max_wait: int = WAIT_UI) -> None:
     """
-    Wait for the composer (textarea or contenteditable) to be present & interactable.
+    Wait for the composer to be present & interactable.
 
-    Parameters
-    ----------
-    bounded : bool
-        • False (default) → wait indefinitely (used during initial login).
-        • True            → wait up to *max_wait* seconds, then raise TimeoutError.
-    max_wait : int
-        Upper bound in seconds when *bounded* is True.
+    bounded=False waits indefinitely (used during initial login).
+    bounded=True waits up to *max_wait* seconds then raises TimeoutError.
     """
     start = time.time()
     last_log = 0.0
@@ -375,7 +369,6 @@ def _wait_composer(drv, *, bounded: bool = False, max_wait: int = WAIT_UI) -> No
         except WebDriverException:
             pass
 
-        # Periodic, non-spammy progress log
         now = time.time()
         if not bounded and (now - last_log) >= 5.0:
             log.info("Waiting for user to sign in to ChatGPT …")
@@ -387,48 +380,46 @@ def _wait_composer(drv, *, bounded: bool = False, max_wait: int = WAIT_UI) -> No
         time.sleep(0.5 if bounded else 5.0)
 
 
-def _clear_composer(area) -> None:
-    """
-    Clear any existing draft from the composer robustly.
+# Backward‑compatibility aliases (internal use only)
+def _find_textarea(drv):  # pragma: no cover
+    return _find_composer(drv)
 
-    We try `.clear()` (works for <textarea>) and *always* follow with
-    Select‑All + Backspace (works for contenteditable too).
-    """
+
+def _wait_textarea(drv, *, bounded: bool = False, max_wait: int = WAIT_UI):  # pragma: no cover
+    return _wait_composer(drv, bounded=bounded, max_wait=max_wait)
+
+
+def _clear_and_send(area, text: str) -> None:
+    """Focus, clear any draft robustly, then send *text* + ENTER."""
     try:
-        area.click()  # ensure focus
+        area.click()
     except WebDriverException:
         pass
 
     try:
-        area.clear()  # harmless for contenteditable
+        area.clear()
     except Exception:
         pass
 
-    # Cross‑platform "Select All"
-    mod = Keys.COMMAND if sys.platform == "darwin" else Keys.CONTROL
     try:
-        area.send_keys(mod, "a")
+        area.send_keys(Keys.CONTROL, "a")
         area.send_keys(Keys.BACK_SPACE)
-    except WebDriverException:
-        # Last resort: send multiple backspaces
-        try:
-            for _ in range(200):
-                area.send_keys(Keys.BACK_SPACE)
-        except Exception:
-            pass
+        area.send_keys(Keys.COMMAND, "a")
+        area.send_keys(Keys.BACK_SPACE)
+    except Exception:
+        pass
+
+    area.send_keys(text)
+    area.send_keys(Keys.ENTER)
 
 
 def _send_message(drv, text: str) -> None:
-    """Send *text* to ChatGPT (clears any previous draft first)."""
-
+    """Send *text* to ChatGPT."""
     def _inner():
         area = _find_composer(drv)
         if not area:
             raise WebDriverException("Composer not found")
-
-        _clear_composer(area)
-        area.send_keys(text)
-        area.send_keys(Keys.ENTER)
+        _clear_and_send(area, text)
 
     _retry(_inner, "send_message")
     log.debug("Sent %d chars", len(text))
@@ -448,9 +439,6 @@ def _assistant_block(drv):
 def _wait_reply(drv) -> str:
     """
     Wait for ChatGPT to finish streaming and return the reply text.
-
-    Uses a **bounded** composer check up-front so we don't stall indefinitely
-    when the UI briefly re-mounts the composer.
     """
     _wait_composer(drv, bounded=True, max_wait=WAIT_UI)
     start = time.time()
@@ -462,7 +450,6 @@ def _wait_reply(drv) -> str:
             txt = block.text
             if txt != last_txt:
                 last_txt, last_change = txt, time.time()
-            # A short period of inactivity ≈ finished streaming
             if time.time() - last_change > IDLE_SECS:
                 return txt
         time.sleep(0.5)
@@ -471,9 +458,7 @@ def _wait_reply(drv) -> str:
 
 
 def _navigate_to_chat(drv) -> None:
-    """
-    Navigate to ChatGPT, preferring chatgpt.com with a chat.openai.com fallback.
-    """
+    """Navigate to ChatGPT, with chat.openai.com fallback."""
     for url in (CHAT_URL, CHAT_URL_FALLBACK):
         try:
             drv.get(url)
@@ -488,7 +473,6 @@ def _navigate_to_chat(drv) -> None:
 # ════════════════════════════════════════════════════════════════════════════
 # Patch extraction – code‑fence tolerant, balanced braces
 # ════════════════════════════════════════════════════════════════════════════
-# Match the first triple‑backtick block (optional language json/jsonc/text)
 _FENCE_RE = re.compile(r"```(?:jsonc?|text)?\s*(.*?)\s*```", re.S)
 
 
@@ -540,16 +524,14 @@ def _extract_patch(raw: str) -> Optional[dict]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Command execution helpers
+# Command execution & error‑chunking
 # ════════════════════════════════════════════════════════════════════════════
 def _run_cmd(cmd: str, repo: Path, timeout: int) -> Tuple[bool, str, int]:
     """
     Execute *cmd* in *repo*; return (success, combined output, exit_code).
 
-    Notes
-    -----
-    • On timeout, returns (False, <output>, 124) and prefixes the output with
-      a short TIMEOUT banner for clarity.
+    On timeout, returns (False, <output>, 124) and prefixes the output with a
+    short TIMEOUT banner for clarity.
     """
     try:
         res = subprocess.run(
@@ -592,14 +574,14 @@ def _send_error_chunks(
 
     Each message is prefixed with `[gpt-review#<session>] (i/N)` so interleaving
     cannot confuse the assistant. The **first** chunk includes a compact metadata
-    header (commit SHA, command, exit code, timestamp).
+    header (commit SHA, command, exit code, timestamp). Commit lookup is safe on
+    fresh repos.
     """
     chunks = _chunk(output)
     N = len(chunks)
-    commit = _current_commit(repo)
+    commit = _current_commit(repo)  # safe on empty repos
     ts = _now_iso_utc()
 
-    # First chunk: metadata + first slice
     header = textwrap.dedent(
         f"""\
         [gpt-review#{session_id}] (1/{N}) — The command failed. Please propose the next fix.
@@ -616,7 +598,6 @@ def _send_error_chunks(
     )
     _send_message(drv, header)
 
-    # Remaining chunks: tagged slices only
     for idx, part in enumerate(chunks[1:], start=2):
         _send_message(
             drv,
@@ -624,8 +605,54 @@ def _send_error_chunks(
         )
 
 
+def _send_apply_error(
+    *,
+    drv,
+    session_id: str,
+    repo: Path,
+    patch: dict,
+    stdout: str,
+    stderr: str,
+    exit_code: int,
+) -> None:
+    """
+    Send a concise, tagged report when `apply_patch.py` fails,
+    including the attempted patch JSON and tool output.
+    """
+    try:
+        patch_json = json.dumps(patch, indent=2, ensure_ascii=False)
+    except Exception:
+        patch_json = str(patch)
+
+    report = textwrap.dedent(
+        f"""\
+        Patch apply failed. Please send a corrected patch (raw JSON only).
+
+        Patch JSON (as attempted):
+        ```json
+        {patch_json}
+        ```
+
+        apply_patch.py output:
+        ```text
+        {stdout}
+        {stderr}
+        ```
+        """
+    ).strip()
+
+    _send_error_chunks(
+        drv,
+        session_id=session_id,
+        repo=repo,
+        cmd="apply_patch",
+        exit_code=exit_code,
+        output=report,
+    )
+
+
 # ════════════════════════════════════════════════════════════════════════════
-# Prompt helpers (initial + recovery nudge + capability probe)
+# Prompt helpers
 # ════════════════════════════════════════════════════════════════════════════
 def _initial_prompt(instr: str) -> str:
     """
@@ -719,7 +746,7 @@ def main() -> None:
     if not (repo / ".git").exists():
         sys.exit("❌ Not a git repository: " + str(repo))
 
-    # Create a short, stable session id for this run (used in error‑log chunk tags)
+    # Short, stable session id for this run (used in error‑log chunk tags)
     session_id = uuid.uuid4().hex[:12]
     log.info("Session id: %s", session_id)
 
@@ -732,7 +759,6 @@ def main() -> None:
             log.info("Resuming conversation: %s", state["conversation_url"])
             driver.get(state["conversation_url"])
             _wait_composer(drv=driver, bounded=False)  # user might need to re‑login
-            # Persist again after successful resume load (keeps timestamp fresh)
             _save_state_quiet(repo, driver.current_url)
 
             if args.auto:
@@ -775,8 +801,7 @@ def main() -> None:
                 if nudge_budget > 0:
                     attempt = (NUDGE_RETRIES - nudge_budget) + 1
                     log.warning(
-                        "No valid JSON patch found; requesting raw‑JSON resend "
-                        "(attempt %d/%d).",
+                        "No valid JSON patch found; requesting raw‑JSON resend (attempt %d/%d).",
                         attempt,
                         NUDGE_RETRIES,
                     )
@@ -788,8 +813,7 @@ def main() -> None:
                 if probe_budget > 0:
                     probe_attempt = (PROBE_RETRIES - probe_budget) + 1
                     log.warning(
-                        "Raw‑JSON nudges exhausted. Sending capability probe "
-                        "(attempt %d/%d).",
+                        "Raw‑JSON nudges exhausted. Sending capability probe (attempt %d/%d).",
                         probe_attempt,
                         PROBE_RETRIES,
                     )
@@ -825,10 +849,7 @@ def main() -> None:
                     patch = probe_patch
 
                 else:
-                    log.error(
-                        "Exceeded capability probe attempts (%d). Stopping.",
-                        PROBE_RETRIES,
-                    )
+                    log.error("Exceeded capability probe attempts (%d). Stopping.", PROBE_RETRIES)
                     break
 
             # Reset nudge budget once we successfully parsed any valid patch
@@ -840,16 +861,41 @@ def main() -> None:
                 _send_message(driver, _nudge_resend_raw_json())
                 continue
 
-            # Apply patch
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(ROOT / "apply_patch.py"),
-                    json.dumps(patch),
-                    str(repo),
-                ],
-                check=True,
-            )
+            # Apply patch via STDIN (avoids argv size limits)
+            try:
+                proc = subprocess.run(
+                    [sys.executable, str(ROOT / "apply_patch.py"), "-", str(repo)],
+                    input=json.dumps(patch),
+                    capture_output=True,
+                    text=True,
+                )
+                if proc.returncode != 0:
+                    log.warning("Patch apply failed with code %s", proc.returncode)
+                    _send_apply_error(
+                        drv=driver,
+                        session_id=session_id,
+                        repo=repo,
+                        patch=patch,
+                        stdout=proc.stdout or "",
+                        stderr=proc.stderr or "",
+                        exit_code=proc.returncode,
+                    )
+                    # Conversation URL might change while sending logs
+                    _save_state_quiet(repo, driver.current_url)
+                    continue
+            except Exception as exc:
+                log.exception("Patch apply raised: %s", exc)
+                _send_apply_error(
+                    drv=driver,
+                    session_id=session_id,
+                    repo=repo,
+                    patch=patch,
+                    stdout="",
+                    stderr=str(exc),
+                    exit_code=1,
+                )
+                _save_state_quiet(repo, driver.current_url)
+                continue
 
             # Run command if provided
             if args.cmd:
@@ -863,7 +909,6 @@ def main() -> None:
                         exit_code=code,
                         output=output,
                     )
-                    # Conversation URL might change while sending logs
                     _save_state_quiet(repo, driver.current_url)
                     continue
 

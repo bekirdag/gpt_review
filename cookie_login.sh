@@ -14,7 +14,7 @@
 # 2) Detects a suitable browser binary (CHROME_BIN override respected).
 # 3) Launches a **visible** browser window with that profile.
 # 4) Opens ChatGPT: primary URL (GPT_REVIEW_LOGIN_URL or https://chatgpt.com/)
-#    with an optional fallback tab to https://chat.openai.com/.
+#    with a fallback tab to https://chat.openai.com/ **unless identical**.
 # 5) Prints friendly guidance and waits until you close the window (Linux),
 #    or asks you to press <Enter> when done (macOS `open -a` fallback).
 #
@@ -87,14 +87,15 @@ detect_browser() {
     if [[ -x "${CHROME_BIN:-/nonexistent}" ]]; then
       echo "$CHROME_BIN"; return 0
     else
-      warn "CHROME_BIN is set but not executable: ${CHROME_BIN:-<unset>}"
+      warn "CHROME_BIN is set but not executable: ${CHROME_BIN}"
     fi
   fi
 
   # 2) Common PATH candidates (Linux/WSL)
+  local candidate
   for candidate in google-chrome-stable google-chrome chromium chromium-browser chrome; do
     if command -v "$candidate" >/dev/null 2>&1; then
-      echo "$(command -v "$candidate")"; return 0
+      command -v "$candidate"; return 0
     fi
   done
 
@@ -104,9 +105,9 @@ detect_browser() {
       "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
       "/Applications/Chromium.app/Contents/MacOS/Chromium"
     )
-    for p in "${mac_bins[@]}"; do
-      if [[ -x "$p" ]]; then
-        echo "$p"; return 0
+    for candidate in "${mac_bins[@]}"; do
+      if [[ -x "$candidate" ]]; then
+        echo "$candidate"; return 0
       fi
     done
   fi
@@ -127,7 +128,7 @@ echo "────────────────────────�
 echo "• Chrome profile : $PROFILE_DIR"
 echo "• Primary URL    : $PRIMARY_URL"
 if [[ $SAME_AS_FALLBACK -eq 1 ]]; then
-  echo "• Fallback URL   : (suppressed — primary equals fallback)"
+  echo "• Fallback URL   : (suppressed – same as primary)"
 else
   echo "• Fallback URL   : $FALLBACK_URL"
 fi
@@ -139,22 +140,15 @@ if [[ -n "$BROWSER_BIN" ]]; then
 else
   echo "• Browser binary : (not found on PATH)"
 fi
-
-# Helpful hint if a previous Chrome session holds the profile lock.
-LOCK_HINT=""
-if [[ -e "$PROFILE_DIR/SingletonLock" || -e "$PROFILE_DIR/SingletonCookie" ]]; then
-  LOCK_HINT="(If you see a 'profile in use' message, fully close all Chrome/Chromium windows and retry.)"
-fi
-
 echo
 echo "Next steps:"
 if [[ $SAME_AS_FALLBACK -eq 1 ]]; then
-  echo "  1) A browser window will open with *one* tab: $PRIMARY_URL"
+  echo "  1) A browser window will open with $PRIMARY_URL."
 else
   echo "  1) A browser window will open with $PRIMARY_URL (and a fallback tab)."
 fi
 echo "  2) Sign in to ChatGPT and verify you can chat."
-echo "  3) CLOSE the window to finish (or press Enter if prompted). $LOCK_HINT"
+echo "  3) CLOSE the window to finish (or press Enter if prompted)."
 echo "───────────────────────────────────────────────────────────────────────────"
 echo
 
@@ -172,11 +166,12 @@ if [[ -n "$BROWSER_BIN" ]]; then
     "${URL_ARGS[@]}" \
     >/dev/null 2>&1 &
   PID=$!
+  # Trap ensures we don't leave a zombie on Ctrl-C
+  trap 'kill -TERM $PID >/dev/null 2>&1 || true' INT TERM
   wait "$PID" || true
 else
   # macOS fallback: use `open -a` if we couldn't find a direct binary
   if [[ "$(uname -s)" == "Darwin" ]]; then
-    # Prefer Google Chrome app, fall back to Chromium
     if [[ -d "/Applications/Google Chrome.app" ]]; then
       info "Launching via 'open -a Google Chrome' (macOS)"
       open -a "Google Chrome" --args \
@@ -197,7 +192,12 @@ else
       die "No Chrome/Chromium app found. Install Chrome or set CHROME_BIN."
     fi
     echo
-    read -r -p "Press <Enter> once you have finished logging in and closed the browser…" _
+    # Prompt only on TTY to avoid hanging in CI
+    if [[ -t 0 ]]; then
+      read -r -p "Press <Enter> once you have finished logging in and closed the browser…" _
+    else
+      warn "Non‑interactive shell detected; assuming login completed."
+    fi
   else
     die "Chromium/Chrome not found. Install 'chromium' or 'google-chrome', or set CHROME_BIN."
   fi
