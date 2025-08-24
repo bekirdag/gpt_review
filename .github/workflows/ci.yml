@@ -14,13 +14,9 @@
 # • On Python 3.12, append coverage and a Changelog excerpt (Unreleased or the
 #   latest release) to the **Job Summary** for quick PR review.
 #
-# Other workflows
-# ---------------
-# • End‑to‑End browser smoke test lives in *e2e.yml* and runs separately.
-#
 # Performance
 # -----------
-# • pip cache keyed on OS + python‑version + hash of pyproject.toml
+# • Built‑in pip caching via `actions/setup-python` keyed by `pyproject.toml`
 # • pre‑commit cache keyed on OS + .pre-commit-config.yaml hash
 # • Concurrency cancels stale runs on same branch / PR.
 # • Log groups keep GitHub UI readable.
@@ -38,30 +34,29 @@ concurrency:
   group: ci-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
-# -----------------------------------------------------------------------------#
-#  LINT JOB (pre‑commit)
-# -----------------------------------------------------------------------------#
 jobs:
+  # ---------------------------------------------------------------------------#
+  #  LINT JOB (pre‑commit)
+  # ---------------------------------------------------------------------------#
   lint:
     name: "Lint (pre‑commit)"
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_INPUT: "1"
+      PY_COLORS: "1"
 
     steps:
       - name: "⬇️  Checkout repository"
         uses: actions/checkout@v4
 
-      - name: "🐍  Set up Python 3.12"
+      - name: "🐍  Set up Python 3.12 (with pip cache)"
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: "📦  Restore pip cache"
-        id: pip-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-lint-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+          cache: "pip"
+          cache-dependency-path: "pyproject.toml"
 
       - name: "💾  Restore pre‑commit cache"
         id: precommit-cache
@@ -91,6 +86,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: lint
     timeout-minutes: 25
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_INPUT: "1"
+      PY_COLORS: "1"
 
     strategy:
       matrix:
@@ -100,19 +99,12 @@ jobs:
       - name: "⬇️  Checkout repository"
         uses: actions/checkout@v4
 
-      - name: "🐍  Set up Python ${{ matrix.python-version }}"
+      - name: "🐍  Set up Python ${{ matrix.python-version }} (with pip cache)"
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-
-      - name: "📦  Restore pip cache"
-        id: pip-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: >-
-            pip-unit-${{ runner.os }}-py${{ matrix.python-version }}-
-            ${{ hashFiles('pyproject.toml') }}
+          cache: "pip"
+          cache-dependency-path: "pyproject.toml"
 
       - name: "📥  Install package with dev extras"
         run: |
@@ -120,8 +112,6 @@ jobs:
           pip install .[dev]
 
       - name: "🧪  Run pytest with coverage"
-        env:
-          PY_COLORS: "1"
         run: |
           echo "::group::pytest"
           coverage run -m pytest -q

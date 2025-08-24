@@ -25,19 +25,21 @@ These constraints ensure deterministic patching and a clean Git history.
 
 Enhancements in this revision
 -----------------------------
-• **Early state persistence**: save conversation URL after navigation and after
-  each assistant reply to enable resilient resume.
-• **Composer robustness**: bounded wait for interactable textarea and ignore
-  hidden/disabled clones.
-• **Structured error‑log chunking**: stable *session id* + metadata header
-  (commit, command, exit code, timestamp) on first chunk.
-• **Fence‑free formatting guard**: initial prompt reminder + automatic
-  **“resend as raw JSON only”** nudge on parse failure.
-• **Capability probe & self‑heal** (this patch):
-  - After `NUDGE_RETRIES` exhausted, send a **minimal schema echo probe**.
+• **Early state persistence** (resume‑safe).
+• **Composer robustness**:
+  - Finds both `<textarea>` and `div[contenteditable="true"]`.
+  - Ignores hidden/disabled clones.
+  - **Clears drafts reliably** (Select‑All + Backspace), not just `.clear()`.
+• **Structured error‑log chunking** with stable session id.
+• **Fence‑free formatting guard** + automatic **raw‑JSON nudge** on parse failure.
+• **Capability probe & self‑heal**:
+  - After `NUDGE_RETRIES`, send a minimal schema echo probe.
   - Accept either the exact probe‑patch (skip applying; ask for real patch)
-    or a real valid patch.
-  - Bounded by `PROBE_RETRIES` to avoid infinite loops.
+    or a real valid patch — bounded by `PROBE_RETRIES`.
+• **Selenium resilience (this patch)**:
+  - Add `--disable-dev-shm-usage` for Docker/CI stability.
+  - Suppress first‑run prompts (`--no-first-run`, `--no-default-browser-check`).
+  - Use `page_load_strategy = "eager"` to reduce unnecessary waits.
 """
 from __future__ import annotations
 
@@ -66,7 +68,7 @@ from selenium.webdriver.support.ui import WebDriverWait  # noqa: F401
 from webdriver_manager.chrome import ChromeDriverManager
 from webdriver_manager.core.utils import ChromeType
 
-from logger import get_logger
+from gpt_review import get_logger
 from patch_validator import validate_patch
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -190,7 +192,13 @@ def _detect_browser_binary() -> Optional[str]:
         return env_bin
 
     # 2) Common PATH candidates
-    for name in ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser", "chrome"):
+    for name in (
+        "google-chrome-stable",
+        "google-chrome",
+        "chromium",
+        "chromium-browser",
+        "chrome",
+    ):
         p = shutil.which(name)
         if p:
             return p
@@ -233,6 +241,15 @@ def _chrome_driver() -> webdriver.Chrome:
     opts.add_argument(f"--user-data-dir={profile}")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")  # CI/Docker stability
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--no-default-browser-check")
+    # Faster navigation: don't wait for all subresources
+    try:
+        opts.page_load_strategy = "eager"  # Selenium 4+
+    except Exception:
+        pass
+
     # New headless mode is more stable across versions
     if os.getenv("GPT_REVIEW_HEADLESS"):
         opts.add_argument("--headless=new")
@@ -254,7 +271,11 @@ def _chrome_driver() -> webdriver.Chrome:
     caps = getattr(drv, "capabilities", {})
     browser_version = caps.get("browserVersion")
     chrome_block = caps.get("chrome", {}) if isinstance(caps, dict) else {}
-    driver_version = (chrome_block.get("chromedriverVersion", "unknown").split(" ") or ["unknown"])[0]
+    driver_version = (
+        (chrome_block.get("chromedriverVersion", "unknown").split(" ") or ["unknown"])[0]
+        if isinstance(chrome_block, dict)
+        else "unknown"
+    )
     log.info(
         "Browser launched – type=%s version=%s, driver=%s",
         chrome_type.name,
@@ -285,8 +306,8 @@ def _is_interactable(el) -> bool:
     """
     Return True if *el* is visible and enabled, and not aria-hidden.
 
-    ChatGPT sometimes renders hidden/disabled textareas during UI re-mounts.
-    We avoid sending keystrokes to such offscreen clones.
+    ChatGPT sometimes renders hidden/disabled clones during UI re-mounts.
+    We avoid sending keystrokes to such offscreen elements.
     """
     try:
         if not el.is_displayed():
@@ -303,30 +324,38 @@ def _is_interactable(el) -> bool:
         return False
 
 
-def _find_textarea(drv):
+def _find_composer(drv):
     """
-    Return the **most recent visible** composer textarea element, or *None*.
+    Return the **most recent visible** composer element (textarea or contenteditable).
 
-    We try a couple of selector variants and filter out hidden/disabled clones.
+    Strategy (in order):
+      1) <textarea data-testid="composer-textarea">
+      2) any visible <textarea>
+      3) visible contenteditable region that looks like the composer
+         (div[contenteditable="true"] with plausible aria/placeholder)
     """
-    candidates = [
+    selectors = [
         (By.CSS_SELECTOR, "textarea[data-testid='composer-textarea']"),
         (By.CSS_SELECTOR, "textarea"),
+        (
+            By.CSS_SELECTOR,
+            "div[contenteditable='true'][aria-label], div[contenteditable='true'][placeholder]",
+        ),
     ]
-    for by, sel in candidates:
+    for by, sel in selectors:
         try:
             els = drv.find_elements(by, sel)
         except WebDriverException:
             els = []
         visible = [e for e in els if _is_interactable(e)]
         if visible:
-            return visible[-1]  # prefer the last one (usually the active composer)
+            return visible[-1]  # prefer the last (typically the active composer)
     return None
 
 
-def _wait_textarea(drv, *, bounded: bool = False, max_wait: int = WAIT_UI) -> None:
+def _wait_composer(drv, *, bounded: bool = False, max_wait: int = WAIT_UI) -> None:
     """
-    Wait for the composer textarea to be present & interactable.
+    Wait for the composer (textarea or contenteditable) to be present & interactable.
 
     Parameters
     ----------
@@ -340,7 +369,7 @@ def _wait_textarea(drv, *, bounded: bool = False, max_wait: int = WAIT_UI) -> No
     last_log = 0.0
     while True:
         try:
-            el = _find_textarea(drv)
+            el = _find_composer(drv)
             if el:
                 return
         except WebDriverException:
@@ -353,19 +382,51 @@ def _wait_textarea(drv, *, bounded: bool = False, max_wait: int = WAIT_UI) -> No
             last_log = now
 
         if bounded and (now - start) >= max_wait:
-            raise TimeoutError(f"Composer textarea not found within {max_wait}s")
+            raise TimeoutError(f"Composer not found within {max_wait}s")
 
         time.sleep(0.5 if bounded else 5.0)
 
 
+def _clear_composer(area) -> None:
+    """
+    Clear any existing draft from the composer robustly.
+
+    We try `.clear()` (works for <textarea>) and *always* follow with
+    Select‑All + Backspace (works for contenteditable too).
+    """
+    try:
+        area.click()  # ensure focus
+    except WebDriverException:
+        pass
+
+    try:
+        area.clear()  # harmless for contenteditable
+    except Exception:
+        pass
+
+    # Cross‑platform "Select All"
+    mod = Keys.COMMAND if sys.platform == "darwin" else Keys.CONTROL
+    try:
+        area.send_keys(mod, "a")
+        area.send_keys(Keys.BACK_SPACE)
+    except WebDriverException:
+        # Last resort: send multiple backspaces
+        try:
+            for _ in range(200):
+                area.send_keys(Keys.BACK_SPACE)
+        except Exception:
+            pass
+
+
 def _send_message(drv, text: str) -> None:
-    """Send *text* to ChatGPT (clears any previous draft)."""
+    """Send *text* to ChatGPT (clears any previous draft first)."""
 
     def _inner():
-        area = _find_textarea(drv)
+        area = _find_composer(drv)
         if not area:
-            raise WebDriverException("Composer textarea not found")
-        area.clear()
+            raise WebDriverException("Composer not found")
+
+        _clear_composer(area)
         area.send_keys(text)
         area.send_keys(Keys.ENTER)
 
@@ -391,7 +452,7 @@ def _wait_reply(drv) -> str:
     Uses a **bounded** composer check up-front so we don't stall indefinitely
     when the UI briefly re-mounts the composer.
     """
-    _wait_textarea(drv, bounded=True, max_wait=WAIT_UI)
+    _wait_composer(drv, bounded=True, max_wait=WAIT_UI)
     start = time.time()
     last_txt, last_change = "", time.time()
 
@@ -416,7 +477,7 @@ def _navigate_to_chat(drv) -> None:
     for url in (CHAT_URL, CHAT_URL_FALLBACK):
         try:
             drv.get(url)
-            _wait_textarea(drv, bounded=False)  # allow user to sign in interactively
+            _wait_composer(drv, bounded=False)  # allow user to sign in interactively
             log.info("Chat page loaded: %s", url)
             return
         except Exception as exc:  # pragma: no cover
@@ -670,7 +731,7 @@ def main() -> None:
         if state and state.get("last_commit") == _current_commit(repo):
             log.info("Resuming conversation: %s", state["conversation_url"])
             driver.get(state["conversation_url"])
-            _wait_textarea(drv=driver, bounded=False)  # user might need to re‑login
+            _wait_composer(drv=driver, bounded=False)  # user might need to re‑login
             # Persist again after successful resume load (keeps timestamp fresh)
             _save_state_quiet(repo, driver.current_url)
 

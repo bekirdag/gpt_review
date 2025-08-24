@@ -8,12 +8,19 @@ Exports
 -------
 * __version__     – Resolved from installed package metadata
 * get_version()   – Helper returning the version string
-* get_logger()    – Re‑export of logger.get_logger (shared configuration)
+* get_logger()    – Re‑export of the packaged logger.get_logger
 
 Side‑effects
 ------------
 * Configures the root "gpt_review" logger on first import so all sub‑modules
-  share the same rotating file + console handlers (see logger.py).
+  share the same rotating file + console handlers (see gpt_review/logger.py).
+
+Notes
+-----
+This module imports the **packaged** logger implementation directly to avoid any
+duplication. A thin top‑level `logger.py` shim exists for backward compatibility
+with legacy imports (`from logger import get_logger`), and simply delegates to
+`gpt_review.logger`.
 """
 from __future__ import annotations
 
@@ -22,7 +29,7 @@ from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
 # Initialise the project‑wide logging configuration early.
 # The underlying implementation is idempotent and will not duplicate handlers.
-from logger import get_logger as _configure_logger  # local module import
+from gpt_review.logger import get_logger as _configure_logger  # packaged logger
 
 # -----------------------------------------------------------------------------
 # Logging – initialise root logger once
@@ -63,7 +70,7 @@ def get_logger(name: str | None = None) -> logging.Logger:
           project logger "gpt_review".
     """
     # Reuse the same configuration function; it avoids duplicate handlers.
-    from logger import get_logger as _get  # local import to prevent cycles
+    from gpt_review.logger import get_logger as _get  # local import to prevent cycles
 
     return _get(name)
 

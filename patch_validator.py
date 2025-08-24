@@ -35,7 +35,6 @@ Design notes
 * The schema is loaded **once** at import time via `importlib.resources`.
 * We compile a `Draft7Validator` for speed and nicer error messages.
 * Log output is concise but includes JSON pointers for failing fields.
-
 """
 from __future__ import annotations
 
@@ -48,7 +47,7 @@ from typing import Any, Dict
 import jsonschema
 from jsonschema import Draft7Validator, ValidationError
 
-from logger import get_logger
+from gpt_review import get_logger
 
 # -----------------------------------------------------------------------------
 # Logging

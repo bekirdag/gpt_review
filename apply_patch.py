@@ -25,8 +25,10 @@ Safety nets
 * **Path traversal** – rejects any path escaping repo root (../ tricks).
 * **Local modifications** – refuses destructive ops when file differs from
   *HEAD* (staged *or* unstaged).
-* **Safe chmod** – only 644 or 755 allowed (configurable).
+* **Safe chmod** – allows only 644/755 (**accepts** both "755" and "0755").
 * **No‑op commits** – skips commit when there is nothing to stage (idempotent).
+* **CRLF→LF normalization** – text bodies are normalized to LF + trailing \n
+  to avoid noisy diffs when patches are authored on Windows.
 
 Logging
 -------
@@ -52,7 +54,8 @@ from logger import get_logger
 # -----------------------------------------------------------------------------
 # Constants & logger
 # -----------------------------------------------------------------------------
-SAFE_MODES = {"644", "755"}
+# Accept "755" and "0755" (same for 644). Using numeric set avoids string drift.
+_ALLOWED_MODES = {0o644, 0o755}
 log = get_logger(__name__)
 
 # -----------------------------------------------------------------------------
@@ -149,9 +152,26 @@ def _ensure_inside(repo: Path, target: Path) -> None:
         raise ValueError("Patch path escapes repository root") from exc
 
 
+def _normalize_newlines(text: str) -> str:
+    """
+    Normalize newlines to LF only.
+
+    Converts:
+      • CRLF (\r\n) → LF (\n)
+      • CR (\r)    → LF (\n)
+    """
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _normalize_text(text: str) -> str:
-    """Ensure trailing newline (POSIX)."""
-    return text if text.endswith("\n") else text + "\n"
+    """
+    Prepare a text body for writing to disk:
+
+    1) Normalize newlines to LF only
+    2) Ensure a single trailing newline (POSIX)
+    """
+    norm = _normalize_newlines(text)
+    return norm if norm.endswith("\n") else norm + "\n"
 
 
 def _write_file(p: Path, body: Optional[str], body_b64: Optional[str]) -> tuple[int, int]:
@@ -173,18 +193,27 @@ def _write_file(p: Path, body: Optional[str], body_b64: Optional[str]) -> tuple[
 
     # text
     text = _normalize_text(body or "")
-    p.write_text(text, encoding="utf-8")
+    p.write_text(text, encoding="utf-8", newline="\n")  # explicit LF on write
     log.debug("Wrote text file %s (%d chars)", p, len(text))
     return len(text.encode("utf-8")), prev_size
 
 
 def _same_contents_text(p: Path, new_text: str) -> bool:
-    """Return True if file *p* already equals *new_text* (after normalization)."""
+    """
+    Return True if file *p* already equals *new_text* (after normalization).
+
+    Note: comparison is **EOL-insensitive** on the incoming *new_text*:
+    the incoming text is normalized to LF and compared to the on-disk bytes
+    **as written**. If the repository file already matches the normalized
+    text, we avoid a no-op update even if the incoming payload contained CRLF.
+    """
     if not p.exists():
         return False
     try:
         current = p.read_text(encoding="utf-8")
-        return current == _normalize_text(new_text)
+        current_norm = _normalize_text(current)
+        incoming_norm = _normalize_text(new_text)
+        return current_norm == incoming_norm
     except UnicodeDecodeError:
         return False
 
@@ -237,7 +266,7 @@ def apply_patch(patch_json: str, repo_path: str) -> None:
             if not src.exists():
                 raise FileNotFoundError(src)
 
-            # No‑op fast‑path: if contents are identical, skip writing + commit
+            # No‑op fast‑path: if contents are identical (EOL-insensitive), skip
             if body is not None and _same_contents_text(src, body):
                 log.info("No content change for %s – skipping update.", rel)
                 return
@@ -294,21 +323,29 @@ def apply_patch(patch_json: str, repo_path: str) -> None:
 
     # ---------------------------- chmod ------------------------------------
     if op == "chmod":
-        mode = patch["mode"]
-        if mode not in SAFE_MODES:
-            raise PermissionError(f"Unsafe chmod mode {mode} (allowed: {SAFE_MODES})")
+        mode_str = patch["mode"]
         if not src.exists():
             raise FileNotFoundError(src)
 
-        desired = int(mode, 8)
+        # Accept "755" and "0755" (same for 644). Validate against allowed set.
+        try:
+            desired = int(mode_str, 8)
+        except ValueError as exc:
+            raise PermissionError(f"Invalid chmod mode {mode_str!r}") from exc
+
+        if desired not in _ALLOWED_MODES:
+            raise PermissionError(
+                f"Unsafe chmod mode {mode_str!r} (allowed: 644 / 755)"
+            )
+
         current = src.stat().st_mode & 0o777
         if current == desired:
-            log.info("Mode for %s already %s – skipping chmod.", rel, mode)
+            log.info("Mode for %s already %s – skipping chmod.", rel, mode_str)
             return
 
         os.chmod(src, desired)
         # Stage the path to ensure mode change is recorded (git tracks mode bits)
-        _commit(repo, f"GPT chmod {mode}: {rel}", paths=[rel])
+        _commit(repo, f"GPT chmod {mode_str}: {rel}", paths=[rel])
         return
 
     # -----------------------------------------------------------------------

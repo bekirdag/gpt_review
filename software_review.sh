@@ -13,11 +13,10 @@
 #
 # Improvements in this revision
 # -----------------------------
-# • Robust runner resolution with clear logging:
-#     - Prefer `gpt-review` CLI if found (logs full path).
-#     - Fall back to `python3` / `python` and verify `import gpt_review` works.
-#     - Emit actionable error if neither is available or import fails.
-# • Logs resolved runner command for traceability.
+# • Aligned, readable `--env-dump` output (columnised).
+# • Exit summary line with status, exit code, and wall‑clock duration.
+# • If `--log-file` is provided, it **implies** logging (even if `--no-log` was set).
+# • Clearer messages; consistent logging helpers.
 #
 # Usage
 # -----
@@ -78,10 +77,16 @@ _join_cmd() {
   printf "%s" "${out% }"
 }
 
+# Columnised key/value (aligned) for env‑dump
+_env_kv() {
+  # Usage: _env_kv "KEY" "VALUE"
+  printf "  %-24s : %s\n" "$1" "$2"
+}
+
 # ───────────────────────────── usage banner ────────────────────────────────
 usage() {
-  local d_chat="${GPT_REVIEW_CHAT_URL:-https://chatgpt.com/}"
-  local d_prof="${GPT_REVIEW_PROFILE:-$HOME/.cache/gpt-review/chrome}"
+  local d_chat="https://chatgpt.com/"
+  local d_prof="${HOME}/.cache/gpt-review/chrome"
   cat <<EOF
 ${C_INFO}Usage:${C_END} $(basename "$0") [wrapper‑opts] instructions.txt /path/to/repo [gpt‑review opts]
 
@@ -105,14 +110,14 @@ Forwarded options (examples for gpt-review):
 Environment (current → default):
   GPT_REVIEW_CHAT_URL        = ${GPT_REVIEW_CHAT_URL:-<unset>}  → ${d_chat}
   GPT_REVIEW_PROFILE         = ${GPT_REVIEW_PROFILE:-<unset>}   → ${d_prof}
-  GPT_REVIEW_HEADLESS        = ${GPT_REVIEW_HEADLESS:-<unset>}  → <off>
+  GPT_REVIEW_HEADLESS        = ${GPT_REVIEW_HEADLESS:-<off>}    → <off>
   GPT_REVIEW_WAIT_UI         = ${GPT_REVIEW_WAIT_UI:-<unset>}   → 90
   GPT_REVIEW_STREAM_IDLE_SECS= ${GPT_REVIEW_STREAM_IDLE_SECS:-<unset>} → 2
   GPT_REVIEW_RETRIES         = ${GPT_REVIEW_RETRIES:-<unset>}   → 3
   GPT_REVIEW_CHUNK_SIZE      = ${GPT_REVIEW_CHUNK_SIZE:-<unset>}→ 15000
   GPT_REVIEW_COMMAND_TIMEOUT = ${GPT_REVIEW_COMMAND_TIMEOUT:-<unset>} → 300
   GPT_REVIEW_LOG_DIR         = ${GPT_REVIEW_LOG_DIR:-<unset>}   → ./logs
-  CHROME_BIN                 = ${CHROME_BIN:-<unset>}            (auto‑detected if unset)
+  CHROME_BIN                 = ${CHROME_BIN:-<auto>}             (auto‑detected if unset)
 
 Examples:
   $(basename "$0") docs/example_instructions.txt  ~/my-project  --cmd "pytest -q" --auto
@@ -143,6 +148,11 @@ while [[ $# -gt 0 ]]; do
     *  ) break ;;                       # first positional arg encountered
   esac
 done
+
+# If a log file was explicitly requested, it implies logging.
+if [[ -n "$LOG_FILE" ]]; then
+  WRAP_LOG=1
+fi
 
 # ───────────────────────────── positional args ──────────────────────────────
 if [[ $# -lt 2 ]]; then
@@ -181,19 +191,19 @@ fi
 
 # ───────────────────────────── env dump (optional) ──────────────────────────
 if [[ $ENV_DUMP -eq 1 ]]; then
-  cat <<EOT
-$(printf "%s\n" "${C_INFO}─ Environment dump ─────────────────────────────${C_END}")
-CHAT URL      : ${GPT_REVIEW_CHAT_URL:-https://chatgpt.com/}
-PROFILE DIR   : ${GPT_REVIEW_PROFILE:-$HOME/.cache/gpt-review/chrome}
-HEADLESS      : ${GPT_REVIEW_HEADLESS:-<off>}
-WAIT_UI       : ${GPT_REVIEW_WAIT_UI:-90}   (seconds)
-STREAM_IDLE   : ${GPT_REVIEW_STREAM_IDLE_SECS:-2}   (seconds)
-RETRIES       : ${GPT_REVIEW_RETRIES:-3}
-CHUNK_SIZE    : ${GPT_REVIEW_CHUNK_SIZE:-15000}   (characters)
-CMD TIMEOUT   : ${GPT_REVIEW_COMMAND_TIMEOUT:-300}   (seconds)
-LOG DIR       : ${GPT_REVIEW_LOG_DIR:-logs}
-CHROME_BIN    : ${CHROME_BIN:-<auto>}
-EOT
+  echo
+  echo -e "${C_INFO}─ Environment dump ─────────────────────────────${C_END}"
+  _env_kv "CHAT URL"            "${GPT_REVIEW_CHAT_URL:-https://chatgpt.com/}"
+  _env_kv "PROFILE DIR"         "${GPT_REVIEW_PROFILE:-$HOME/.cache/gpt-review/chrome}"
+  _env_kv "HEADLESS"            "${GPT_REVIEW_HEADLESS:-<off>}"
+  _env_kv "WAIT_UI (s)"         "${GPT_REVIEW_WAIT_UI:-90}"
+  _env_kv "STREAM_IDLE (s)"     "${GPT_REVIEW_STREAM_IDLE_SECS:-2}"
+  _env_kv "RETRIES"             "${GPT_REVIEW_RETRIES:-3}"
+  _env_kv "CHUNK_SIZE (chars)"  "${GPT_REVIEW_CHUNK_SIZE:-15000}"
+  _env_kv "CMD TIMEOUT (s)"     "${GPT_REVIEW_COMMAND_TIMEOUT:-300}"
+  _env_kv "LOG DIR"             "${GPT_REVIEW_LOG_DIR:-logs}"
+  _env_kv "CHROME_BIN"          "${CHROME_BIN:-<auto>}"
+  echo
 fi
 
 # ───────────────────────────── logging (tee to file) ────────────────────────
@@ -238,7 +248,7 @@ EOF
 import sys
 try:
     import gpt_review  # noqa
-except Exception as exc:
+except Exception:
     sys.exit(42)
 sys.exit(0)
 PY
@@ -267,7 +277,8 @@ info "Resolved runner command: $(_join_cmd "${RUNNER_CMD[@]}")"
 
 # ───────────────────────────── kickoff ──────────────────────────────────────
 info "▶︎ Launching GPT‑Review …"
-info "• Instructions : $INSTRUCTIONS ($(wc -c <"$INSTRUCTIONS" | tr -d '[:space:]') bytes)"
+instr_bytes="$(wc -c <"$INSTRUCTIONS" | tr -d '[:space:]')"
+info "• Instructions : $INSTRUCTIONS (${instr_bytes} bytes)"
 info "• Repository   : $REPO"
 [[ ${#FORWARD_ARGS[@]} -gt 0 ]] && info "• Forwarded CLI: $(_join_cmd "${FORWARD_ARGS[@]}")"
 
@@ -275,15 +286,23 @@ info "• Repository   : $REPO"
 export PY_COLORS="${PY_COLORS:-1}"
 
 # Execute the tool
+START_EPOCH="$(date +%s)"
 set +e  # we want to capture exit code and print a friendly summary
 "${RUNNER_CMD[@]}" "$INSTRUCTIONS" "$REPO" "${FORWARD_ARGS[@]}"
 EXIT_CODE=$?
 set -e
+END_EPOCH="$(date +%s)"
+DURATION="$(( END_EPOCH - START_EPOCH ))"
 
 if [[ $EXIT_CODE -eq 0 ]]; then
   info "✓ GPT‑Review finished successfully"
+  echo "Result: SUCCESS | exit=${EXIT_CODE} | duration=${DURATION}s"
 else
   error "✖ GPT‑Review exited with code $EXIT_CODE"
+  echo "Result: FAILURE | exit=${EXIT_CODE} | duration=${DURATION}s"
 fi
+
+# Also emit a machine‑parsable line for log scrapers
+echo "EXIT_CODE=${EXIT_CODE}"
 
 exit $EXIT_CODE

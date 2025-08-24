@@ -11,7 +11,8 @@
 #   bundled resources (schema.json) and `python -m gpt_review` work reliably.
 # • Keep top‑level modules (`review`, `apply_patch`, `patch_validator`, `logger`)
 #   via `py-modules` – these back the console entry‑point `gpt-review`.
-# • Leave dev tools and style configs unchanged (mirrors repo tooling).
+# • Project URLs now point to the canonical repo:
+#     https://github.com/bekirdag/gpt_review
 ###############################################################################
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -90,9 +91,9 @@ dev = [
 #  Handy links on PyPI project page
 # ─────────────────────────────────────────────────────────────────────────────
 [project.urls]
-Homepage = "https://github.com/your-org/gpt-review"
-Documentation = "https://github.com/your-org/gpt-review#readme"
-Issues = "https://github.com/your-org/gpt-review/issues"
+Homepage = "https://github.com/bekirdag/gpt_review"
+Documentation = "https://github.com/bekirdag/gpt_review#readme"
+Issues = "https://github.com/bekirdag/gpt_review/issues"
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Console script entry‑point
@@ -109,7 +110,7 @@ gpt-review = "review:main"
 packages = ["gpt_review"]               # ← ensures `gpt_review` package is in the wheel
 include-package-data = true             # ← cooperate with MANIFEST.in when building sdists
 
-# Top‑level modules that live outside the package dir
+# Top‑level modules that live outside the package dir (shim for legacy imports)
 py-modules = ["review", "apply_patch", "patch_validator", "logger"]
 
 [tool.setuptools.package-data]

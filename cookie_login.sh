@@ -14,7 +14,7 @@
 # 2) Detects a suitable browser binary (CHROME_BIN override respected).
 # 3) Launches a **visible** browser window with that profile.
 # 4) Opens ChatGPT: primary URL (GPT_REVIEW_LOGIN_URL or https://chatgpt.com/)
-#    with a fallback tab to https://chat.openai.com/ **unless identical**.
+#    with an optional fallback tab to https://chat.openai.com/.
 # 5) Prints friendly guidance and waits until you close the window (Linux),
 #    or asks you to press <Enter> when done (macOS `open -a` fallback).
 #
@@ -83,8 +83,12 @@ fi
 # ------------------------------------------------------------------------------
 detect_browser() {
   # 1) Explicit override
-  if [[ -n "${CHROME_BIN:-}" && -x "${CHROME_BIN:-/nonexistent}" ]]; then
-    echo "$CHROME_BIN"; return 0
+  if [[ -n "${CHROME_BIN:-}" ]]; then
+    if [[ -x "${CHROME_BIN:-/nonexistent}" ]]; then
+      echo "$CHROME_BIN"; return 0
+    else
+      warn "CHROME_BIN is set but not executable: ${CHROME_BIN:-<unset>}"
+    fi
   fi
 
   # 2) Common PATH candidates (Linux/WSL)
@@ -123,7 +127,7 @@ echo "────────────────────────�
 echo "• Chrome profile : $PROFILE_DIR"
 echo "• Primary URL    : $PRIMARY_URL"
 if [[ $SAME_AS_FALLBACK -eq 1 ]]; then
-  echo "• Fallback URL   : (suppressed – same as primary)"
+  echo "• Fallback URL   : (suppressed — primary equals fallback)"
 else
   echo "• Fallback URL   : $FALLBACK_URL"
 fi
@@ -135,15 +139,22 @@ if [[ -n "$BROWSER_BIN" ]]; then
 else
   echo "• Browser binary : (not found on PATH)"
 fi
+
+# Helpful hint if a previous Chrome session holds the profile lock.
+LOCK_HINT=""
+if [[ -e "$PROFILE_DIR/SingletonLock" || -e "$PROFILE_DIR/SingletonCookie" ]]; then
+  LOCK_HINT="(If you see a 'profile in use' message, fully close all Chrome/Chromium windows and retry.)"
+fi
+
 echo
 echo "Next steps:"
 if [[ $SAME_AS_FALLBACK -eq 1 ]]; then
-  echo "  1) A browser window will open with $PRIMARY_URL."
+  echo "  1) A browser window will open with *one* tab: $PRIMARY_URL"
 else
   echo "  1) A browser window will open with $PRIMARY_URL (and a fallback tab)."
 fi
 echo "  2) Sign in to ChatGPT and verify you can chat."
-echo "  3) CLOSE the window to finish (or press Enter if prompted)."
+echo "  3) CLOSE the window to finish (or press Enter if prompted). $LOCK_HINT"
 echo "───────────────────────────────────────────────────────────────────────────"
 echo
 

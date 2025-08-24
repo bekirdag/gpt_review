@@ -15,6 +15,7 @@ Goals
     • commits created as expected
     • path‑traversal attempts blocked
     • local‑change protection works
+    • **staging is scoped** – unrelated sibling changes are not swept in
 
 All tests run inside a **temporary Git repository** created via the
 tmp_path fixture (pytest).
@@ -267,3 +268,41 @@ def test_path_traversal_blocked(tmp_path: Path):
         _apply(malicious, repo)
 
     log.info("Path traversal protection test passed.")
+
+
+def test_staging_scoped_no_sibling_sweep(tmp_path: Path):
+    """
+    Creating a file under a directory that also contains a **modified** sibling
+    must NOT stage that sibling. Only the target path should be included.
+    """
+    repo = _init_repo(tmp_path, initial_file=True)
+
+    # Add a sibling file and commit it
+    (repo / "docs").mkdir(parents=True, exist_ok=True)
+    (repo / "docs" / "kept.txt").write_text("keep\n")
+    _git(repo, "add", "docs/kept.txt")
+    _git(repo, "commit", "-m", "add kept")
+
+    # Modify kept.txt locally (leave it unstaged)
+    (repo / "docs" / "kept.txt").write_text("local change\n")
+
+    # Apply a create patch for a different file in the same directory
+    _apply(
+        {
+            "op": "create",
+            "file": "docs/new.txt",
+            "body": "new",
+            "status": "in_progress",
+        },
+        repo,
+    )
+
+    # The modified sibling must remain unstaged after the commit
+    status = _git(repo, "status", "--porcelain", capture=True)
+    assert " M docs/kept.txt" in status.splitlines()
+
+    # Last commit should only contain the new file
+    name_status = _git(
+        repo, "diff-tree", "--no-commit-id", "--name-status", "-r", "HEAD", capture=True
+    ).strip()
+    assert name_status.splitlines() == ["A\tdocs/new.txt"]
