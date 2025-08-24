@@ -36,6 +36,7 @@ Edit → Run → Fix — until your tests pass.
    - [Debian/Ubuntu (one‑liner)](#debianubuntu-one-liner)  
    - [pip / virtual‑env](#pip--virtual-env)  
    - [Docker](#docker)  
+   - [Update (in‑place upgrade)](#update-in-place-upgrade)  
 4. [First‑time login](#first-time-login)  
    - [macOS client (XQuartz) + SSH X‑forwarding](#macos-client-xquartz--ssh-x-forwarding)  
    - [Headless servers (Xvfb + VNC alternative)](#headless-servers-xvfb--vnc-alternative)  
@@ -144,6 +145,24 @@ docker run -it --rm \
   gpt-review /workspace/example_instructions.txt /workspace \
   --cmd "pytest -q" --auto
 ```
+
+### Update (in‑place upgrade)
+
+To update an existing install (default path `/opt/gpt-review`):
+
+```bash
+curl -sSL https://raw.githubusercontent.com/bekirdag/gpt_review/main/update.sh | sudo bash -s -- --force
+```
+
+**Flags:**
+
+* `-d, --repo /path` — update a non‑default clone (default: `/opt/gpt-review`)
+* `-b, --branch <name>` — pick a branch (default: `main`)
+* `-f, --force` — discard local changes (hard reset)
+
+The script pulls the latest code, reinstalls the package in the bundled
+virtual‑env, and refreshes launchers: **gpt-review**, **software_review.sh**,
+**cookie_login.sh**, and **gpt-review-update**.
 
 ---
 
@@ -376,6 +395,17 @@ Two GitHub Actions workflows:
   - Test with `xclock`.  
   - If Snap Chromium, move profile to a snap‑writable path.  
   - For root sessions, the login helper auto‑adds `--no-sandbox`.
+
+* **“User data directory is already in use”**  
+  - Close any other Chrome/Chromium using your profile.  
+  - Or clone to a temporary run profile:  
+    ```bash
+    BASE="$HOME/.cache/gpt-review/chrome"
+    RUN="$HOME/.cache/gpt-review/run-$(date +%s)"
+    rsync -a --delete --exclude='**/Cache' --exclude='**/Code Cache' --exclude='**/GPUCache' "$BASE"/ "$RUN"/
+    export GPT_REVIEW_PROFILE="$RUN"
+    software_review.sh instructions.txt /repo --cmd "pytest -q" --auto
+    ```
 
 * **“No composer textarea found”**  
   - Ensure you’re logged in (`cookie_login.sh`). The driver searches for `<textarea>` and clears drafts before sending.
