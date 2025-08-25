@@ -46,6 +46,10 @@ High‑impact robustness
 • **Safe commit lookup**:
   - `_current_commit()` returns `"<no-commits-yet>"` on fresh repos instead
     of crashing, so error reporting works before the first commit.
+
+• **Non‑BMP input fallback**:
+  - ChromeDriver can’t send characters outside the BMP (e.g., some emojis).
+    We detect such text and fall back to a JS fill that dispatches proper events.
 """
 from __future__ import annotations
 
@@ -400,6 +404,36 @@ def _wait_textarea(drv, *, bounded: bool = False, max_wait: int = WAIT_UI):  # p
     return _wait_composer(drv, bounded=bounded, max_wait=max_wait)
 
 
+# ────────────────────────────────────────────────────────────────────────────
+#  Non‑BMP input workaround (ChromeDriver limitation)
+# ────────────────────────────────────────────────────────────────────────────
+def _contains_non_bmp(text: str) -> bool:
+    """True if *text* contains code points above U+FFFF (emoji etc.)."""
+    return any(ord(ch) > 0xFFFF for ch in text)
+
+
+def _js_fill_input(drv, el, text: str) -> None:
+    """
+    Fill the ChatGPT composer via JS to bypass send_keys' BMP limitation.
+    We update value/textContent and dispatch 'input' and 'change' events so
+    the React app notices the change.
+    """
+    js = """
+    const el = arguments[0];
+    const val = arguments[1];
+    const tag = (el.tagName || '').toLowerCase();
+    if (tag === 'textarea') {
+      el.value = val;
+    } else {
+      el.innerHTML = '';
+      el.textContent = val;
+    }
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+    """
+    drv.execute_script(js, el, text)
+
+
 def _clear_and_send(area, text: str) -> None:
     """Focus, clear any draft robustly, then send *text* + ENTER."""
     try:
@@ -420,7 +454,23 @@ def _clear_and_send(area, text: str) -> None:
     except Exception:
         pass
 
-    area.send_keys(text)
+    # Prefer JS fill when non‑BMP is present; otherwise try send_keys first.
+    drv = getattr(area, "parent", None) or getattr(area, "_parent", None)
+    try:
+        if _contains_non_bmp(text) and drv is not None:
+            log.debug("Detected non‑BMP characters; using JS fill for %d chars.", len(text))
+            _js_fill_input(drv, area, text)
+        else:
+            area.send_keys(text)
+    except WebDriverException as exc:
+        # ChromeDriver cannot send characters outside the BMP (emoji, some symbols).
+        msg = str(exc)
+        if ("BMP" in msg or "supports characters in the BMP" in msg or _contains_non_bmp(text)) and drv is not None:
+            log.warning("send_keys rejected characters; falling back to JS fill for %d chars.", len(text))
+            _js_fill_input(drv, area, text)
+        else:
+            raise
+
     area.send_keys(Keys.ENTER)
 
 
