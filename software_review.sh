@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ###############################################################################
-# GPT-Review - Thin CLI Wrapper (with optional API mode)
+# GPT‑Review ▸ Thin CLI Wrapper (browser or API mode)
 ###############################################################################
 #
 # Purpose
@@ -9,7 +9,7 @@
 #   - Optionally load a .env file, dump effective environment, and tee logs
 #   - Delegate to the underlying "gpt-review" Python CLI (or python -m fallback)
 #   - Convenience switches:
-#       --api         -> request API mode (no browser)
+#       --api         -> request API mode (no browser)  == --mode api
 #       --model NAME  -> select API model (forwarded to the Python CLI)
 #
 # Usage
@@ -27,8 +27,8 @@
 #
 # Notes
 #   - You can also pass --mode/--model directly after the positional args; this
-#     wrapper will forward them unchanged. The --api flag is a convenience that
-#     will be rewritten to "--mode api" for you.
+#     wrapper forwards them unchanged. The --api flag is a convenience that is
+#     rewritten to "--mode api".
 #   - Environment variables commonly used:
 #       GPT_REVIEW_PROFILE, GPT_REVIEW_CHAT_URL, GPT_REVIEW_HEADLESS,
 #       GPT_REVIEW_WAIT_UI, GPT_REVIEW_STREAM_IDLE_SECS, GPT_REVIEW_RETRIES,
@@ -36,13 +36,14 @@
 #       CHROME_BIN
 #     API mode adds:
 #       OPENAI_API_KEY, OPENAI_BASE_URL (or OPENAI_API_BASE), GPT_REVIEW_MODEL,
-#       GPT_REVIEW_CTX_TURNS, GPT_REVIEW_LOG_TAIL_CHARS, GPT_REVIEW_API_TIMEOUT
+#       GPT_REVIEW_CTX_TURNS, GPT_REVIEW_LOG_TAIL_CHARS, GPT_REVIEW_API_TIMEOUT,
+#       GPT_REVIEW_MODE=api (if you want API mode by default)
 ###############################################################################
 
 set -euo pipefail
 IFS=$'\n\t'
 
-# ------------------------------- color helpers ------------------------------ #
+# -------------------------------- color helpers ---------------------------- #
 if [[ -t 1 ]]; then
   C_INFO=$'\e[34m'; C_OK=$'\e[32m'; C_WARN=$'\e[33m'; C_ERR=$'\e[31m'; C_END=$'\e[0m'
 else
@@ -84,7 +85,7 @@ Wrapper options (before positional args):
   --fresh                Remove .gpt-review-state.json to start fresh
   --no-log               Do not write a wrapper log (console only)
   --log-file PATH        Write output to PATH (implies tee)
-  --api                  Use API mode (no browser)
+  --api                  Use API mode (no browser) [same as --mode api]
   --model NAME           API model name (e.g. gpt-5-pro)
 
 Positional arguments:
@@ -109,6 +110,7 @@ Environment (current -> default):
   GPT_REVIEW_COMMAND_TIMEOUT  = ${GPT_REVIEW_COMMAND_TIMEOUT:-<unset>} -> 300
   GPT_REVIEW_LOG_DIR          = ${GPT_REVIEW_LOG_DIR:-<unset>}   -> ./logs
   CHROME_BIN                  = ${CHROME_BIN:-<unset>}            (auto if unset)
+  GPT_REVIEW_MODE             = ${GPT_REVIEW_MODE:-<unset>}       (default CLI mode: browser)
 
 API mode extras:
   OPENAI_API_KEY              = $( [[ -n "${OPENAI_API_KEY:-}" ]] && echo "<set>" || echo "<unset>" )
@@ -195,9 +197,10 @@ if [[ $FRESH -eq 1 ]]; then
   fi
 fi
 
-# ----------------- normalize/augment forwarded args for API mode ----------- #
+# --------------- normalize/augment forwarded args for mode/model ----------- #
 NEW_ARGS=()
 EXPLICIT_MODE_PRESENT=0
+EXPLICIT_MODE_VALUE=""   # capture explicit --mode value
 EXPLICIT_MODEL_PRESENT=0
 INLINE_API=0
 MODEL_EXPLICIT=""
@@ -208,9 +211,9 @@ while [[ $i -lt ${#FORWARD_ARGS[@]} ]]; do
   case "$arg" in
     --mode)
       EXPLICIT_MODE_PRESENT=1
-      NEW_ARGS+=("$arg")
       if [[ $((i+1)) -lt ${#FORWARD_ARGS[@]} ]]; then
-        NEW_ARGS+=("${FORWARD_ARGS[$((i+1))]}")
+        EXPLICIT_MODE_VALUE="${FORWARD_ARGS[$((i+1))]}"
+        NEW_ARGS+=("$arg" "$EXPLICIT_MODE_VALUE")
         i=$((i+2))
       else
         die "--mode requires a value"
@@ -219,6 +222,7 @@ while [[ $i -lt ${#FORWARD_ARGS[@]} ]]; do
       ;;
     --mode=*)
       EXPLICIT_MODE_PRESENT=1
+      EXPLICIT_MODE_VALUE="${arg#*=}"
       NEW_ARGS+=("$arg")
       i=$((i+1)); continue
       ;;
@@ -251,21 +255,21 @@ while [[ $i -lt ${#FORWARD_ARGS[@]} ]]; do
   esac
 done
 
-# Decide effective mode
-MODE_EFFECTIVE="browser"
+# Compute effective mode:
+# Priority: explicit --mode > wrapper --api/INLINE_API > env GPT_REVIEW_MODE > browser
 if [[ $EXPLICIT_MODE_PRESENT -eq 1 ]]; then
-  MODE_EFFECTIVE="(explicit)"
+  MODE_EFFECTIVE="$EXPLICIT_MODE_VALUE"
 else
   if [[ $WRAP_API -eq 1 || $INLINE_API -eq 1 ]]; then
     MODE_EFFECTIVE="api"
   else
-    MODE_EFFECTIVE="browser"
+    MODE_EFFECTIVE="${GPT_REVIEW_MODE:-browser}"
   fi
 fi
 
 # Decide effective model (only relevant when api mode is active)
 MODEL_EFFECTIVE=""
-if [[ "$MODE_EFFECTIVE" == "api" || ( $EXPLICIT_MODE_PRESENT -eq 1 && "${NEW_ARGS[*]}" == *"--mode api"* ) ]]; then
+if [[ "$MODE_EFFECTIVE" == "api" ]]; then
   if [[ $EXPLICIT_MODEL_PRESENT -eq 1 ]]; then
     MODEL_EFFECTIVE="$MODEL_EXPLICIT"
   elif [[ -n "$WRAP_MODEL" ]]; then
@@ -276,8 +280,8 @@ if [[ "$MODE_EFFECTIVE" == "api" || ( $EXPLICIT_MODE_PRESENT -eq 1 && "${NEW_ARG
 fi
 
 # Apply convenience rewrites if mode was not explicitly provided
-if [[ $EXPLICIT_MODE_PRESENT -eq 0 && "$MODE_EFFECTIVE" == "api" ]]; then
-  NEW_ARGS+=(--mode api)
+if [[ $EXPLICIT_MODE_PRESENT -eq 0 ]]; then
+  NEW_ARGS+=(--mode "$MODE_EFFECTIVE")
 fi
 # Provide --model if we decided one and user did not set it explicitly
 if [[ -n "$MODEL_EFFECTIVE" && $EXPLICIT_MODEL_PRESENT -eq 0 ]]; then
@@ -298,7 +302,7 @@ CHUNK_SIZE     : ${GPT_REVIEW_CHUNK_SIZE:-15000} (chars)
 CMD TIMEOUT    : ${GPT_REVIEW_COMMAND_TIMEOUT:-300} (s)
 LOG DIR        : ${GPT_REVIEW_LOG_DIR:-logs}
 CHROME_BIN     : ${CHROME_BIN:-<auto>}
-API MODE       : $( [[ "$MODE_EFFECTIVE" == "api" || "${NEW_ARGS[*]}" == *"--mode api"* ]] && echo "on" || echo "off" )
+MODE           : ${MODE_EFFECTIVE}
 OPENAI KEY     : $( [[ -n "${OPENAI_API_KEY:-}" ]] && echo "<set>" || echo "<unset>" )
 OPENAI URL     : ${OPENAI_BASE_URL:-${OPENAI_API_BASE:-<unset>}}
 API MODEL      : ${MODEL_EFFECTIVE:-${GPT_REVIEW_MODEL:-gpt-5-pro}}
@@ -375,28 +379,11 @@ info "Resolved runner command: $(_join_cmd "${RUNNER_CMD[@]}")"
 
 # -------------------------------- kickoff ---------------------------------- #
 BYTES="$(wc -c <"$INSTRUCTIONS" | tr -d '[:space:]' || echo 0)"
-info "Launching GPT-Review ..."
-info "  - Instructions : $INSTRUCTIONS (${BYTES} bytes)"
-info "  - Repository   : $REPO"
-
-# Mode banner
-if [[ "$MODE_EFFECTIVE" == "(explicit)" ]]; then
-  if [[ "${NEW_ARGS[*]}" == *"--mode api"* ]]; then
-    [[ -n "$MODEL_EFFECTIVE" ]] && info "  - Mode         : api (model: $MODEL_EFFECTIVE)" || info "  - Mode         : api"
-  elif [[ "${NEW_ARGS[*]}" == *"--mode browser"* ]]; then
-    info "  - Mode         : browser"
-  else
-    info "  - Mode         : (explicit via args)"
-  fi
-else
-  if [[ "$MODE_EFFECTIVE" == "api" ]]; then
-    info "  - Mode         : api (model: $MODEL_EFFECTIVE)"
-  else
-    info "  - Mode         : browser"
-  fi
-fi
-
-[[ ${#NEW_ARGS[@]} -gt 0 ]] && info "  - Forwarded CLI: $(_join_cmd "${NEW_ARGS[@]}")"
+info "▶ Launching GPT‑Review …"
+info "  • Instructions : $INSTRUCTIONS (${BYTES} bytes)"
+info "  • Repository   : $REPO"
+info "  • Mode         : $MODE_EFFECTIVE"
+[[ ${#NEW_ARGS[@]} -gt 0 ]] && info "  • Forwarded CLI: $(_join_cmd "${NEW_ARGS[@]}")"
 
 # Make Python colored logs visible by default where supported
 export PY_COLORS="${PY_COLORS:-1}"
@@ -407,9 +394,9 @@ EXIT_CODE=$?
 set -e
 
 if [[ $EXIT_CODE -eq 0 ]]; then
-  info "Completed successfully"
+  info "✓ Completed successfully"
 else
-  error "GPT-Review exited with code $EXIT_CODE"
+  error "✖ GPT‑Review exited with code $EXIT_CODE"
 fi
 
 exit $EXIT_CODE

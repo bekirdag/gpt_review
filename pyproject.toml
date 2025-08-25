@@ -2,16 +2,13 @@
 # GPT‑Review ▸ Project Metadata & Build Configuration
 ###############################################################################
 # This file powers **PEP 517/518** builds (`python -m build`) as well as
-# editable installs (`pip install -e .`).  Comments are verbose by design so
-# newcomers can understand *why* each section exists.
+# editable installs (`pip install -e .`). Comments are verbose by design.
 #
 # Changes in this revision
 # ------------------------
-# • **Single source of truth for Flake8**: keep lint settings in `.flake8`.
-#   The previous duplicate `[tool.flake8]` table has been removed to avoid
-#   precedence ambiguity.
-# • Canonical dependency casing: `GitPython` (PyPI name) for clarity.
-# • Project URLs point at `https://github.com/bekirdag/gpt_review`.
+# • Add API mode dependency: `openai` (official SDK).
+# • Keep Selenium deps for browser mode.
+# • Consolidate lint/test config and packaging notes.
 ###############################################################################
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -27,16 +24,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name            = "gpt-review"
 version         = "0.3.0"                        # ↞ keep in sync with gpt_review/__init__.py fallback
-description     = "Browser‑driven, ChatGPT‑powered code‑review loop with auto‑test execution."
+description     = "Browser or API driven, ChatGPT-powered code-review loop with auto-test execution."
 readme          = "README.md"
 license         = { file = "LICENSE" }
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 
 authors = [
   { name = "GPT‑Review Team", email = "opensource@gpt-review.dev" }
 ]
 
-keywords = ["chatgpt", "selenium", "code‑review", "automation", "dev‑tool"]
+keywords = ["chatgpt", "selenium", "openai", "code-review", "automation", "dev-tool"]
 
 classifiers = [
   "Programming Language :: Python :: 3",
@@ -50,9 +47,12 @@ classifiers = [
 #  Runtime dependencies (PyPI)
 # ─────────────────────────────────────────────────────────────────────────────
 dependencies = [
-  # Browser automation
+  # Browser automation (browser mode)
   "selenium>=4.21.0",
   "webdriver-manager>=4.0.1",
+
+  # OpenAI API client (API mode)
+  "openai>=1.40.0",
 
   # JSON‑Schema validation
   "jsonschema>=4.22.0",
@@ -121,7 +121,7 @@ py-modules = ["review", "apply_patch", "patch_validator", "logger"]
 # ─────────────────────────────────────────────────────────────────────────────
 [tool.black]
 line-length = 88
-target-version = ["py39", "py310", "py311", "py312"]
+target-version = ["py310", "py311", "py312"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  isort (import sorter) – configured to play nice with Black

@@ -1,171 +1,324 @@
 #!/usr/bin/env bash
 ###############################################################################
-# GPT‑Review ▸ One‑shot installer (Debian/Ubuntu & derivatives)
+# GPT‑Review ▸ Installer (Debian/Ubuntu)
 ###############################################################################
 #
-# What it does (idempotent; safe to rerun)
-# ----------------------------------------
-# 1) Installs prerequisite **system packages** (Python, Git, Chrome/Chromium,
-#    Xvfb, etc.)
-# 2) Clones or updates GPT‑Review to /opt/gpt-review   (override via $REPO_DIR)
-# 3) Creates a **Python virtual‑environment** at        /opt/gpt-review/venv
-# 4) Installs the package in *editable* mode (pip install -e .)
-# 5) Creates three launchers:
-#       • /usr/local/bin/gpt-review         → console script from the venv
-#       • /usr/local/bin/software_review.sh → convenience Bash wrapper
-#       • /usr/local/bin/cookie_login.sh    → visible browser login helper
+# This script installs GPT‑Review system‑wide:
+#   • Installs OS dependencies (Python, Git, Chromium or Google Chrome, Xvfb)
+#   • Clones the repository (default: /opt/gpt-review)
+#   • Creates a Python virtual‑env and installs the package
+#   • Installs convenient launchers in /usr/local/bin:
+#       - gpt-review           → runs the Python CLI
+#       - software_review.sh   → thin wrapper (browser/API mode)
+#       - cookie_login.sh      → first‑time visible login helper (if present)
+#       - gpt-review-update    → pull & reinstall on demand
 #
-# New in this revision
-# --------------------
-# • Optional non‑snap **Google Chrome** install when INSTALL_GOOGLE_CHROME=1.
-# • Clear guidance for Snap Chromium vs non‑snap Chrome.
-# • No need to create a root wrapper: cookie_login.sh auto‑adds --no-sandbox.
+# Usage (run as root or via sudo):
+#   curl -sSL https://raw.githubusercontent.com/bekirdag/gpt_review/main/install.sh | \
+#     sudo INSTALL_GOOGLE_CHROME=1 bash -s -- [options]
 #
-# Usage
-# -----
-#   curl -sSL https://raw.githubusercontent.com/bekirdag/gpt_review/main/install.sh \
-#     | sudo INSTALL_GOOGLE_CHROME=1 bash
+# Options (flags after `--`):
+#   -d, --dir PATH        Install directory (default: /opt/gpt-review)
+#   -b, --branch NAME     Git branch to checkout (default: main)
+#   -f, --force           Force reset local changes when updating an existing clone
+#       --no-dev          Do not install dev extras (pre-commit, pytest, etc.)
+#
+# Environment toggles:
+#   INSTALL_GOOGLE_CHROME=1  Install Google Chrome Stable (recommended on Ubuntu)
+#   INSTALL_DEV=1            Install dev extras regardless of --no-dev
+#   SKIP_BROWSER=1           Skip installing any browser (use API mode only)
+#
+# After install, try:
+#   software_review.sh example_instructions.txt /path/to/repo --cmd "pytest -q" --auto
 #
 ###############################################################################
-
 set -euo pipefail
+IFS=$'\n\t'
 
-# ────────────────────────────────────────────────────────────────────────────
-# Pretty colours (fallback to plain if not TTY)
-# ────────────────────────────────────────────────────────────────────────────
-if [[ -t 1 ]]; then
-  GREEN='\e[32m'; YELLOW='\e[33m'; BLUE='\e[34m'; RED='\e[31m'; RESET='\e[0m'
-else
-  GREEN=''; YELLOW=''; BLUE=''; RED=''; RESET=''
+# --------------------------------- helpers --------------------------------- #
+C_INFO=$'\e[34m'; C_OK=$'\e[32m'; C_WARN=$'\e[33m'; C_ERR=$'\e[31m'; C_END=$'\e[0m'
+_ts() { date "+%Y-%m-%d %H:%M:%S"; }
+info()  { echo -e "${C_INFO}[$(_ts)] INFO ${C_END}$*"; }
+ok()    { echo -e "${C_OK}[$(_ts)] OK   ${C_END}$*"; }
+warn()  { echo -e "${C_WARN}[$(_ts)] WARN ${C_END}$*" >&2; }
+error() { echo -e "${C_ERR}[$(_ts)] ERROR${C_END} $*" >&2; }
+die()   { error "$@"; exit 1; }
+
+require_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    cat >&2 <<'EOF'
+This installer needs root privileges.
+
+Re-run with:   sudo bash install.sh  (or use the curl | sudo bash pattern)
+EOF
+    exit 1
+  fi
+}
+
+on_debian_like() {
+  if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    case "${ID_LIKE:-$ID}" in
+      *debian*|*ubuntu*|ubuntu|debian) return 0 ;;
+    esac
+  fi
+  return 1
+}
+
+apt_install() {
+  local -a pkgs=("$@")
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${pkgs[@]}"
+}
+
+ensure_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+write_launcher() {
+  local path="$1"
+  local body="$2"
+  echo "#!/usr/bin/env bash" > "$path"
+  echo "set -euo pipefail" >> "$path"
+  printf "%s\n" "$body" >> "$path"
+  chmod 0755 "$path"
+  ok "Installed launcher: $path"
+}
+
+# -------------------------------- defaults -------------------------------- #
+REPO_DIR="/opt/gpt-review"
+BRANCH="main"
+FORCE_RESET=0
+INSTALL_DEV_FLAG="${INSTALL_DEV:-0}"
+NO_DEV_OPT=0
+
+# ------------------------------- parse flags ------------------------------- #
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d|--dir)
+      REPO_DIR="${2:-}"; [[ -n "$REPO_DIR" ]] || die "--dir requires a path"
+      shift 2 ;;
+    --dir=*)
+      REPO_DIR="${1#*=}"; shift ;;
+    -b|--branch)
+      BRANCH="${2:-}"; [[ -n "$BRANCH" ]] || die "--branch requires a name"
+      shift 2 ;;
+    --branch=*)
+      BRANCH="${1#*=}"; shift ;;
+    -f|--force)
+      FORCE_RESET=1; shift ;;
+    --no-dev)
+      NO_DEV_OPT=1; shift ;;
+    *)
+      die "Unknown option: $1" ;;
+  esac
+done
+
+require_root
+
+info "Install directory : ${REPO_DIR}"
+info "Git branch        : ${BRANCH}"
+info "Force reset       : $([[ $FORCE_RESET -eq 1 ]] && echo yes || echo no)"
+info "Install dev extras: $([[ ${INSTALL_DEV_FLAG} -eq 1 ]] && echo yes || ( [[ $NO_DEV_OPT -eq 1 ]] && echo no || echo no ))"
+info "Google Chrome     : $([[ ${INSTALL_GOOGLE_CHROME:-0} -eq 1 ]] && echo 'install' || echo 'skip')"
+info "Skip browser      : $([[ ${SKIP_BROWSER:-0} -eq 1 ]] && echo yes || echo no)"
+
+# --------------------------- OS prerequisites ------------------------------ #
+if ! on_debian_like; then
+  warn "This installer targets Debian/Ubuntu. Proceeding may fail on other distros."
 fi
-info()  { echo -e "${BLUE}▶︎${RESET} $*"; }
-warn()  { echo -e "${YELLOW}⚠${RESET} $*" >&2; }
-ok()    { echo -e "${GREEN}✓${RESET} $*"; }
-fatal() { echo -e "${RED}✖${RESET} $*" >&2; exit 1; }
 
-# ────────────────────────────────────────────────────────────────────────────
-# Require root
-# ────────────────────────────────────────────────────────────────────────────
-[[ ${EUID:-$(id -u)} -eq 0 ]] || fatal "Please run as root (use sudo)."
-
-# ────────────────────────────────────────────────────────────────────────────
-# Variables (override by exporting before running)
-# ────────────────────────────────────────────────────────────────────────────
-REPO_URL="${REPO_URL:-https://github.com/bekirdag/gpt_review.git}"
-REPO_DIR="${REPO_DIR:-/opt/gpt-review}"
-VENV_DIR="${VENV_DIR:-$REPO_DIR/venv}"
-INSTALL_GOOGLE_CHROME="${INSTALL_GOOGLE_CHROME:-0}"
-
-WRAPPER_BIN="/usr/local/bin/gpt-review"             # console entrypoint
-WRAPPER_SH="/usr/local/bin/software_review.sh"      # thin bash helper
-LOGIN_HELPER="/usr/local/bin/cookie_login.sh"       # visible login helper
-
-info "Installing GPT‑Review into $REPO_DIR"
-
-# ────────────────────────────────────────────────────────────────────────────
-# System packages
-# ────────────────────────────────────────────────────────────────────────────
-info "Installing system packages …"
+info "Updating apt metadata …"
 apt-get update -y
-# Base tools
-apt-get install -y --no-install-recommends \
-  python3 python3-venv python3-pip git curl wget unzip ca-certificates \
-  gnupg xvfb
 
-# ────────────────────────────────────────────────────────────────────────────
-# Browser: Google Chrome (optional) or Chromium (fallback)
-# ────────────────────────────────────────────────────────────────────────────
-arch="$(dpkg --print-architecture || echo amd64)"
-if [[ "$INSTALL_GOOGLE_CHROME" == "1" ]]; then
-  if [[ "$arch" != "amd64" ]]; then
-    warn "INSTALL_GOOGLE_CHROME=1 requested, but arch is '$arch' (Google Chrome apt repo is amd64). Skipping Chrome install."
-  else
-    info "Adding Google Chrome APT repository (amd64) …"
-    wget -qO- https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor > /usr/share/keyrings/google-linux.gpg
-    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
+info "Installing base packages …"
+apt_install ca-certificates curl git python3 python3-venv python3-pip
+
+# Xvfb is useful for visible login sessions on headless servers
+apt_install xvfb >/dev/null 2>&1 || true
+
+# ------------------------------ Browser setup ------------------------------ #
+if [[ "${SKIP_BROWSER:-0}" -ne 1 ]]; then
+  if [[ "${INSTALL_GOOGLE_CHROME:-0}" -eq 1 ]]; then
+    info "Setting up Google Chrome Stable APT repository …"
+    apt_install wget gpg
+    if [[ ! -f /usr/share/keyrings/google-linux.gpg ]]; then
+      wget -qO- https://dl.google.com/linux/linux_signing_key.pub \
+        | gpg --dearmor \
+        > /usr/share/keyrings/google-linux.gpg
+    fi
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+      > /etc/apt/sources.list.d/google-chrome.list
     apt-get update -y
     info "Installing Google Chrome Stable …"
-    if apt-get install -y --no-install-recommends google-chrome-stable; then
-      ok "Installed google-chrome-stable"
-    else
-      warn "Failed to install google-chrome-stable. Falling back to Chromium."
-    fi
-  fi
-fi
-
-# Fallback to Chromium if Chrome not present
-if ! command -v google-chrome >/dev/null 2>&1; then
-  if ! command -v chromium >/dev/null 2>&1 && ! command -v chromium-browser >/dev/null 2>&1; then
-    info "Installing Chromium (APT) …"
-    if apt-get install -y --no-install-recommends chromium; then
-      ok "Installed chromium"
-    elif apt-get install -y --no-install-recommends chromium-browser; then
-      ok "Installed chromium-browser"
-    else
-      warn "Could not install Chromium via APT. You can install Chrome/Chromium later."
-      warn "If installed in a non-default location, set CHROME_BIN=/path/to/browser"
-    fi
+    apt_install google-chrome-stable || warn "Failed to install Google Chrome; continuing."
   else
-    ok "Chromium already present on system PATH"
+    info "Installing Chromium (fallback) …"
+    apt_install chromium || apt_install chromium-browser || warn "Chromium not available; continuing."
   fi
 else
-  ok "Google Chrome detected on PATH"
+  info "Skipping browser installation (API‑only usage requested)."
 fi
 
-# ────────────────────────────────────────────────────────────────────────────
-# Clone or update repository
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------- Clone / update repo -------------------------- #
 if [[ -d "$REPO_DIR/.git" ]]; then
-  info "Repository exists – pulling latest changes"
-  git -C "$REPO_DIR" pull --ff-only
+  info "Repository already exists: $REPO_DIR"
+  pushd "$REPO_DIR" >/dev/null
+  git fetch --all --tags
+  if [[ $FORCE_RESET -eq 1 ]]; then
+    warn "Forcing reset to origin/${BRANCH}"
+    git reset --hard "origin/${BRANCH}"
+    git checkout -q "${BRANCH}" || git checkout -b "${BRANCH}" "origin/${BRANCH}"
+    git pull --ff-only || true
+  else
+    git checkout -q "${BRANCH}" || git checkout -b "${BRANCH}" "origin/${BRANCH}" || true
+    git pull --ff-only || true
+  fi
+  popd >/dev/null
 else
-  info "Cloning repository …"
-  git clone "$REPO_URL" "$REPO_DIR"
+  info "Cloning repository → $REPO_DIR"
+  mkdir -p "$(dirname "$REPO_DIR")"
+  git clone --branch "${BRANCH}" --depth 1 "https://github.com/bekirdag/gpt_review.git" "$REPO_DIR"
 fi
 
-# ────────────────────────────────────────────────────────────────────────────
-# Python virtual‑environment & package install
-# ────────────────────────────────────────────────────────────────────────────
-info "Creating / Updating virtualenv at $VENV_DIR …"
-python3 -m venv "$VENV_DIR"
-# shellcheck source=/dev/null
-source "$VENV_DIR/bin/activate"
-python -m pip install --upgrade pip
-info "Installing GPT‑Review (editable mode) …"
-pip install -e "$REPO_DIR"
-deactivate
-ok "Virtualenv ready"
+# ------------------------------ Python venv -------------------------------- #
+VENV="${REPO_DIR}/venv"
+if [[ ! -d "$VENV" ]]; then
+  info "Creating virtual environment → $VENV"
+  python3 -m venv "$VENV"
+fi
 
-# ────────────────────────────────────────────────────────────────────────────
-# Launchers
-# ────────────────────────────────────────────────────────────────────────────
-# Console script – symlink the venv entrypoint
-info "Linking CLI → $WRAPPER_BIN"
-ln -sf "$VENV_DIR/bin/gpt-review" "$WRAPPER_BIN"
-chmod +x "$WRAPPER_BIN"
+# shellcheck disable=SC1090
+. "${VENV}/bin/activate"
+python -m pip install --upgrade pip wheel setuptools
 
-# Bash helper – thin wrapper for convenience
-info "Linking Bash helper → $WRAPPER_SH"
-ln -sf "$REPO_DIR/software_review.sh" "$WRAPPER_SH"
-chmod +x "$WRAPPER_SH"
+# Decide whether to install dev extras
+INSTALL_DEV=$INSTALL_DEV_FLAG
+if [[ $INSTALL_DEV -eq 0 && $NO_DEV_OPT -eq 0 ]]; then
+  INSTALL_DEV=0  # default: no dev extras
+fi
 
-# Visible login helper – opens a real browser to save cookies
-info "Linking login helper → $LOGIN_HELPER"
-ln -sf "$REPO_DIR/cookie_login.sh" "$LOGIN_HELPER"
-chmod +x "$LOGIN_HELPER"
+info "Installing GPT‑Review package ($([[ $INSTALL_DEV -eq 1 ]] && echo 'with dev extras' || echo 'core only')) …"
+if [[ $INSTALL_DEV -eq 1 ]]; then
+  pip install -e "${REPO_DIR}[dev]"
+else
+  pip install -e "${REPO_DIR}"
+fi
 
-# ────────────────────────────────────────────────────────────────────────────
-# Final hints
-# ────────────────────────────────────────────────────────────────────────────
-ok "GPT‑Review installed successfully."
-echo "Run   :  software_review.sh --help"
-echo "Login :  cookie_login.sh    # opens a visible browser to save cookies"
-echo "Update:  sudo $0            # rerun this script anytime"
-echo
-echo "Tips:"
-echo "  • If your browser isn’t auto-detected, export CHROME_BIN=/usr/bin/google-chrome (or /usr/bin/chromium)"
-echo "  • For CI/servers, set GPT_REVIEW_HEADLESS=1 (headless runs after cookies exist)"
-echo "  • On Snap Chromium, prefer a snap‑writable profile:"
-echo "        export GPT_REVIEW_PROFILE=\"\$HOME/snap/chromium/current/gpt-review-profile\""
-echo "  • To change the login domain for the helper, set GPT_REVIEW_LOGIN_URL"
-echo "        (default: https://chatgpt.com/ ; fallback: https://chat.openai.com/)"
+# Basic sanity check
+info "Verifying CLI import …"
+python - <<'PY'
+import sys
+try:
+    import gpt_review  # noqa: F401
+except Exception as exc:
+    print("Import failed:", exc, file=sys.stderr)
+    sys.exit(1)
+print("ok")
+PY
+ok "Python package import OK."
+
+# --------------------------- Install launchers ----------------------------- #
+BIN_DIR="/usr/local/bin"
+mkdir -p "$BIN_DIR"
+
+# gpt-review launcher – always points to the venv’s Python
+write_launcher "${BIN_DIR}/gpt-review" \
+"VENV='${VENV}'
+exec \"\${VENV}/bin/python\" -m gpt_review \"\$@\""
+
+# software_review.sh – symlink to repo version (keeps latest features)
+if [[ -f "${REPO_DIR}/software_review.sh" ]]; then
+  ln -sf "${REPO_DIR}/software_review.sh" "${BIN_DIR}/software_review.sh"
+  chmod 0755 "${REPO_DIR}/software_review.sh"
+  ok "Linked: ${BIN_DIR}/software_review.sh → ${REPO_DIR}/software_review.sh"
+else
+  warn "software_review.sh not found in repo; skipping symlink."
+fi
+
+# cookie_login.sh – if present in repo, link it; otherwise provide a minimal helper
+if [[ -f "${REPO_DIR}/cookie_login.sh" ]]; then
+  ln -sf "${REPO_DIR}/cookie_login.sh" "${BIN_DIR}/cookie_login.sh"
+  chmod 0755 "${REPO_DIR}/cookie_login.sh"
+  ok "Linked: ${BIN_DIR}/cookie_login.sh → ${REPO_DIR}/cookie_login.sh"
+else
+  warn "cookie_login.sh not found in repo; installing a minimal helper."
+  write_launcher "${BIN_DIR}/cookie_login.sh" \
+'LOGIN_URL="${GPT_REVIEW_LOGIN_URL:-https://chatgpt.com/}"
+FALLBACK="https://chat.openai.com/"
+CHROME="${CHROME_BIN:-$(command -v google-chrome-stable || command -v google-chrome || command -v chromium || command -v chromium-browser || true)}"
+if [[ -z "$CHROME" ]]; then
+  echo "No Chrome/Chromium found. Set CHROME_BIN or install a browser." >&2
+  exit 1
+fi
+echo "Opening login tabs with: $CHROME"
+# Prefer a fresh visible session (no headless)
+"$CHROME" --new-window "$LOGIN_URL" "$FALLBACK" >/dev/null 2>&1 & disown
+echo "Browser started. Complete login, then close the window."
+'
+fi
+
+# gpt-review-update – convenience updater
+write_launcher "${BIN_DIR}/gpt-review-update" \
+"set -euo pipefail
+REPO_DIR='${REPO_DIR}'
+VENV='${VENV}'
+BRANCH='${BRANCH}'
+echo 'Updating GPT‑Review in' \"\$REPO_DIR\"
+cd \"\$REPO_DIR\"
+git fetch --all --tags
+git checkout -q \"\$BRANCH\" || git checkout -b \"\$BRANCH\" \"origin/\$BRANCH\" || true
+git pull --ff-only || true
+\"\$VENV/bin/python\" -m pip install --upgrade pip wheel setuptools
+# Reinstall in editable mode to pick up changes
+if grep -q \"\\[project.optional-dependencies\\]\" pyproject.toml 2>/dev/null; then
+  \"\$VENV/bin/pip\" install -e .  >/dev/null
+else
+  \"\$VENV/bin/pip\" install -e .  >/dev/null
+fi
+echo 'Done.'"
+
+# ------------------------------- Post‑install ------------------------------- #
+# Try to detect browser version (best‑effort)
+if ensure_cmd google-chrome-stable; then
+  CHROME_BIN_DETECTED="$(command -v google-chrome-stable)"
+elif ensure_cmd google-chrome; then
+  CHROME_BIN_DETECTED="$(command -v google-chrome)"
+elif ensure_cmd chromium; then
+  CHROME_BIN_DETECTED="$(command -v chromium)"
+elif ensure_cmd chromium-browser; then
+  CHROME_BIN_DETECTED="$(command -v chromium-browser)"
+else
+  CHROME_BIN_DETECTED=""
+fi
+
+if [[ -n "$CHROME_BIN_DETECTED" ]]; then
+  info "Detected browser: $CHROME_BIN_DETECTED"
+  "$CHROME_BIN_DETECTED" --version || true
+else
+  warn "No Chrome/Chromium detected. API mode will still work. Install a browser for UI mode."
+fi
+
+cat <<'EOT'
+
+─────────────────────────── Installation Complete ────────────────────────────
+Launchers installed:
+  • gpt-review
+  • software_review.sh
+  • cookie_login.sh
+  • gpt-review-update
+
+Next steps:
+  1) (Optional, for browser mode) Save cookies with a visible login:
+       cookie_login.sh
+  2) Run a review session (browser mode):
+       software_review.sh instructions.txt /path/to/repo --cmd "pytest -q" --auto
+     Or API mode (no browser):
+       software_review.sh instructions.txt /path/to/repo --api --model gpt-5-pro --cmd "pytest -q" --auto
+
+Tips:
+  • Configure environment in a ./.env file (see .env.example in the repo).
+  • API mode requires OPENAI_API_KEY and (optionally) OPENAI_BASE_URL.
+
+EOT
+
+ok "All set."
