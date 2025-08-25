@@ -1,6 +1,6 @@
 # GPT‑Review
 
-**Browser‑driven, ChatGPT‑powered code‑review loop**  
+**Browser‑ or API‑driven, ChatGPT‑powered code‑review loop**  
 Edit → Run → Fix — until your tests pass.
 
 <p align="center">
@@ -12,13 +12,16 @@ Edit → Run → Fix — until your tests pass.
 | One‑file‑at‑a‑time patches | ✅ |
 | ChatGPT must ask “continue” between chunks | ✅ |
 | Runs any shell command after each patch | ✅ |
-| Feeds failing logs back to ChatGPT (chunked) | ✅ |
+| Feeds failing logs back to ChatGPT (chunked/tail) | ✅ |
 | Delete / Rename / Chmod ops | ✅ |
 | Binary file support (body_b64) | ✅ |
 | Crash‑safe resume (state file) | ✅ |
 | Daily‑rotating logs | ✅ |
-| **chatgpt.com** primary + chat.openai.com fallback | ✅ |
-| Chrome/Chromium auto‑detect + correct driver | ✅ |
+| **Browser mode**: chatgpt.com primary + chat.openai.com fallback | ✅ |
+| **API mode** (OpenAI‑compatible; e.g., GPT‑5 Pro) | ✅ |
+| Transport toggle `--mode browser|api` | ✅ |
+| Token‑thrifty API loop (rolling history + tailed logs) | ✅ |
+| Chrome/Chromium auto‑detect + correct driver (browser mode) | ✅ |
 | Env‑tunable timeouts/retries/chunk sizes | ✅ |
 | Multi‑arch Docker (Debian + Chromium) | ✅ |
 | Pre‑commit in CI + E2E Selenium smoke test | ✅ |
@@ -32,23 +35,28 @@ Edit → Run → Fix — until your tests pass.
 
 1. [How it works](#how-it-works)  
 2. [Quick start](#quick-start)  
+   - [Quick start (Browser mode)](#quick-start-browser-mode)  
+   - [Quick start (API mode)](#quick-start-api-mode)  
 3. [Installation](#installation)  
    - [Debian/Ubuntu (one‑liner)](#debianubuntu-one-liner)  
    - [pip / virtual‑env](#pip--virtual-env)  
    - [Docker](#docker)  
    - [Update (in‑place upgrade)](#update-in-place-upgrade)  
-4. [First‑time login](#first-time-login)  
+4. [First‑time login (browser mode)](#first-time-login-browser-mode)  
    - [macOS client (XQuartz) + SSH X‑forwarding](#macos-client-xquartz--ssh-x-forwarding)  
    - [Headless servers (Xvfb + VNC alternative)](#headless-servers-xvfb--vnc-alternative)  
-   - [Browser choices: Google Chrome (recommended) vs Snap Chromium](#browser-choices-google-chrome-recommended-vs-snap-chromium)  
+   - [Browser choices: Google Chrome vs Snap Chromium](#browser-choices-google-chrome-vs-snap-chromium)  
 5. [Usage](#usage)  
 6. [Session rules](#session-rules)  
 7. [Environment & configuration](#environment--configuration)  
+   - [Browser mode variables](#browser-mode-variables)  
+   - [API mode variables](#api-mode-variables)  
 8. [Advanced](#advanced)  
 9. [Development](#development)  
 10. [CI pipelines](#ci-pipelines)  
 11. [Troubleshooting](#troubleshooting)  
-12. [License](#license)  
+12. [Security](#security)  
+13. [License](#license)  
 
 ---
 
@@ -57,30 +65,35 @@ Edit → Run → Fix — until your tests pass.
 sequenceDiagram
     participant You
     participant GPT‑Review
-    participant ChatGPT
+    participant Model as Model (Browser/API)
     participant Tests
 
     You->>GPT‑Review: instructions.txt<br>/repo --cmd "pytest -q"
-    GPT‑Review->>ChatGPT: initial prompt (+session rules)
-    ChatGPT-->>GPT‑Review: JSON patch (file, body, status)
+    GPT‑Review->>Model: initial prompt (+session rules)
+    Model-->>GPT‑Review: JSON patch (file, body, status)
     GPT‑Review->>Repo: apply patch & commit
     GPT‑Review->>Tests: run command
     Tests-->>GPT‑Review: pass / fail
     alt fail
-        GPT‑Review->>ChatGPT: error log in chunks
-        ChatGPT-->>GPT‑Review: next patch
+        GPT‑Review->>Model: error log (chunked/tail)
+        Model-->>GPT‑Review: next patch
     end
     alt status = completed & tests pass
         GPT‑Review-->>You: "All done!"
     else
-        GPT‑Review->>ChatGPT: "continue"
-        ChatGPT-->>GPT‑Review: next patch
+        GPT‑Review->>Model: "continue"
+        Model-->>GPT‑Review: next patch
     end
 ```
+**Transport:**  
+- **Browser mode** uses Selenium to interact with chatgpt.com (with chat.openai.com fallback).  
+- **API mode** calls an OpenAI‑compatible endpoint directly (e.g., GPT‑5 Pro) without launching a browser.
 
 ---
 
 ## Quick start
+
+### Quick start (Browser mode)
 
 > **Requirements:** Python **3.10+**, Git, and a Chromium/Chrome browser.
 
@@ -106,6 +119,25 @@ software_review.sh instructions.txt  /path/to/git/repo  --cmd "pytest -q"
 > software_review.sh instructions.txt /repo --cmd "pytest -q" --auto
 > ```
 
+### Quick start (API mode)
+
+> **Requirements:** Python **3.10+**, Git, and an OpenAI‑compatible API key.  
+> Install the Python SDK once: `pip install "openai>=1.0.0"`
+
+```bash
+export OPENAI_API_KEY="sk-..."
+# Optional if using a custom endpoint/proxy:
+# export OPENAI_BASE_URL="https://api.your-endpoint.example/v1"
+
+# Run in API mode against GPT‑5 Pro
+software_review.sh instructions.txt /repo --mode api --model gpt-5-pro --cmd "pytest -q" --auto
+```
+
+API mode avoids Selenium/Chrome entirely and is **token‑thrifty**:
+- Rolling history window (keeps the last few exchanges)
+- Error logs are **tailed** to a maximum character budget
+- Temperature fixed at 0; compact prompts
+
 ---
 
 ## Installation
@@ -123,6 +155,11 @@ The installer:
 * Installs the package in editable mode.
 * Adds launchers: `gpt-review`, `software_review.sh`, and `cookie_login.sh`.
 
+> **API mode:** ensure the OpenAI SDK is available in the same environment:
+> ```bash
+> pip install "openai>=1.0.0"
+> ```
+
 ### pip / virtual‑env
 
 ```bash
@@ -130,6 +167,8 @@ git clone https://github.com/bekirdag/gpt_review.git
 cd gpt-review
 python -m venv venv && . venv/bin/activate
 pip install -e .[dev]
+# For API mode, add:
+pip install "openai>=1.0.0"
 ```
 
 ### Docker
@@ -166,7 +205,7 @@ virtual‑env, and refreshes launchers: **gpt-review**, **software_review.sh**,
 
 ---
 
-## First‑time login
+## First‑time login (browser mode)
 
 Run the helper once:
 
@@ -223,7 +262,7 @@ cookie_login.sh
 # On your laptop: ssh -L 5900:localhost:5900 <user>@<server> ; then open vnc://localhost:5900
 ```
 
-### Browser choices: Google Chrome (recommended) vs Snap Chromium
+### Browser choices: Google Chrome vs Snap Chromium
 
 **Google Chrome (non‑snap, recommended)** on Ubuntu:
 ```bash
@@ -250,7 +289,11 @@ mkdir -p "$GPT_REVIEW_PROFILE"
 ### Minimal
 
 ```bash
+# Browser (default)
 software_review.sh instructions.txt /repo
+
+# API
+software_review.sh instructions.txt /repo --mode api --model gpt-5-pro
 ```
 
 ### Full CLI
@@ -262,6 +305,9 @@ software_review.sh instructions.txt /repo
 | `--cmd "pytest -q"` | _(none)_ | Command must exit 0 before loop stops |
 | `--auto` | off | Auto‑send **continue** after each patch |
 | `--timeout 600` | 300 | Kill command after *N* seconds |
+| `--mode {browser,api}` | browser | Transport: Selenium or OpenAI API |
+| `--model gpt-5-pro` | env: `GPT_REVIEW_MODEL` | Model name for API mode |
+| `--api-timeout 120` | env: `GPT_REVIEW_API_TIMEOUT` | API call timeout (seconds) |
 
 ### JSON contract
 
@@ -297,7 +343,9 @@ These rules keep commit history readable and make rollbacks trivial.
 
 ## Environment & configuration
 
-A `.env.example` is provided. Common tunables (read by the driver and logger):
+A `.env.example` is provided.
+
+### Browser mode variables
 
 * **Browser & URL**
   * `GPT_REVIEW_CHAT_URL` – preferred ChatGPT domain for the **driver** (default: `https://chatgpt.com/`)  
@@ -324,6 +372,19 @@ A `.env.example` is provided. Common tunables (read by the driver and logger):
   * `GPT_REVIEW_LOG_LVL` – console level (`INFO` by default)
   * `GPT_REVIEW_LOG_ROT` – rotation schedule (default: `midnight`)
   * `GPT_REVIEW_LOG_BACK` – number of backups (default: `7`)
+
+### API mode variables
+
+* **Endpoint & Identity**
+  * `OPENAI_API_KEY` – API key (required).  
+  * `OPENAI_BASE_URL` / `OPENAI_API_BASE` – custom endpoint (optional).
+  * `OPENAI_ORG_ID` / `OPENAI_ORGANIZATION` – org scoping (optional).
+
+* **Model & runtime**
+  * `GPT_REVIEW_MODEL` – default model for API mode (e.g., `gpt-5-pro`).  
+  * `GPT_REVIEW_API_TIMEOUT` – per‑request timeout (seconds, default: `120`).  
+  * `GPT_REVIEW_API_LOG_TAIL` – max characters from the end of failing logs to send back (default: `min(12000, CHUNK_SIZE)`).  
+  * `GPT_REVIEW_API_MAX_TURNS` – rolling history window (assistant/user pairs to keep, default: `6`).
 
 Apply env quickly with:
 
@@ -372,6 +433,10 @@ make smoke       # CLI entrypoint sanity (version/help)
 make login       # open visible browser to save cookies
 make changelog   # print Unreleased section from CHANGELOG.md
 ```
+For API mode development, ensure the SDK is present:
+```bash
+pip install "openai>=1.0.0"
+```
 
 Pre‑commit hooks ensure Black, isort, flake8, codespell, JSON/YAML/TOML checks
 run on every commit.
@@ -386,9 +451,13 @@ Two GitHub Actions workflows:
   The CI job also appends the **“Unreleased”** section from the changelog to the job summary for fast PR review.
 * **E2E Smoke** – launches a real Chrome/Chromium via Selenium to catch driver/browser mismatches early.
 
+> Future work: add an API‑mode smoke that calls a mocked endpoint for hermetic CI.
+
 ---
 
 ## Troubleshooting
+
+**Browser mode**
 
 * **No window / instant Chrome exit (SSH)**  
   - Ensure `echo $DISPLAY` prints something like `localhost:10.0`.  
@@ -424,6 +493,31 @@ Two GitHub Actions workflows:
 
 * **Regional/SSO login quirks**  
   - Set `GPT_REVIEW_LOGIN_URL` to your organisation’s entrypoint; a fallback tab to `https://chat.openai.com/` opens unless identical.
+
+**API mode**
+
+* **401 Unauthorized**  
+  - Check `OPENAI_API_KEY` and any organisation scoping.
+
+* **404/`model_not_found`**  
+  - Verify `--model` (or `GPT_REVIEW_MODEL`) is available to your account/endpoint.
+
+* **429 Rate limit**  
+  - Rerun later or lower concurrency; API mode already limits history and tails logs to reduce tokens.
+
+* **Connection errors / gateway timeouts**  
+  - Increase `--api-timeout` or set a closer `OPENAI_BASE_URL` proxy.
+
+* **Costs creep up**  
+  - Lower `GPT_REVIEW_API_MAX_TURNS` and/or `GPT_REVIEW_API_LOG_TAIL`. Use narrower `--cmd` output when possible.
+
+---
+
+## Security
+
+* Never commit secrets. `.env` is ignored by default.  
+* The tool never prints `OPENAI_API_KEY`; avoid echoing it in shells or logs.  
+* Review logs before sharing externally; redact repository paths if needed.
 
 ---
 
