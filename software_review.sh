@@ -16,7 +16,8 @@
 #   software_review.sh [wrapper-opts] instructions.txt /path/to/repo [gpt-review opts...]
 #
 # Wrapper options (must appear before positional args):
-#   --help                 Show this help and exit
+#   -h, --help             Show this help and exit
+#       --version          Print underlying gpt-review version and exit
 #   --load-dotenv[=PATH]   Source a dotenv file before running (default: ./.env)
 #   --env-dump             Print effective environment and continue
 #   --fresh                Remove .gpt-review-state.json to start fresh
@@ -79,7 +80,8 @@ usage() {
 Usage: $(basename "$0") [wrapper-opts] instructions.txt /path/to/repo [gpt-review opts...]
 
 Wrapper options (before positional args):
-  --help                 Show this help and exit
+  -h, --help             Show this help and exit
+      --version          Print underlying gpt-review version and exit
   --load-dotenv[=PATH]   Source dotenv file (default: ./.env)
   --env-dump             Print effective environment then continue
   --fresh                Remove .gpt-review-state.json to start fresh
@@ -135,10 +137,12 @@ ENV_DUMP=0
 FRESH=0
 WRAP_API=0
 WRAP_MODEL=""
+SHOW_VERSION=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --help) usage; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    --version) SHOW_VERSION=1; shift; break ;;  # handled later without requiring positionals
     --no-log) WRAP_LOG=0; shift ;;
     --log-file)
       LOG_FILE="${2:-}"; [[ -n "$LOG_FILE" ]] || die "--log-file requires a path"
@@ -162,6 +166,17 @@ while [[ $# -gt 0 ]]; do
     *)  break ;;
   esac
 done
+
+# If only --version was requested, run underlying CLI and exit early.
+if [[ $SHOW_VERSION -eq 1 ]]; then
+  if command -v gpt-review >/dev/null 2>&1; then
+    exec gpt-review --version
+  fi
+  # Fallback to python -m
+  PY_PATH="$(command -v python3 || command -v python || true)"
+  [[ -n "$PY_PATH" ]] || die "No Python interpreter found for --version."
+  exec "$PY_PATH" -m gpt_review --version
+fi
 
 # ------------------------------ positional args ---------------------------- #
 if [[ $# -lt 2 ]]; then
@@ -200,7 +215,7 @@ fi
 # --------------- normalize/augment forwarded args for mode/model ----------- #
 NEW_ARGS=()
 EXPLICIT_MODE_PRESENT=0
-EXPLICIT_MODE_VALUE=""   # capture explicit --mode value
+EXPLICIT_MODE_VALUE=""
 EXPLICIT_MODEL_PRESENT=0
 INLINE_API=0
 MODEL_EXPLICIT=""
@@ -301,7 +316,7 @@ RETRIES        : ${GPT_REVIEW_RETRIES:-3}
 CHUNK_SIZE     : ${GPT_REVIEW_CHUNK_SIZE:-15000} (chars)
 CMD TIMEOUT    : ${GPT_REVIEW_COMMAND_TIMEOUT:-300} (s)
 LOG DIR        : ${GPT_REVIEW_LOG_DIR:-logs}
-CHROME_BIN     : ${CHROME_BIN:-<auto>}
+CHROME BIN     : ${CHROME_BIN:-<auto>}
 MODE           : ${MODE_EFFECTIVE}
 OPENAI KEY     : $( [[ -n "${OPENAI_API_KEY:-}" ]] && echo "<set>" || echo "<unset>" )
 OPENAI URL     : ${OPENAI_BASE_URL:-${OPENAI_API_BASE:-<unset>}}
@@ -320,6 +335,15 @@ if [[ $WRAP_LOG -eq 1 ]]; then
   fi
   info "Wrapper log -> $LOG_FILE"
   exec > >(tee -a "$LOG_FILE") 2>&1
+fi
+
+# -------------------------- API preflight warnings ------------------------- #
+# Respect both OPENAI_BASE_URL and alias OPENAI_API_BASE
+if [[ -z "${OPENAI_BASE_URL:-}" && -n "${OPENAI_API_BASE:-}" ]]; then
+  export OPENAI_BASE_URL="${OPENAI_API_BASE}"
+fi
+if [[ "$MODE_EFFECTIVE" == "api" && -z "${OPENAI_API_KEY:-}" ]]; then
+  warn "API mode selected but OPENAI_API_KEY is not set. The run will likely fail."
 fi
 
 # ------------------------------ runner resolution -------------------------- #

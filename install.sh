@@ -88,8 +88,8 @@ write_launcher() {
 REPO_DIR="/opt/gpt-review"
 BRANCH="main"
 FORCE_RESET=0
-INSTALL_DEV_FLAG="${INSTALL_DEV:-0}"
 NO_DEV_OPT=0
+INSTALL_DEV_ENV="${INSTALL_DEV:-0}"  # environment override, default off
 
 # ------------------------------- parse flags ------------------------------- #
 while [[ $# -gt 0 ]]; do
@@ -115,10 +115,22 @@ done
 
 require_root
 
+# Decide final dev‑extras setting now (for accurate logging and behavior)
+# Priority: INSTALL_DEV=1 env → dev ON; otherwise --no-dev disables; default OFF.
+if [[ "$INSTALL_DEV_ENV" == "1" ]]; then
+  INSTALL_DEV_FINAL=1
+else
+  if [[ $NO_DEV_OPT -eq 1 ]]; then
+    INSTALL_DEV_FINAL=0
+  else
+    INSTALL_DEV_FINAL=0
+  fi
+fi
+
 info "Install directory : ${REPO_DIR}"
 info "Git branch        : ${BRANCH}"
 info "Force reset       : $([[ $FORCE_RESET -eq 1 ]] && echo yes || echo no)"
-info "Install dev extras: $([[ ${INSTALL_DEV_FLAG} -eq 1 ]] && echo yes || ( [[ $NO_DEV_OPT -eq 1 ]] && echo no || echo no ))"
+info "Install dev extras: $([[ $INSTALL_DEV_FINAL -eq 1 ]] && echo yes || echo no)"
 info "Google Chrome     : $([[ ${INSTALL_GOOGLE_CHROME:-0} -eq 1 ]] && echo 'install' || echo 'skip')"
 info "Skip browser      : $([[ ${SKIP_BROWSER:-0} -eq 1 ]] && echo yes || echo no)"
 
@@ -133,7 +145,7 @@ apt-get update -y
 info "Installing base packages …"
 apt_install ca-certificates curl git python3 python3-venv python3-pip
 
-# Xvfb is useful for visible login sessions on headless servers
+# Xvfb is useful for visible login sessions on headless servers (best-effort)
 apt_install xvfb >/dev/null 2>&1 || true
 
 # ------------------------------ Browser setup ------------------------------ #
@@ -191,15 +203,10 @@ fi
 . "${VENV}/bin/activate"
 python -m pip install --upgrade pip wheel setuptools
 
-# Decide whether to install dev extras
-INSTALL_DEV=$INSTALL_DEV_FLAG
-if [[ $INSTALL_DEV -eq 0 && $NO_DEV_OPT -eq 0 ]]; then
-  INSTALL_DEV=0  # default: no dev extras
-fi
-
-info "Installing GPT‑Review package ($([[ $INSTALL_DEV -eq 1 ]] && echo 'with dev extras' || echo 'core only')) …"
-if [[ $INSTALL_DEV -eq 1 ]]; then
-  pip install -e "${REPO_DIR}[dev]"
+info "Installing GPT‑Review package ($([[ $INSTALL_DEV_FINAL -eq 1 ]] && echo 'with dev extras' || echo 'core only')) …"
+if [[ $INSTALL_DEV_FINAL -eq 1 ]]; then
+  # If extras aren't defined, fall back to core install gracefully.
+  pip install -e "${REPO_DIR}[dev]" || pip install -e "${REPO_DIR}"
 else
   pip install -e "${REPO_DIR}"
 fi
@@ -251,7 +258,6 @@ if [[ -z "$CHROME" ]]; then
   exit 1
 fi
 echo "Opening login tabs with: $CHROME"
-# Prefer a fresh visible session (no headless)
 "$CHROME" --new-window "$LOGIN_URL" "$FALLBACK" >/dev/null 2>&1 & disown
 echo "Browser started. Complete login, then close the window."
 '
@@ -269,12 +275,8 @@ git fetch --all --tags
 git checkout -q \"\$BRANCH\" || git checkout -b \"\$BRANCH\" \"origin/\$BRANCH\" || true
 git pull --ff-only || true
 \"\$VENV/bin/python\" -m pip install --upgrade pip wheel setuptools
-# Reinstall in editable mode to pick up changes
-if grep -q \"\\[project.optional-dependencies\\]\" pyproject.toml 2>/dev/null; then
-  \"\$VENV/bin/pip\" install -e .  >/dev/null
-else
-  \"\$VENV/bin/pip\" install -e .  >/dev/null
-fi
+# Reinstall in editable mode to pick up changes (fallback to core if extras missing)
+\"\$VENV/bin/pip\" install -e .[dev] || \"\$VENV/bin/pip\" install -e .
 echo 'Done.'"
 
 # ------------------------------- Post‑install ------------------------------- #

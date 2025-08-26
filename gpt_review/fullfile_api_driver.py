@@ -39,10 +39,12 @@ Integration points
 
 Environment & defaults
 ----------------------
-* `OPENAI_API_KEY`           – required (unless a client is injected)
-* `OPENAI_BASE_URL`          – optional custom endpoint
-* `GPT_REVIEW_MODEL`         – default model name (e.g., "gpt-5-pro")
-* `GPT_REVIEW_API_TIMEOUT`   – per‑request timeout (seconds; default 120)
+* `OPENAI_API_KEY`              – required (unless a client is injected)
+* `OPENAI_BASE_URL`             – optional custom endpoint
+* `GPT_REVIEW_MODEL`            – default model name (e.g., "gpt-5-pro")
+* `GPT_REVIEW_API_TIMEOUT`      – per‑request timeout (seconds; default 120)
+* `GPT_REVIEW_MAX_PROMPT_BYTES` – truncate text prompts with head+tail when larger (default 200_000)
+* `GPT_REVIEW_HEAD_TAIL_BYTES`  – bytes for head and tail slices (default 60_000)
 
 Notes
 -----
@@ -55,7 +57,7 @@ import json
 import os
 import textwrap
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Optional
 
 from gpt_review import get_logger
@@ -63,13 +65,15 @@ from gpt_review import get_logger
 log = get_logger(__name__)
 
 # --------------------------------------------------------------------------- #
-# Env-backed defaults (keep aligned with gpt_review/api_driver.py)
+# Env‑backed defaults (aligned with orchestrator/api_driver)
 # --------------------------------------------------------------------------- #
 DEFAULT_MODEL = os.getenv("GPT_REVIEW_MODEL", "gpt-5-pro")
 DEFAULT_API_TIMEOUT = int(os.getenv("GPT_REVIEW_API_TIMEOUT", "120"))
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+MAX_PROMPT_BYTES = int(os.getenv("GPT_REVIEW_MAX_PROMPT_BYTES", str(200_000)))
+HEAD_TAIL_BYTES = int(os.getenv("GPT_REVIEW_HEAD_TAIL_BYTES", str(60_000)))
 
 # --------------------------------------------------------------------------- #
 # Result type
@@ -144,6 +148,65 @@ def _propose_fullfile_tool() -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# Iteration deferral patterns (docs/setup/examples/CI)
+# --------------------------------------------------------------------------- #
+_DOC_EXTS = {".md", ".rst", ".adoc", ".txt"}
+_SETUP_BASENAMES = {
+    "setup.py", "pyproject.toml", "requirements.txt", "Pipfile", "Pipfile.lock",
+    "poetry.lock", "Makefile", "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
+    ".pre-commit-config.yaml", ".pre-commit-config.yml",
+    "install.sh", "update.sh", "software_review.sh", "cookie_login.sh",
+}
+_DEFER_DIR_HINTS = {"docs", "doc", "examples", "example", ".github/workflows", ".github/actions", "ci", ".ci"}
+
+
+def _path_deferred_before_iter3(rel: str) -> bool:
+    """
+    True if *rel* looks like docs/setup/examples/CI that we defer until iteration 3.
+    """
+    p = PurePosixPath(rel)
+    if p.suffix.lower() in _DOC_EXTS:
+        return True
+    if p.name in _SETUP_BASENAMES:
+        return True
+    parts = [seg.lower() for seg in p.parts[:-1]]
+    return any(h in parts for h in _DEFER_DIR_HINTS)
+
+
+# --------------------------------------------------------------------------- #
+# Helpers: path guard & excerpting
+# --------------------------------------------------------------------------- #
+def _is_safe_repo_rel_posix(path: str) -> bool:
+    """
+    Defensive path guard:
+      - POSIX separators only; not absolute; no backslashes; no '..'
+      - not under '.git/' and not '.git' itself; no empty segments
+    """
+    if not isinstance(path, str) or not path.strip():
+        return False
+    if "\\" in path or path.startswith("/"):
+        return False
+    if path == ".git" or path.startswith(".git/") or "/.git/" in path:
+        return False
+    if ".." in path.split("/"):
+        return False
+    p = PurePosixPath(path)
+    return str(p) == path and all(seg for seg in p.parts)
+
+
+def _excerpt_bytes_to_text(data: bytes) -> str:
+    """
+    Convert bytes to UTF‑8 text (replace errors), truncating with head+tail marker
+    when larger than MAX_PROMPT_BYTES. Mirrors orchestrator behaviour.
+    """
+    if len(data) <= MAX_PROMPT_BYTES:
+        return data.decode("utf-8", errors="replace")
+    head = data[:HEAD_TAIL_BYTES].decode("utf-8", errors="replace")
+    tail = data[-HEAD_TAIL_BYTES:].decode("utf-8", errors="replace")
+    return f"<<EXCERPT: file too large ({len(data)} bytes); sending head+tail>>\n{head}\n…\n{tail}"
+
+
+# --------------------------------------------------------------------------- #
 # Prompts
 # --------------------------------------------------------------------------- #
 def _system_prompt(iteration: int) -> str:
@@ -154,12 +217,13 @@ def _system_prompt(iteration: int) -> str:
         "You are GPT‑Review, a software reviewer/refactorer.\n"
         "Respond ONLY by calling the function `propose_fullfile` for the file provided.\n"
         "Rules:\n"
-        "  1) Output must reflect a FULL file (no patches/diffs) when changing.\n"
+        "  1) For any change you MUST return a **COMPLETE FILE** (no diffs/patches). "
+        "Use `content` for text or `content_b64` for binary.\n"
         "  2) Keep changes minimal and behavior‑preserving unless the instructions demand otherwise.\n"
         "  3) If no change is necessary, choose action='keep'.\n"
         "  4) Use 'update_binary'/'create_binary' ONLY for non‑text/binary content.\n"
         "  5) Iteration gates:\n"
-        "     - Iterations 1–2: focus on code/tests; do NOT introduce new docs/setup/examples.\n"
+        "     - Iterations 1–2: focus on code/tests; do NOT introduce or modify docs/setup/examples/CI.\n"
         "     - Iteration 3   : ensure global consistency; THEN docs/install/setup/examples may change.\n"
         f"Current iteration: {iteration}.\n"
     )
@@ -225,7 +289,7 @@ def _build_user_prompt(
     )
     iteration_goals = (
         "Iteration goals:\n"
-        "  • Iters 1–2: refactor/modernize code & tests only; do not touch docs/setup/examples.\n"
+        "  • Iters 1–2: refactor/modernize code & tests only; do not touch docs/setup/examples/CI.\n"
         "  • Iter 3   : finalized cross‑file consistency; then docs/setup/examples may be updated.\n"
     )
     safety = (
@@ -259,7 +323,7 @@ def _build_user_prompt(
         # Never include raw binary bytes in the prompt; we only tell the model it's binary.
         body = "Binary content omitted in prompt. If you decide to change it, return Base64 bytes."
     else:
-        # Provide the FULL textual content.
+        # Provide the FULL textual content (possibly excerpted with head+tail).
         body = f"```\n{content_preview}\n```"
 
     return header + "\nCurrent content:\n" + body
@@ -331,10 +395,12 @@ def review_file_with_api(
     client = _ensure_client(client)
 
     language_hint = _language_hint_for_path(path)
+
+    # Decide textual vs binary based on flag + decoding capability
     text_preview = ""
     if not is_binary:
         try:
-            text_preview = content.decode("utf-8")
+            text_preview = _excerpt_bytes_to_text(content)
         except UnicodeDecodeError:
             # Treat as binary if decoding fails
             is_binary = True
@@ -407,6 +473,11 @@ def review_file_with_api(
         content_b64=(args.get("content_b64") or None),
     )
 
+    # Path safety: if the assistant tried to move/rename, pin to the reviewed path.
+    if not _is_safe_repo_rel_posix(out.path) or out.path != path:
+        log.warning("Unsafe or mismatched path from model (%r). Using original path %r.", out.path, path)
+        out.path = path
+
     # Sanity enforcement
     valid_actions = {"keep", "update", "update_binary", "create", "create_binary", "delete"}
     if out.action not in valid_actions:
@@ -430,14 +501,11 @@ def review_file_with_api(
                 log.warning("Invalid Base64 for %s; defaulting to keep.", path)
                 out.action = "keep"
 
-    # Defer docs/setup/examples until iteration 3 (defensive check – the orchestrator already enforces this)
-    if iteration < 3:
-        lower = out.path.lower()
-        if any(seg in lower for seg in ("/docs/", "/doc/", "/examples/", "/example/")) \
-           or any(lower.endswith(sfx) for sfx in (".md", ".rst")):
-            log.info("Deferring docs/examples change for %s until iteration 3 → keep.", out.path)
-            out.action = "keep"
-            out.reason = (out.reason or "") + " (deferred docs/examples until iter 3)"
+    # Defer docs/setup/examples/CI until iteration 3 (defensive – orchestrator enforces this too)
+    if iteration < 3 and _path_deferred_before_iter3(out.path):
+        log.info("Deferring docs/setup/examples/CI change for %s until iteration 3 → keep.", out.path)
+        out.action = "keep"
+        out.reason = (out.reason or "") + " (deferred until iter 3)"
 
     log.info("Decision for %s → %s%s", out.path, out.action, f"  · {out.reason}" if out.reason else "")
     return out

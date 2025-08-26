@@ -15,7 +15,7 @@ a shell command (tests/linter), and send the outcome back as the tool's result.
 Design notes
 ------------
 • **Token‑aware**:
-  - Minimal system prompt.
+  - Minimal system prompt (explicitly requires FULL FILE bodies).
   - Rolling history limited by GPT_REVIEW_CTX_TURNS.
   - Only the tail of failing logs is returned (GPT_REVIEW_LOG_TAIL_CHARS).
 
@@ -53,7 +53,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from logger import get_logger
+from gpt_review import get_logger
 from patch_validator import validate_patch
 
 log = get_logger(__name__)
@@ -72,6 +72,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")    # required at runtime if client 
 # Utilities
 # ─────────────────────────────────────────────────────────────────────────────
 def _now_iso_utc() -> str:
+    """Current UTC timestamp as ISO‑8601 to seconds (stable for logs)."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
@@ -114,6 +115,7 @@ def _current_commit(repo: Path) -> str:
 
 
 def _tail(text: str, n_chars: int = LOG_TAIL_CHARS) -> str:
+    """Return *text* limited to its last *n_chars* characters."""
     if len(text) <= n_chars:
         return text
     return text[-n_chars:]
@@ -132,6 +134,7 @@ def _submit_patch_tool() -> Dict[str, Any]:
             "name": "submit_patch",
             "description": (
                 "Create, update, delete, rename or chmod exactly one file in the repository. "
+                "For create/update you MUST return a COMPLETE FILE in 'body' (or 'body_b64' for binary) — never a diff. "
                 "Return one patch at a time and set status to 'in_progress' until the last patch, "
                 "then 'completed'."
             ),
@@ -171,20 +174,23 @@ def _system_prompt() -> str:
     return (
         "You are GPT‑Review. Respond **only** by calling the function `submit_patch` "
         "with a single, minimal patch for exactly one file. "
-        "After each patch, wait for tool results before proposing the next patch. "
+        "For create/update operations you MUST return a **COMPLETE FILE** (not a diff) in `body` "
+        "or `body_b64` for binary content. "
+        "After each patch, wait for the tool results before proposing the next patch. "
         "Use status='in_progress' until the last patch, then 'completed'. "
-        "Avoid prose unless asked; keep changes small and self‑contained."
+        "Avoid prose unless asked; keep changes small and self‑contained; use repo‑relative POSIX paths."
     )
 
 
 def _instructions_block(user_instructions: str) -> str:
-    # Keep this compact; the browser-mode JSON reminder is not needed in API mode.
+    # Keep this compact and language‑agnostic.
     rules = (
         "Rules:\n"
-        "1) One file per patch.\n"
-        "2) Preserve behaviour (BC‑safe) and modernise for Python 3.12.\n"
-        "3) Keep diffs minimal; avoid unrelated formatting.\n"
-        "4) When tests fail, propose the next patch.\n"
+        "1) One file per patch; return a **complete file** for create/update.\n"
+        "2) Preserve behaviour (backwards‑compatible) unless fixing a clear defect.\n"
+        "3) Keep diffs minimal; avoid unrelated formatting or churn.\n"
+        "4) Use exact repo‑relative POSIX paths; avoid creating new directories unless requested.\n"
+        "5) When the command fails, propose the next patch to address the failure.\n"
     )
     return f"{user_instructions.strip()}\n\n{rules}"
 
@@ -201,7 +207,6 @@ def _prune_messages(msgs: List[Dict[str, Any]], max_turn_pairs: int) -> List[Dic
     tail = msgs[2:]
     # A "turn pair" here is coarse (assistant + tool [+ optional user log]).
     # We approximate by limiting to the last N *assistant/tool* pairs in the tail.
-    # Find indices of assistant/tool messages to split into pairs.
     indices = [i for i, m in enumerate(tail) if m["role"] in ("assistant", "tool")]
     if not indices:
         return msgs
@@ -376,7 +381,7 @@ def run(
         tool_result: Dict[str, Any]
         try:
             patch = json.loads(raw_args)
-            # Reuse our schema validator (expects JSON string)
+            # Reuse our schema validator (accepts dict or JSON string)
             validate_patch(json.dumps(patch, ensure_ascii=False))
         except Exception as exc:
             log.warning("Patch validation failed at turn %d: %s", turn, exc)
@@ -394,6 +399,11 @@ def run(
                 }
             )
             continue
+
+        # Helpful visibility before applying the patch
+        op = patch.get("op")
+        file_path = patch.get("file")
+        log.info("Turn %d: applying patch op=%s file=%s status=%s", turn, op, file_path, patch.get("status"))
 
         # Apply patch
         apply_res = _apply_patch(repo, patch)
@@ -421,6 +431,7 @@ def run(
         # Optionally run command
         cmd_ok, cmd_out, cmd_code = (True, "", 0)
         if cmd:
+            log.info("Running command after patch: %s", shlex.join(shlex.split(cmd)))
             cmd_ok, cmd_out, cmd_code = _run_cmd(cmd, repo, timeout)
 
         # Build tool output (success + optional command results)
@@ -449,10 +460,12 @@ def run(
 
         # Stop condition: status=completed AND (no cmd OR cmd passed).
         if (patch.get("status") == "completed") and (not cmd or cmd_ok):
-            log.info("All done — status=completed%s.",
-                     "" if not cmd else (" and command passed (rc=0)"))
+            log.info(
+                "All done — status=completed%s.",
+                "" if not cmd else (" and command passed (rc=0)"),
+            )
             return
 
-        # Otherwise, the loop continues: the assistant will read the tool result
+        # Otherwise, loop continues: assistant will read the tool result
         # and (we force tool_choice) propose another `submit_patch` call.
         # No extra user message is required; this keeps context small.

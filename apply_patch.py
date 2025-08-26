@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 ===============================================================================
 GPT‑Review ▸ Patch applier
@@ -27,18 +28,17 @@ Safety nets
 * **Safe chmod** – only 0644 or 0755 allowed (accept both 3/4‑digit forms).
 * **Precise staging** – stage only the affected path(s); never parent dirs.
 * **No‑op commits** – skip commit when there is nothing to stage (idempotent).
+* **No writes under `.git/`** – any attempt to read/write/move into `.git/` is rejected.
 
 Logging
 -------
-Uses the project‑wide daily rotating logger (logger.get_logger).  Each
-high‑level step logs an INFO banner; low‑level details at DEBUG.
-
+Uses the project‑wide daily rotating logger (logger.get_logger). Each high‑level
+step logs an INFO banner; low‑level details log at DEBUG.
 """
 from __future__ import annotations
 
 import base64
 import json
-import logging
 import os
 import re
 import shutil
@@ -156,9 +156,30 @@ def _ensure_inside(repo: Path, target: Path) -> None:
         raise ValueError("Patch path escapes repository root") from exc
 
 
+def _is_under_dot_git(rel: str) -> bool:
+    """
+    Return True if a repo‑relative POSIX path refers to `.git` or a descendant.
+    """
+    s = rel.strip().lstrip("./")
+    if not s:
+        return False
+    return (
+        s == ".git"
+        or s.startswith(".git/")
+        or "/.git/" in s
+        or s.endswith("/.git")
+    )
+
+
 def _normalize_text(text: str) -> str:
-    """Ensure trailing newline (POSIX)."""
-    return text if text.endswith("\n") else text + "\n"
+    """
+    Normalize text payloads:
+
+    * Convert CRLF/CR → LF
+    * Ensure a trailing newline (POSIX)
+    """
+    t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    return t if t.endswith("\n") else t + "\n"
 
 
 def _write_file(p: Path, body: Optional[str], body_b64: Optional[str]) -> tuple[int, int]:
@@ -238,23 +259,25 @@ def apply_patch(patch_json: str, repo_path: str) -> None:
     """
     Main entry – validate, perform operation, commit.
     """
-    patch = validate_patch(patch_json)  # raises jsonschema.ValidationError
+    patch = validate_patch(patch_json)  # schema-level validation; raises on error
     repo = Path(repo_path).resolve()
 
     if not (repo / ".git").exists():
         raise FileNotFoundError(f"Not a git repo: {repo}")
 
     rel = patch.get("file", "")
+    if _is_under_dot_git(rel):
+        raise PermissionError("Refusing to operate inside .git/")
+
     src = (repo / rel).resolve()
     _ensure_inside(repo, src)
+
     op = patch["op"]
     log.info("Applying %s → %s", op, rel)
 
     # Guard against accidental overwrite of locally modified files
     if op in {"update", "delete", "rename", "chmod"} and _has_local_changes(repo, rel):
-        raise RuntimeError(
-            f"Refusing to {op} '{rel}' – local modifications detected."
-        )
+        raise RuntimeError(f"Refusing to {op} '{rel}' – local modifications detected.")
 
     # ----------------------- create / update -------------------------------
     if op in {"create", "update"}:
@@ -301,6 +324,9 @@ def apply_patch(patch_json: str, repo_path: str) -> None:
     # ---------------------------- rename -----------------------------------
     if op == "rename":
         target_rel = patch["target"]
+        if _is_under_dot_git(target_rel):
+            raise PermissionError("Refusing to move a path into .git/")
+
         target = (repo / target_rel).resolve()
         _ensure_inside(repo, target)
 

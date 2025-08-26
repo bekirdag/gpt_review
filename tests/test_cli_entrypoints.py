@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 ===============================================================================
 CLI smoke tests for entrypoints
@@ -44,13 +46,17 @@ def _run(cmd: list[str]) -> tuple[int, str]:
     return proc.returncode, out
 
 
+# Accept classic "X.Y.Z" or PEP 440 local/dev segments (e.g., 0.3.0.dev1, 0.3.0+local)
+_PEP440ish = re.compile(r"\b\d+\.\d+\.\d+(?:[A-Za-z0-9_.+-]+)?\b")
+
+
 def test_module_entrypoint_version() -> None:
     """
-    `python -m gpt_review --version` should print a semantic version and exit 0.
+    `python -m gpt_review --version` should print a version and exit 0.
     """
     code, out = _run([sys.executable, "-m", "gpt_review", "--version"])
     assert code == 0, "Module entrypoint should exit 0 for --version"
-    assert re.search(r"\b\d+\.\d+\.\d+\b", out), f"Unexpected version output: {out!r}"
+    assert _PEP440ish.search(out), f"Unexpected version output: {out!r}"
 
 
 def test_console_script_help() -> None:

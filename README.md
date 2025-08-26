@@ -398,25 +398,24 @@ set +a
 
 ## Advanced
 
-### Crash‑safe resume
+### Iteration workflow (multi‑pass)
 
-A state‑file `.gpt-review-state.json` is written after every successful patch.
-Re‑run the same command to resume; delete the file to start fresh.
+Iterations **1–2** focus on code + tests. Iteration **3** may update docs/setup/examples for global consistency.  
+This is enforced by the `RepoScanner` + orchestrator and reflected in prompts.
 
-### Headless mode
+### Safety nets
 
-```bash
-export GPT_REVIEW_HEADLESS=1
-software_review.sh ...
-```
+* Path traversal blocked (`..`, absolute paths, backslashes).  
+* No writes inside `.git/`.  
+* Refuses to clobber locally‑modified files.  
+* **Scoped staging**: commits touch only the intended paths (no parent‑dir sweep).  
+* Chmod whitelist (0644/755; accepts 3‑ or 4‑digit octal).  
+* Text normalization (LF, trailing newline).  
+* Binary create/update via `body_b64` (strict Base64).
 
-Headless mode uses Chromium’s **new** headless backend for stability.
+### Full‑file API driver
 
-### Custom log directory
-
-```bash
-export GPT_REVIEW_LOG_DIR=/var/log/gpt-review
-```
+API workflows can propose **complete file replacements** (not diffs). The `fullfile_api_driver.py` tool enforces that the model returns an explicit `keep/update/create/delete` decision and provides full content when changing a file.
 
 ---
 

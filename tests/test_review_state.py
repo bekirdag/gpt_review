@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 ===============================================================================
 Unit‑tests for review.py repo state helpers
@@ -6,6 +8,12 @@ Unit‑tests for review.py repo state helpers
 Covers:
 * _current_commit() on an empty repository (unborn HEAD)
 * _current_commit() after an initial commit
+
+Notes
+-----
+We tolerate either the legacy sentinel exported by `review.HEAD_UNBORN` or the
+newer "<no-commits-yet>" value used by helpers elsewhere, so the test remains
+stable across implementations.
 """
 from __future__ import annotations
 
@@ -14,7 +22,13 @@ import re
 import subprocess
 from pathlib import Path
 
-from review import _current_commit, HEAD_UNBORN
+from review import _current_commit
+
+# Prefer the module's sentinel when available; otherwise fall back.
+try:  # pragma: no cover - import availability depends on implementation
+    from review import HEAD_UNBORN as _HEAD_UNBORN  # type: ignore
+except Exception:  # pragma: no cover
+    _HEAD_UNBORN = "<no-commits-yet>"
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -40,7 +54,7 @@ def _init_repo(tmp: Path, do_commit: bool = False) -> Path:
 def test_unborn_head_returns_sentinel(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path, do_commit=False)
     sha = _current_commit(repo)
-    assert sha == HEAD_UNBORN
+    assert sha == _HEAD_UNBORN
 
 
 def test_after_initial_commit_returns_sha(tmp_path: Path) -> None:

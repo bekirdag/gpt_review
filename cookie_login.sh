@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ###############################################################################
-# GPT‑Review ▸ Cookie Login Helper (robust for SSH/X11 & root)
+# GPT‑Review ▸ Cookie Login Helper (robust for SSH/X11/Wayland & root)
 ###############################################################################
 #
 # Purpose
@@ -8,14 +8,15 @@
 # GPT‑Review drives a **real Chrome/Chromium session**. You must sign in once;
 # cookies then persist in the selected Chrome profile directory.
 #
-# What’s new
-# ----------
+# What’s new / key guarantees
+# ---------------------------
 # • Adds `--no-sandbox` automatically when running as **root** (Chrome/Chromium
 #   refuse to start as root without it).
-# • Validates that a **DISPLAY** is available on Linux (XQuartz/X11/VNC).
+# • Validates that a **DISPLAY** (X11) or **WAYLAND_DISPLAY** is available on Linux.
 # • Detects **Snap Chromium** and avoids dot‑dir profiles by default (uses a
 #   snap‑writable profile unless you explicitly override GPT_REVIEW_PROFILE).
 # • Captures browser logs to a temp file and shows diagnostics if startup fails.
+# • Accepts optional extra flags via GPT_REVIEW_BROWSER_ARGS (advanced users).
 #
 # Usage
 # -----
@@ -23,9 +24,10 @@
 #
 # Common environment overrides
 # ----------------------------
-#   GPT_REVIEW_PROFILE   – where Chrome stores cookies (default varies; see below)
-#   GPT_REVIEW_LOGIN_URL – primary URL to open (default: https://chatgpt.com/)
-#   CHROME_BIN           – explicit browser binary
+#   GPT_REVIEW_PROFILE     – where Chrome stores cookies (default varies; see below)
+#   GPT_REVIEW_LOGIN_URL   – primary URL to open (default: https://chatgpt.com/)
+#   CHROME_BIN             – explicit browser binary
+#   GPT_REVIEW_BROWSER_ARGS– extra args appended to the launch command
 #
 ###############################################################################
 
@@ -100,19 +102,20 @@ detect_browser() {
 
 BROWSER_BIN="$(detect_browser || true)"
 IS_LINUX=0; [[ "$(uname -s)" == "Linux" ]] && IS_LINUX=1
+IS_DARWIN=0; [[ "$(uname -s)" == "Darwin" ]] && IS_DARWIN=1
 IS_ROOT=0;  [[ "${EUID:-$(id -u)}" -eq 0 ]] && IS_ROOT=1
-IS_SNAP=0;  [[ "$BROWSER_BIN" == *"/snap/"* ]] && IS_SNAP=1
+IS_SNAP=0;  [[ -n "$BROWSER_BIN" && "$BROWSER_BIN" == *"/snap/"* ]] && IS_SNAP=1
 
 # ------------------------------------------------------------------------------
-# Linux DISPLAY sanity (headless login is impossible)
+# Linux GUI sanity (headless login is impossible)
 # ------------------------------------------------------------------------------
 if [[ $IS_LINUX -eq 1 ]]; then
-  if [[ -z "${DISPLAY:-}" ]]; then
-    die "No DISPLAY found. Login requires a visible browser.
+  if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+    die "No DISPLAY (X11) or WAYLAND_DISPLAY found. Login requires a visible browser.
 Hints:
   • macOS: install XQuartz, log out/in, run:  xhost +localhost ; ssh -Y user@server
-  • Or start a virtual display:  Xvfb :99 &  export DISPLAY=:99  (use x11vnc/Fluxbox for VNC)
-  • Or run this on a machine with a desktop session."
+  • Linux: start a desktop session, or use a virtual display:  Xvfb :99 &  export DISPLAY=:99
+  • Remote: use VNC (x11vnc/Fluxbox) or X11 forwarding (ssh -Y)."
   fi
 fi
 
@@ -147,6 +150,17 @@ if [[ $IS_ROOT -eq 1 ]]; then
   EXTRA_ARGS+=("--no-sandbox")
 fi
 
+# Wayland hint (safe to pass even under X11; Chrome auto-detects)
+if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+  EXTRA_ARGS+=("--ozone-platform-hint=auto")
+fi
+
+# Optional extra flags from env (advanced users)
+if [[ -n "${GPT_REVIEW_BROWSER_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  EXTRA_ARGS+=(${GPT_REVIEW_BROWSER_ARGS})
+fi
+
 # ------------------------------------------------------------------------------
 # Banner
 # ------------------------------------------------------------------------------
@@ -170,6 +184,10 @@ else
 fi
 if [[ $IS_LINUX -eq 1 ]]; then
   echo "• DISPLAY        : ${DISPLAY:-<unset>}"
+  echo "• WAYLAND_DISPLAY: ${WAYLAND_DISPLAY:-<unset>}"
+fi
+if [[ -n "${GPT_REVIEW_BROWSER_ARGS:-}" ]]; then
+  echo "• Extra args     : ${GPT_REVIEW_BROWSER_ARGS}"
 fi
 echo
 echo "Next steps:"
@@ -186,7 +204,15 @@ echo
 # ------------------------------------------------------------------------------
 # Launch browser (platform‑aware with diagnostics)
 # ------------------------------------------------------------------------------
-TMP_LOG="$(mktemp -t gpt-review-browser-XXXXXX.log || echo "/tmp/gpt-review-browser.log")"
+TMP_LOG="$(mktemp -t gpt-review-browser-XXXXXX.log 2>/dev/null || echo "/tmp/gpt-review-browser.log")"
+
+print_recent_log_and_die() {
+  warn "Browser exited immediately. Recent log:"
+  echo "────────────────────  $TMP_LOG  ────────────────────"
+  (tail -n 120 "$TMP_LOG" || true)
+  echo "────────────────────────────────────────────────────"
+  die "Unable to start a visible browser. See hints above for XQuartz/Wayland/VNC."
+}
 
 if [[ -n "$BROWSER_BIN" ]]; then
   info "Launching: $BROWSER_BIN"
@@ -205,11 +231,7 @@ if [[ -n "$BROWSER_BIN" ]]; then
   # Give it a moment; if it dies immediately, show logs.
   sleep 2
   if ! ps -p "$PID" >/dev/null 2>&1; then
-    warn "Browser exited immediately. Recent log:"
-    echo "────────────────────  $TMP_LOG  ────────────────────"
-    tail -n 80 "$TMP_LOG" || true
-    echo "────────────────────────────────────────────────────"
-    die "Unable to start a visible browser. See hints above for XQuartz/Xvfb/VNC."
+    print_recent_log_and_die
   fi
 
   # Wait until the user closes the window.
@@ -217,7 +239,7 @@ if [[ -n "$BROWSER_BIN" ]]; then
 
 else
   # macOS fallback: use `open -a` if we couldn't find a direct binary
-  if [[ "$(uname -s)" == "Darwin" ]]; then
+  if [[ $IS_DARWIN -eq 1 ]]; then
     if [[ -d "/Applications/Google Chrome.app" ]]; then
       info "Launching via 'open -a Google Chrome' (macOS)"
       open -a "Google Chrome" --args \

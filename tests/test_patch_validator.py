@@ -1,9 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 ===============================================================================
 Unit‑tests for *patch_validator.validate_patch*
 ===============================================================================
 
-The validator enforces the JSON‑Schema defined in gpt_review/schema.json.
+The validator enforces the patch contract aligned with gpt_review/schema.json.
 We exercise representative *valid* and *invalid* patches for every operation to
 ensure:
 
@@ -12,21 +14,34 @@ ensure:
 * Enum / pattern constraints (op, status, mode)
 * Bytes input is accepted
 * Unknown properties are rejected (additionalProperties=false)
-* jsonschema.ValidationError is raised on bad input
+
+Notes
+-----
+The merged validator may raise either `jsonschema.ValidationError` (schema path)
+or `ValueError` (logic path). Tests accept both to avoid coupling to one backend.
 """
 from __future__ import annotations
 
 import base64
 import json
 import logging
+from typing import Tuple, Type
 
 import pytest
-from jsonschema import ValidationError
+
+# Prefer jsonschema.ValidationError when available; fall back to a dummy type
+try:  # pragma: no cover - import is environment dependent
+    from jsonschema import ValidationError as SchemaValidationError  # type: ignore
+except Exception:  # pragma: no cover
+    class SchemaValidationError(Exception):  # type: ignore
+        pass
 
 from patch_validator import validate_patch
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+InvalidTypes: Tuple[Type[BaseException], ...] = (SchemaValidationError, ValueError)
 
 
 # -----------------------------------------------------------------------------
@@ -53,11 +68,12 @@ def _as_json(patch: dict) -> str:
 
 def _expect_error(patch: dict):
     """
-    Helper: assert that *patch* triggers ValidationError.
+    Helper: assert that *patch* triggers a validation failure.
+    Accepts either jsonschema.ValidationError or ValueError.
     """
-    with pytest.raises(ValidationError):
+    with pytest.raises(InvalidTypes):
         validate_patch(_as_json(patch))
-        log.info("Expected schema validation failure: %s", patch)
+        log.info("Expected validation failure: %s", patch)
 
 
 # =============================================================================
@@ -126,7 +142,7 @@ def test_valid_patches(patch):
     All *patch* examples above should validate cleanly.
     """
     assert validate_patch(_as_json(patch)) == patch
-    log.info("Valid patch passed schema: %s", patch["op"])
+    log.info("Valid patch passed contract: %s", patch["op"])
 
 
 def test_accepts_bytes_payload():
@@ -196,7 +212,7 @@ def test_mode_pattern():
 
 def test_rejects_unknown_property():
     """
-    Schema sets additionalProperties=false → unknown keys must be rejected.
+    Contract forbids unknown keys (additionalProperties=false / strict key set).
     """
     bad = _good_base()
     bad["unexpected"] = "nope"

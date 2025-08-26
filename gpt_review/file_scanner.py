@@ -2,489 +2,356 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
-GPT‑Review ▸ Repository Scanner & Classifier
+GPT‑Review ▸ File Scanner (compatibility shim over RepoScanner)
 ===============================================================================
 
-Purpose
--------
-Provide a resilient, Git‑aware view of the repository so the orchestrator can:
-  • enumerate files relative to the repo root (POSIX paths),
-  • classify each file (code, test, docs, install, setup, examples, binary),
-  • filter files per **iteration rules**:
-        - Iterations 1 & 2 → focus on code/tests; defer docs/install/setup/examples
-        - Iteration 3       → include the deferred classes as well
-  • (optionally) read text files with LF normalization (no CR/CRLF).
+Why this file?
+--------------
+Some parts of the system (e.g., `gpt_review.workflow`) import a module named
+`gpt_review.file_scanner` that exposes a small facade:
 
-Design notes
-------------
-• We prefer `git ls-files` to respect .gitignore and avoid scanning bulky
-  directories (node_modules/, build/, etc). If Git calls fail, we fall back to
-  a guarded filesystem walk while applying a conservative exclude set.
-• All paths returned are **POSIX** ("/") and **relative** to the repo root.
-• This module is side‑effect free; no writes, no staging. It only observes.
-• No external deps; relies on stdlib + Git CLI.
+    • RepoScan dataclass (lightweight manifest with helpful groupings)
+    • scan_repository(repo, ignores=...) -> RepoScan
+    • classify_for_iteration(scan, iteration) -> list[str]
+    • RepoScan.manifest_text() -> str
 
-Integration points
-------------------
-• `scan_repository()` – core enumerator (returns `List[FileInfo]`)
-• `files_for_iteration()` – filtered, ordered paths for a given iteration
-• `classify_path()` – standalone classifier (used by prompts/orchestrator)
-• `read_text_file()` – normalized text reader (LF line endings)
+Historically we also exposed utility helpers such as:
+    • classify_path(repo, rel_path) -> Category
+    • read_text_file(repo, rel_posix) -> str (LF-normalized)
+    • languages_present(repo) -> list[(language, count)]
+
+The project now includes a richer scanner at `gpt_review.repo_scanner.RepoScanner`.
+To avoid churn and keep backward compatibility, this module wraps the newer
+scanner behind the old facade and re‑implements the helpers using its index.
+
+Behavioral contract (aligned with requirements)
+-----------------------------------------------
+• Iterations 1–2: operate on **code + tests** only; defer docs/setup/examples.
+• Iteration 3    : include **all** non‑binary files (docs/setup/examples too).
+• All paths are **repo‑relative POSIX**; binary files are **excluded** from
+  iteration lists (binary creation/updates still possible via body_b64).
+• Pure read‑only: this module never mutates the repository.
 
 Logging
 -------
-INFO: summary counts by category; DEBUG: per‑file classification.
+INFO for summary counts and iteration selections; DEBUG for detailed decisions.
 """
 from __future__ import annotations
 
 import fnmatch
-import logging
-import os
-import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from gpt_review import get_logger
+from gpt_review.repo_scanner import RepoScanner          # robust underlying scanner
+from gpt_review.fs_utils import (                        # reuse shared helpers
+    read_text_normalized as _read_text_normalized,
+    is_binary_file as _is_binary_file,
+)
 
 log = get_logger(__name__)
 
 
 # =============================================================================
-# Categories
+# Categories (kept for backwards compatibility with earlier caller code)
 # =============================================================================
 class Category(Enum):
-    """High‑level file classes used to drive iteration ordering."""
-
-    CODE = auto()       # application/library source code
-    TEST = auto()       # tests (unit/integration)
-    DOCS = auto()       # markdown/rst + docs/ tree
-    INSTALL = auto()    # install/update scripts, Dockerfiles, deployment helpers
-    SETUP = auto()      # packaging/setup files (pyproject, setup.cfg, requirements, etc.)
-    EXAMPLE = auto()    # example assets, sample configs
-    DATA = auto()       # non‑code text data (json/yaml/txt not under docs/examples)
-    BINARY = auto()     # images, archives, compiled blobs
-    UNKNOWN = auto()    # fallback
+    CODE = auto()
+    TEST = auto()
+    DOCS = auto()
+    INSTALL = auto()   # historically separate; we alias into SETUP where needed
+    SETUP = auto()
+    EXAMPLE = auto()
+    DATA = auto()
+    BINARY = auto()
+    UNKNOWN = auto()
 
 
 # =============================================================================
-# Data model
+# Public datamodel
 # =============================================================================
-@dataclass(frozen=True)
-class FileInfo:
-    """Immutable descriptor for one repository file."""
+@dataclass
+class RepoScan:
+    """
+    Lightweight manifest returned by `scan_repository`.
 
-    rel: str                # POSIX relative path (e.g., "src/app.py")
-    category: Category
-    size: int               # bytes
-    is_text: bool           # heuristic
-    # Optional hints (extensible)
-    language: Optional[str] = None  # best‑effort, e.g. "python", "javascript"
+    Attributes
+    ----------
+    root : Path
+        Absolute repository root.
+    all_files : list[str]
+        All **non‑binary** tracked files (POSIX‑relative).
+    code_and_config : list[str]
+        Files to process during iterations 1 & 2 (code + tests; non‑binary).
+    docs_and_extras : list[str]
+        Deferred class: docs/setup/examples (iteration 3 only; non‑binary).
+    """
+    root: Path
+    all_files: List[str] = field(default_factory=list)
+    code_and_config: List[str] = field(default_factory=list)
+    docs_and_extras: List[str] = field(default_factory=list)
+
+    def manifest_text(self, max_lines: int = 400) -> str:
+        """
+        Return a concise, human‑readable manifest for prompts/logs.
+        """
+        total = len(self.all_files)
+        lines = self.all_files
+        if total > max_lines:
+            half = max_lines // 2
+            head = "\n".join(lines[:half])
+            tail = "\n".join(lines[-half:])
+            body = f"{head}\n…\n{tail}"
+        else:
+            body = "\n".join(lines)
+
+        summary = (
+            f"{total} files "
+            f"(iter12={len(self.code_and_config)}, deferred={len(self.docs_and_extras)})"
+        )
+        return f"{summary}\n{body}"
 
 
 # =============================================================================
-# Heuristics & configuration
+# Facade functions
 # =============================================================================
-# Common binary extensions (non‑exhaustive; safe bias toward BINARY)
-_BINARY_EXTS = {
-    # images
-    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp", ".ico",
-    # archives / binaries
-    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar", ".iso",
-    ".pdf", ".ttf", ".otf", ".woff", ".woff2",
-    ".so", ".dll", ".dylib", ".exe", ".bin", ".class",
-    # media
-    ".mp3", ".wav", ".flac", ".ogg", ".mp4", ".mkv", ".mov", ".avi",
-}
+def scan_repository(repo_root: Path, *, ignores: Sequence[str] | None = None) -> RepoScan:
+    """
+    Walk the repository and build a `RepoScan` manifest.
 
-# Known language extensions (partial; add as needed)
+    Parameters
+    ----------
+    repo_root : Path
+        Repository root (must contain `.git`).
+    ignores : Sequence[str] | None
+        Accepted for compatibility with older callers. The underlying
+        `RepoScanner` already applies robust ignore rules. Values here
+        are ignored intentionally to keep behaviour deterministic.
+
+    Returns
+    -------
+    RepoScan
+        A deterministic, non‑binary manifest suitable for iteration logic.
+    """
+    if ignores:  # keep users aware without changing behaviour
+        log.debug("scan_repository: 'ignores' parameter is accepted but unused (%s)", list(ignores))
+
+    root = Path(repo_root).expanduser().resolve()
+    scanner = RepoScanner(root)
+    idx = scanner.scan()
+
+    binaries = set(idx.binary_files)
+    docs = set(idx.docs_files)
+    setup = set(idx.setup_files)
+    examples = set(idx.example_files)
+
+    deferred = sorted((docs | setup | examples) - binaries)
+    code = sorted(set(idx.code_files) - binaries)
+    tests = sorted(set(idx.test_files) - binaries)
+
+    non_binary_all = sorted(set(idx.all_files) - binaries)
+
+    manifest = RepoScan(
+        root=root,
+        all_files=_stable_unique(non_binary_all),
+        code_and_config=_stable_unique(code + tests),
+        docs_and_extras=_stable_unique(deferred),
+    )
+
+    log.info(
+        "Scanned repo: total=%s non‑binary=%s iter12=%s deferred=%s",
+        len(idx.all_files),
+        len(manifest.all_files),
+        len(manifest.code_and_config),
+        len(manifest.docs_and_extras),
+    )
+    return manifest
+
+
+def classify_for_iteration(scan: RepoScan, *, iteration: int) -> List[str]:
+    """
+    Return the ordered list of files to process for the given *iteration*.
+
+    • Iterations 1–2 → code & tests only (scan.code_and_config)
+    • Iteration 3    → **all** non‑binary files, including docs/setup/examples
+    """
+    if iteration >= 3:
+        ordered = _stable_unique(scan.code_and_config + scan.docs_and_extras)
+        log.info("Iteration %d → %d files (incl. docs/setup/examples).", iteration, len(ordered))
+        return ordered
+
+    ordered = list(scan.code_and_config)
+    log.info("Iteration %d → %d files (code + tests).", iteration, len(ordered))
+    return ordered
+
+
+# =============================================================================
+# Back‑compat helpers (mirror earlier API surface)
+# =============================================================================
+# Minimal language map (kept local to avoid tight coupling)
 _LANG_BY_EXT = {
-    # Python
-    ".py": "python",
-    ".pyi": "python",
-    # JavaScript / TypeScript
-    ".js": "javascript",
-    ".cjs": "javascript",
-    ".mjs": "javascript",
-    ".ts": "typescript",
-    ".tsx": "typescript",
-    ".jsx": "javascript",
-    # Shell
-    ".sh": "shell",
-    ".bash": "shell",
-    # Config / Data
-    ".json": "json",
-    ".yaml": "yaml",
-    ".yml": "yaml",
-    ".toml": "toml",
-    ".ini": "ini",
-    ".cfg": "ini",
-    ".conf": "ini",
-    ".txt": "text",
-    ".md": "markdown",
-    ".rst": "rst",
-    # Misc code
-    ".go": "go",
-    ".rs": "rust",
-    ".java": "java",
-    ".kt": "kotlin",
-    ".c": "c",
-    ".h": "c",
-    ".cpp": "cpp",
-    ".hpp": "cpp",
-    ".cs": "csharp",
-    ".php": "php",
-    ".rb": "ruby",
-    ".swift": "swift",
+    ".py": "python", ".pyi": "python",
+    ".js": "javascript", ".cjs": "javascript", ".mjs": "javascript",
+    ".ts": "typescript", ".tsx": "typescript", ".jsx": "javascript",
+    ".sh": "shell", ".bash": "shell",
+    ".json": "json", ".yaml": "yaml", ".yml": "yaml",
+    ".toml": "toml", ".ini": "ini", ".cfg": "ini", ".conf": "ini", ".txt": "text",
+    ".md": "markdown", ".rst": "rst",
+    ".go": "go", ".rs": "rust", ".java": "java", ".kt": "kotlin",
+    ".c": "c", ".h": "c", ".cpp": "cpp", ".hpp": "cpp",
+    ".cs": "csharp", ".php": "php", ".rb": "ruby", ".swift": "swift",
 }
 
-# Fall‑back filesystem excludes (only used when Git is unavailable)
-_FS_EXCLUDES: Tuple[str, ...] = (
-    ".git/**",
-    ".git",
-    "venv/**",
-    ".venv/**",
-    "node_modules/**",
-    "dist/**",
-    "build/**",
-    ".tox/**",
-    ".pytest_cache/**",
-    "__pycache__/**",
-    "coverage/**",
-    "htmlcov/**",
-    "docker-build/**",
-    "logs/**",
-    ".cache/**",
+# Patterns broadly aligned with prior classifier (used only for fallback)
+_DOC_GLOBS: Tuple[str, ...] = (
+    "README.*", "CHANGELOG.*", "CONTRIBUTING.*", "LICENSE*",
+    "docs/**", "*.md", "*.rst",
 )
-
-# Classification patterns
-_DOC_PATTERNS: Tuple[str, ...] = (
-    "README.*",
-    "CHANGELOG.*",
-    "CONTRIBUTING.*",
-    "LICENSE*",
-    "docs/**",
-    "*.md",
-    "*.rst",
-)
-_INSTALL_PATTERNS: Tuple[str, ...] = (
-    "install.sh",
-    "update.sh",
-    "cookie_login.sh",
-    "software_review.sh",
-    "scripts/install*",
-    "scripts/setup*",
-    "Dockerfile",
-    "docker/**",
+_INSTALL_GLOBS: Tuple[str, ...] = (
+    "install.sh", "update.sh", "cookie_login.sh", "software_review.sh",
+    "scripts/install*", "scripts/setup*", "Dockerfile", "docker/**",
     ".github/workflows/**",
 )
-_SETUP_PATTERNS: Tuple[str, ...] = (
-    "pyproject.toml",
-    "setup.cfg",
-    "setup.py",
-    "requirements*.txt",
-    "Pipfile",
-    "poetry.lock",
-    ".flake8",
-    ".editorconfig",
-    ".pre-commit-config.yaml",
+_SETUP_GLOBS: Tuple[str, ...] = (
+    "pyproject.toml", "setup.cfg", "setup.py",
+    "requirements*.txt", "Pipfile", "poetry.lock",
+    ".flake8", ".editorconfig", ".pre-commit-config.yaml", ".pre-commit-config.yml",
 )
-_EXAMPLE_PATTERNS: Tuple[str, ...] = (
-    "examples/**",
-    "example/**",
-    "example_*",
-    "example*.*",
-    "docs/examples/**",
-    "example_instructions.txt",
+_EXAMPLE_GLOBS: Tuple[str, ...] = (
+    "examples/**", "example/**", "example_*", "example*.*",
+    "docs/examples/**", "example_instructions.txt",
 )
-_TEST_PATTERNS: Tuple[str, ...] = (
-    "tests/**",
-    "test_*.*",
-    "*_test.*",
-)
-
-
-# =============================================================================
-# Utilities
-# =============================================================================
-def _to_posix(rel_path: Path) -> str:
-    return rel_path.as_posix()
+_TEST_GLOBS: Tuple[str, ...] = ("tests/**", "test_*.*", "*_test.*")
 
 
 def _matches_any(path: str, patterns: Sequence[str]) -> bool:
     return any(fnmatch.fnmatch(path, pat) for pat in patterns)
 
 
-def _git(repo: Path, *args: str, capture: bool = True) -> str:
+def classify_path(repo: Path, rel_path: Path | str) -> Category:
     """
-    Run git -C <repo> <args>. Raises on non‑zero unless capture=False is used.
-    """
-    res = subprocess.run(
-        ["git", "-C", str(repo), *args],
-        text=True,
-        capture_output=capture,
-        check=True,
-    )
-    return res.stdout if capture else ""
+    Classify a single *repo‑relative* path into a broad Category.
 
+    Implementation:
+    • Prefer the fresh `RepoScanner` index; if the file appears in its category
+      lists we return that category (INSTALL is merged into SETUP).
+    • If not present (e.g., untracked/new), fall back to earlier glob/extension
+      heuristics to keep behavior stable.
+    """
+    root = Path(repo).expanduser().resolve()
+    rel = Path(rel_path).as_posix()
 
-def _detect_text_file(p: Path, max_bytes: int = 4096) -> bool:
-    """
-    Light heuristic: try reading a small prefix in text mode with utf‑8 + 'replace'.
-    If more than ~15% of the characters are the Unicode replacement char, treat as binary.
-    """
     try:
-        raw = p.read_bytes()[:max_bytes]
+        idx = RepoScanner(root).scan()
+        if rel in idx.binary_files:
+            return Category.BINARY
+        if rel in idx.test_files:
+            return Category.TEST
+        if rel in idx.code_files:
+            return Category.CODE
+        if rel in idx.docs_files:
+            return Category.DOCS
+        if rel in idx.example_files:
+            return Category.EXAMPLE
+        if rel in idx.setup_files:
+            # Historically INSTALL was separate; RepoScanner lumps install/setup.
+            return Category.SETUP
     except Exception:
-        return False
-    # Obvious binary signatures
-    if b"\x00" in raw:
-        return False
-    try:
-        txt = raw.decode("utf-8", errors="replace")
-    except Exception:
-        return False
-    bad = txt.count("\uFFFD")
-    return (len(txt) == 0) or (bad / max(1, len(txt)) <= 0.15)
+        # Indexing failed; continue to heuristic fallback.
+        pass
 
-
-def _guess_language(path: Path) -> Optional[str]:
-    return _LANG_BY_EXT.get(path.suffix.lower())
-
-
-def _classify(rel_posix: str, is_text: bool) -> Category:
-    """
-    Rule‑based classifier using glob patterns and filename heuristics.
-    Pattern order matters for specificity.
-    """
-    name = rel_posix
-    lower = name.lower()
-
-    # Binaries first (by extension or explicit signal)
-    if Path(name).suffix.lower() in _BINARY_EXTS or not is_text:
+    # Heuristic fallback (similar to earlier implementation)
+    if _is_binary_file(root / rel):
         return Category.BINARY
 
-    # Docs
-    if _matches_any(name, _DOC_PATTERNS):
+    p = Path(rel)
+    ext = p.suffix.lower()
+
+    if _matches_any(rel, _DOC_GLOBS):
         return Category.DOCS
-
-    # Install / automation helpers
-    if _matches_any(name, _INSTALL_PATTERNS):
+    if _matches_any(rel, _INSTALL_GLOBS):
         return Category.INSTALL
-
-    # Setup / packaging
-    if _matches_any(name, _SETUP_PATTERNS):
+    if _matches_any(rel, _SETUP_GLOBS):
         return Category.SETUP
-
-    # Examples
-    if _matches_any(name, _EXAMPLE_PATTERNS):
+    if _matches_any(rel, _EXAMPLE_GLOBS):
         return Category.EXAMPLE
-
-    # Tests (prefer explicit test patterns before generic code)
-    if _matches_any(name, _TEST_PATTERNS):
+    if _matches_any(rel, _TEST_GLOBS):
         return Category.TEST
 
-    # Generic data (json/yaml/txt) that didn't match docs/examples
-    if Path(name).suffix.lower() in {".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".txt"}:
+    if ext in {".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".txt"}:
         return Category.DATA
-
-    # Fallback: code if extension looks like code; otherwise UNKNOWN
-    if Path(name).suffix.lower() in _LANG_BY_EXT:
+    if ext in _LANG_BY_EXT:
         return Category.CODE
 
-    # Heuristic: top‑level Makefile, justfile → setup
-    base = Path(name).name
-    if base in {"Makefile", "makefile", "Justfile", "justfile"}:
-        return Category.SETUP
-
     return Category.UNKNOWN
-
-
-# =============================================================================
-# Public API
-# =============================================================================
-def classify_path(repo: Path, rel_path: Path) -> Category:
-    """
-    Classify a single path relative to *repo*.
-    """
-    abs_path = (repo / rel_path).resolve()
-    is_text = _detect_text_file(abs_path)
-    category = _classify(_to_posix(rel_path), is_text)
-    log.debug("Classified %s → %s (text=%s)", _to_posix(rel_path), category.name, is_text)
-    return category
-
-
-def scan_repository(repo: Path) -> List[FileInfo]:
-    """
-    Enumerate repository files (tracked + untracked but not ignored), classify,
-    and return a list of `FileInfo` entries.
-
-    Returns
-    -------
-    List[FileInfo]
-        POSIX relative paths; no entries under `.git/`.
-    """
-    repo = repo.expanduser().resolve()
-    if not (repo / ".git").exists():
-        raise ValueError(f"Not a Git repository: {repo}")
-
-    rel_paths: List[str] = []
-
-    # Preferred: Git listing
-    try:
-        tracked = _git(repo, "ls-files").splitlines()
-        others = _git(repo, "ls-files", "--others", "--exclude-standard").splitlines()
-        rel_paths = tracked + others
-        log.info("Git enumeration: %d tracked, %d untracked files.", len(tracked), len(others))
-    except Exception as exc:
-        log.warning("Git listing failed (%s). Falling back to filesystem walk.", exc)
-        rel_paths = []
-        for p in repo.rglob("*"):
-            if p.is_dir():
-                continue
-            rel = p.relative_to(repo)
-            posix = _to_posix(rel)
-            if _matches_any(posix, _FS_EXCLUDES):
-                continue
-            if posix.startswith(".git/"):
-                continue
-            rel_paths.append(posix)
-
-    # Deduplicate & sort
-    rel_paths = sorted(dict.fromkeys(rel_paths))
-
-    out: List[FileInfo] = []
-    for posix in rel_paths:
-        if posix.startswith(".git/") or posix == ".git":
-            continue
-        abs_p = (repo / posix)
-        if not abs_p.exists():
-            # Could be deleted since enumeration; skip.
-            log.debug("Skipping vanished path: %s", posix)
-            continue
-        try:
-            size = abs_p.stat().st_size
-        except Exception:
-            size = 0
-        is_text = _detect_text_file(abs_p)
-        cat = _classify(posix, is_text)
-        lang = _guess_language(abs_p) if cat in (Category.CODE, Category.TEST) else None
-        out.append(FileInfo(rel=posix, category=cat, size=size, is_text=is_text, language=lang))
-        log.debug("FileInfo(%s) → cat=%s size=%d text=%s lang=%s",
-                  posix, cat.name, size, is_text, lang or "-")
-
-    # Summary
-    counts = {}
-    for fi in out:
-        counts[fi.category] = counts.get(fi.category, 0) + 1
-    summary = ", ".join(f"{k.name}={v}" for k, v in sorted(counts.items(), key=lambda kv: kv[0].name))
-    log.info("Scan summary: %d files (%s)", len(out), summary or "no files")
-
-    return out
-
-
-def files_for_iteration(repo: Path, iteration: int) -> List[str]:
-    """
-    Return an ordered list of POSIX paths to process for *iteration*.
-
-    Rules
-    -----
-    • Iterations 1 & 2:
-        - include CODE, TEST, DATA, UNKNOWN
-        - exclude DOCS, INSTALL, SETUP, EXAMPLE
-        - exclude BINARY (we do not ask the API to edit binaries directly)
-    • Iteration 3:
-        - include **all** classes except BINARY by default
-          (binaries may be created via body_b64 when requested explicitly)
-
-    Ordering
-    --------
-    • Code first (language alphabetical, then path)
-    • Tests next
-    • Data/Unknown
-    • Docs/Install/Setup/Examples (iteration 3 only)
-    """
-    infos = scan_repository(repo)
-
-    def allowed(fi: FileInfo) -> bool:
-        if fi.category == Category.BINARY:
-            return False
-        if iteration >= 3:
-            return True  # except binaries (already filtered)
-        # iteration 1 & 2
-        return fi.category in {Category.CODE, Category.TEST, Category.DATA, Category.UNKNOWN}
-
-    selected = [fi for fi in infos if allowed(fi)]
-
-    # Ordering key
-    def _key(fi: FileInfo) -> Tuple[int, str, str]:
-        # group order
-        group = {
-            Category.CODE: 0,
-            Category.TEST: 1,
-            Category.DATA: 2,
-            Category.UNKNOWN: 3,
-            Category.DOCS: 4,
-            Category.INSTALL: 5,
-            Category.SETUP: 6,
-            Category.EXAMPLE: 7,
-        }.get(fi.category, 9)
-        lang = fi.language or "~"
-        return (group, lang, fi.rel)
-
-    ordered = sorted(selected, key=_key)
-    log.info("Iteration %d: %d files selected (of %d scanned).", iteration, len(ordered), len(infos))
-    return [fi.rel for fi in ordered]
 
 
 def read_text_file(repo: Path, rel_posix: str, *, max_bytes: int = 1024 * 1024) -> str:
     """
     Read a text file relative to *repo* with LF normalization.
-
-    • CRLF/CR newlines are normalized to LF.
-    • Appends a final newline if missing (consistent with our writer).
-    • Raises ValueError if the target appears binary.
-
-    Parameters
-    ----------
-    max_bytes : int
-        Safety cap to avoid loading extremely large files into a prompt.
-
-    Returns
-    -------
-    str
-        Normalized UTF‑8 text.
+    Raises ValueError for files that appear binary.
     """
-    p = (repo / rel_posix).resolve()
+    p = (Path(repo).expanduser().resolve() / rel_posix).resolve()
     if not p.exists() or not p.is_file():
         raise FileNotFoundError(rel_posix)
-    if not _detect_text_file(p):
+    if _is_binary_file(p):
         raise ValueError(f"Refusing to read binary file as text: {rel_posix}")
 
-    raw = p.read_bytes()[:max_bytes]
-    txt = raw.decode("utf-8", errors="replace")
-    # Normalize newlines to LF
-    txt = txt.replace("\r\n", "\n").replace("\r", "\n")
-    if not txt.endswith("\n"):
-        txt += "\n"
-    log.debug("Read text %s (%d bytes → %d chars normalized).", rel_posix, len(raw), len(txt))
-    return txt
+    # Use the shared normalization helper; keep a defensive size guard.
+    data = p.read_bytes()[:max_bytes]
+    text = data.decode("utf-8", errors="replace")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if not text.endswith("\n"):
+        text += "\n"
+
+    log.debug("read_text_file: %s (%d bytes → %d chars normalized).", rel_posix, len(data), len(text))
+    return text
 
 
-# =============================================================================
-# Convenience: quick language census
-# =============================================================================
 def languages_present(repo: Path) -> List[Tuple[str, int]]:
     """
     Return a list of (language, file_count) pairs sorted by count desc,
-    for CODE and TEST categories.
+    considering only CODE and TEST categories.
     """
-    infos = scan_repository(repo)
+    idx = RepoScanner(Path(repo).expanduser().resolve()).scan()
     counts: dict[str, int] = {}
-    for fi in infos:
-        if fi.category in (Category.CODE, Category.TEST) and fi.language:
-            counts[fi.language] = counts.get(fi.language, 0) + 1
+    for rel in (idx.code_files + idx.test_files):
+        lang = _LANG_BY_EXT.get(Path(rel).suffix.lower())
+        if lang:
+            counts[lang] = counts.get(lang, 0) + 1
     ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
     log.info("Language census: %s", ", ".join(f"{k}:{v}" for k, v in ranked) or "<none>")
     return ranked
+
+
+# =============================================================================
+# Small helpers
+# =============================================================================
+def _stable_unique(items: Sequence[str]) -> List[str]:
+    """
+    Preserve first‑occurrence order while removing duplicates.
+    """
+    seen: set[str] = set()
+    out: List[str] = []
+    for it in items:
+        if it not in seen:
+            out.append(it)
+            seen.add(it)
+    return out
+
+
+# =============================================================================
+# __all__
+# =============================================================================
+__all__ = [
+    "Category",
+    "RepoScan",
+    "scan_repository",
+    "classify_for_iteration",
+    # back‑compat helpers
+    "classify_path",
+    "read_text_file",
+    "languages_present",
+]

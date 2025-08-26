@@ -7,27 +7,26 @@ GPT‑Review ▸ Filesystem & Git Utilities
 
 Purpose
 -------
-Provide a small, reusable toolbox for common repository operations:
-
-• Safe Git wrappers (status, switch/create branch, list tracked files).
-• Path classification:
-    - "code-like" files to process during iterations 1 & 2
-    - "deferred" files (docs/setup/install/examples) for iteration 3
-• Binary detection (heuristic + extension list).
-• Language census for prompt context.
-• Compact repository tree summaries for the model.
-• Normalized text readers (LF + trailing newline discipline is enforced by the
-  apply layer; here we only ensure CRLF/CR are normalized for prompts).
+A compact, dependency‑free toolbox for repository inspection and safe Git ops.
+These helpers are used by the orchestrator to:
+  • create/switch iteration branches,
+  • classify files into *code‑like* vs *deferred* (docs/setup/examples),
+  • detect binary files conservatively,
+  • provide language census and compact tree summaries,
+  • read text with normalized EOLs for stable prompts.
 
 Design
 ------
-Keep **pure utilities** with no side effects beyond logging. Callers pass the
-`repo: Path` root explicitly. All returned paths are absolute `Path` objects
-under *repo* unless documented otherwise.
+* No side effects beyond logging.
+* All paths returned to callers are absolute `Path` objects under *repo*.
+* We prefer `git ls-files` when available for reproducibility; otherwise we
+  walk the filesystem with sane ignores.
+* Binary detection is conservative: known binary extensions, NUL‑byte sniff,
+  and UTF‑8 decode fallback.
 
 Logging
 -------
-Use the project logger so message formatting and handlers remain consistent.
+Uses the project logger so formatters/handlers are consistent everywhere.
 """
 from __future__ import annotations
 
@@ -70,8 +69,9 @@ def git(repo: Path, *args: str, capture: bool = False, check: bool = True) -> st
         ["git", "-C", str(repo), *args],
         text=True,
         capture_output=capture,
-        check=check,
     )
+    if check and res.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed: {res.stderr.strip()}")
     return (res.stdout or "") if capture else ""
 
 
@@ -94,7 +94,7 @@ def ensure_clean_worktree(repo: Path) -> None:
     if status.strip():
         log.error("Dirty working tree:\n%s", status)
         raise RuntimeError(
-            "Working tree has uncommitted changes. Commit/stash before running GPT‑Review orchestrations."
+            "Working tree has uncommitted changes. Commit/stash before running GPT‑Review."
         )
 
 
@@ -134,41 +134,39 @@ def list_tracked_files(repo: Path) -> List[Path]:
 # =============================================================================
 
 # Documentation & meta
-_DOC_PATTERNS = (
+_DOC_PATTERNS: Sequence[str] = (
     r"(^|/)(README|CHANGELOG|CONTRIBUTING|SECURITY|CODE_OF_CONDUCT)\.(md|rst|txt)$",
     r"(^|/)docs/.*",
     r"(^|/)\.github/workflows/.*\.ya?ml$",
 )
 
 # Installation / packaging / setup
-_INSTALL_SETUP_PATTERNS = (
+_INSTALL_SETUP_PATTERNS: Sequence[str] = (
     r"(^|/)setup\.py$",
     r"(^|/)pyproject\.toml$",
     r"(^|/)(install|update|cookie_login|software_review)\.sh$",
     r"(^|/)Dockerfile$",
+    r"(^|/)(Makefile|requirements\.txt|Pipfile(\.lock)?|poetry\.lock)$",
 )
 
 # Examples
-_EXAMPLE_PATTERNS = (
+_EXAMPLE_PATTERNS: Sequence[str] = (
     r"(^|/)examples?/.*",
     r"(^|/)example_.*",
+    r"(^|/)(samples?|sample_.*)",
 )
 
 # Common binary extensions — a heuristic; we still inspect bytes for \x00
-_BINARY_EXTS = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".bmp",
-    ".ico",
+_BINARY_EXTS: set[str] = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".avif",
     ".pdf",
-    ".zip",
-    ".gz",
-    ".tgz",
-    ".xz",
-    ".tar",
-    ".svg",  # often text, but treat conservatively in automation
+    ".zip", ".gz", ".tgz", ".xz", ".tar", ".7z", ".rar", ".bz2", ".zst",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".mp3", ".aac", ".flac", ".wav",
+    ".mp4", ".mov", ".avi", ".mkv", ".webm",
+    ".bin", ".exe", ".dll", ".dylib", ".so", ".class",
+    # Often text, but we treat conservatively in automation:
+    ".svg",
 }
 
 
@@ -180,9 +178,9 @@ def matches_any(patterns: Sequence[str], rel_posix_path: str) -> bool:
 def is_binary_file(p: Path) -> bool:
     """
     Heuristic binary detection:
-    • Known extensions → binary
-    • Contains NUL byte → binary
-    • Fails utf‑8 decode → binary
+      • Known extensions → binary
+      • Contains NUL byte → binary
+      • Fails utf‑8 decode → binary
     """
     try:
         if p.suffix.lower() in _BINARY_EXTS:
@@ -242,15 +240,21 @@ def classify_paths(repo: Path) -> Tuple[List[Path], List[Path]]:
 
 _LANG_BY_EXT: Dict[str, str] = {
     ".py": "python",
+    ".pyi": "python",
     ".sh": "shell",
     ".md": "markdown",
     ".yml": "yaml",
     ".yaml": "yaml",
     ".json": "json",
     ".toml": "toml",
+    ".ini": "ini",
+    ".cfg": "ini",
     ".js": "javascript",
+    ".jsx": "javascript",
     ".ts": "typescript",
+    ".tsx": "typescript",
     ".java": "java",
+    ".kt": "kotlin",
     ".go": "go",
     ".rb": "ruby",
     ".rs": "rust",
@@ -259,6 +263,10 @@ _LANG_BY_EXT: Dict[str, str] = {
     ".cc": "cpp",
     ".c": "c",
     ".h": "c-header",
+    ".hpp": "cpp-header",
+    ".html": "html",
+    ".css": "css",
+    ".scss": "scss",
 }
 
 
@@ -306,7 +314,7 @@ def read_text_normalized(p: Path) -> str:
     """
     Read a text file as UTF‑8 and normalize end‑of‑line to LF.
 
-    The `apply_patch` layer ensures a trailing newline and permission handling;
+    The patch‑apply layer ensures a trailing newline and permission handling;
     here we only normalize CRLF/CR so prompts stay stable across platforms.
     """
     txt = p.read_text(encoding="utf-8")

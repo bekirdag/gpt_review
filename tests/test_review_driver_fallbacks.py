@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 ===============================================================================
 Unit tests ▸ review.py driver fallbacks & apply-failure reporting
@@ -17,11 +19,9 @@ These tests are **pure unit tests**:
 - They DO NOT launch a real browser.
 - selenium.webdriver.Chrome is monkeypatched with a FakeChrome stub.
 - webdriver_manager install is forced to raise where needed.
-
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -84,14 +84,17 @@ def test_chromedriver_env_precedence(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     monkeypatch.setenv("GPT_REVIEW_PROFILE", str(tmp_path / ".profile"))
 
     # Ensure webdriver-manager is NOT called if CHROMEDRIVER is honored
-    monkeypatch.setattr(review.ChromeDriverManager, "install", _boom, raising=False)
+    monkeypatch.setattr(review, "ChromeDriverManager", type("WDM", (), {"install": _boom})(), raising=False)
 
     # Replace real Chrome with our stub
     FakeChrome.calls = []
-    monkeypatch.setattr(review.webdriver, "Chrome", FakeChrome)
+    # Ensure a webdriver namespace exists even if review imported differently
+    if not hasattr(review, "webdriver"):
+        monkeypatch.setattr(review, "webdriver", type("WD", (), {})(), raising=False)
+    monkeypatch.setattr(review.webdriver, "Chrome", FakeChrome, raising=False)
 
     # Optional: keep binary detection simple/fast
-    monkeypatch.setattr(review, "_detect_browser_binary", lambda: "/usr/bin/chromium")
+    monkeypatch.setattr(review, "_detect_browser_binary", lambda: "/usr/bin/chromium", raising=False)
 
     # Act
     drv = review._chrome_driver()  # should return a FakeChrome
@@ -117,17 +120,21 @@ def test_fallback_to_selenium_manager_when_wdm_fails(
     monkeypatch.setenv("GPT_REVIEW_PROFILE", str(tmp_path / ".profile"))
 
     # Force webdriver-manager to raise
+    def _raise(*_a, **_k):
+        raise RuntimeError("offline")
+
     monkeypatch.setattr(
-        review.ChromeDriverManager, "install", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")),
-        raising=False,
+        review, "ChromeDriverManager", type("WDM", (), {"install": _raise})(), raising=False
     )
 
     # Replace real Chrome with our stub
     FakeChrome.calls = []
-    monkeypatch.setattr(review.webdriver, "Chrome", FakeChrome)
+    if not hasattr(review, "webdriver"):
+        monkeypatch.setattr(review, "webdriver", type("WD", (), {})(), raising=False)
+    monkeypatch.setattr(review.webdriver, "Chrome", FakeChrome, raising=False)
 
     # Optional: stable chrome type (not required)
-    monkeypatch.setattr(review, "_detect_browser_binary", lambda: "/usr/bin/chromium")
+    monkeypatch.setattr(review, "_detect_browser_binary", lambda: "/usr/bin/chromium", raising=False)
 
     # Act
     drv = review._chrome_driver()
@@ -139,7 +146,9 @@ def test_fallback_to_selenium_manager_when_wdm_fails(
     assert "service" not in kwargs, "Fallback should not pass Service when wdm fails"
 
 
-def test_send_apply_error_includes_patch_json_and_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def test_send_apply_error_includes_patch_json_and_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
     """
     _send_apply_error should format a report that includes:
     - The raw patch JSON we attempted to apply
@@ -160,7 +169,7 @@ def test_send_apply_error_includes_patch_json_and_output(monkeypatch: pytest.Mon
         )
 
     # Spy the chunk sender to avoid network/browser interactions
-    monkeypatch.setattr(review, "_send_error_chunks", spy_send_error_chunks)
+    monkeypatch.setattr(review, "_send_error_chunks", spy_send_error_chunks, raising=False)
 
     patch = {"op": "create", "file": "foo.txt", "body": "hi", "status": "in_progress"}
 

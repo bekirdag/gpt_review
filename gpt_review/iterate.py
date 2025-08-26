@@ -8,7 +8,7 @@ GPT‑Review ▸ Iteration Runner (console wrapper)
 Purpose
 -------
 A small, dependency‑light wrapper that forwards execution to the
-`gpt_review.orchestrator` CLI.  Keeping this shim separate allows us to expose
+`gpt_review.orchestrator` CLI. Keeping this shim separate allows us to expose
 a dedicated console script (e.g. `gpt-review-iterate`) without coupling it to
 the legacy `gpt-review` / `python -m gpt_review` entrypoints that drive the
 classic patch‑loop.

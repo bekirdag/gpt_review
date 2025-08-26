@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 ===============================================================================
 Normalization & chmod behavior tests for apply_patch
@@ -14,7 +16,7 @@ import logging
 import subprocess
 from pathlib import Path
 
-from apply_patch import apply_patch
+from apply_patch import apply_patch  # function entrypoint: apply_patch(patch_json: str, repo: str)
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")

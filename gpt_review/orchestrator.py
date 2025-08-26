@@ -5,45 +5,49 @@
 GPT‑Review ▸ Iteration Orchestrator
 ===============================================================================
 
-Implements the multi‑iteration review workflow:
+Overview
+--------
+Implements the three‑iteration, plan‑first review workflow:
 
-  0) Discover repository structure and classify files (code‑like vs deferred).
+  0) **Plan‑first** (before touching code):
+        • Ask the model for an initial *review plan* (description + run/test
+          commands + hints) based on the repository snapshot and instructions.
+        • Persist it under `.gpt-review/initial_plan.json` and
+          `INITIAL_REVIEW_PLAN.md` to guide the upcoming iterations.
+
   1) **Iteration 1** (branch "iteration1"):
-        • For each code‑like **text** file, ask the model for a *complete file*
-          replacement (or KEEP/DELETE) via a function call.
-        • Apply each returned file as an atomic commit (one file → one commit).
-        • Ask the model for any *new source files* that should exist now; create
-          them one by one (full contents).
+        • For each *code‑like text* file, request a **COMPLETE file** replacement
+          (or KEEP/DELETE) via a forced tool call; apply via `apply_patch.py`.
+        • **Commit after every file** to keep a readable history.
+        • After all files, ask the model for **new source files** (strict JSON
+          list); create them one‑by‑one (full file bodies); **commit each**.
+
   2) **Iteration 2** (branch "iteration2"):
-        • Repeat file‑wise review over code‑like files (including new ones).
-        • Ask again for additional *new files* if necessary.
+        • Repeat file‑wise review over *code‑like* files, including newly created.
+        • Ask again for additional **new source files** and create them **one by one**,
+          committing each created file.
+
   3) **Iteration 3** (branch "iteration3"):
-        • Consistency pass over *all* files (code + deferred bucket).
-        • After code consistency, generate **review artifacts**:
-            - machine‑readable plan: .gpt-review/review_plan.json
-            - human guide: REVIEW_GUIDE.md
-        • Finally review/generate docs/setup/examples (deferred bucket).
+        • Consistency pass over **all files** (code + deferred bucket).
+        • Generate final **plan artifacts**:
+            - machine‑readable: `.gpt-review/review_plan.json`
+            - human guide     : `REVIEW_GUIDE.md`
+          (both are committed).
+        • Review/generate **deferred** files now (docs/setup/examples) — commit each.
+
   4) **Error‑fix loop**:
-        • Run commands from the plan (or CLI fallback), collect errors.
-        • Send errors to the model; apply complete‑file fixes it returns.
+        • Execute the plan’s commands (run/test). On failure, send logs to the
+          model and apply returned **COMPLETE file** fixes; **commit each**.
         • Repeat until commands pass or max rounds reached.
-  5) Push the final branch.
 
-Model I/O
----------
-We force tool calls so the model returns structured JSON we can trust:
+  5) **Push** the final branch.
 
-  • propose_full_file(path, action, content?)
-  • propose_new_files(new_files=[{path, content}, ...])
-  • propose_review_plan(run_commands[], test_commands[], description, hints[])
-  • propose_error_fixes(edits=[{path, action, content?}, ...], rationale)
-
-Important guardrails:
-  • We **never** ask for docs/setup/examples until iteration 3 (deferred).
-  • We skip binary files.
-  • We validate/normalize paths and only touch files *inside* the repo.
-  • We commit one file per change to preserve a readable history.
-  • We treat **content as the full file**, not diffs.
+Strictness
+----------
+• The model must always return **complete files** (never diffs).
+• Docs/install/setup/examples are **deferred** until iteration 3.
+• All actions use repo‑root‑relative paths.
+• We commit **one file per change** to preserve a readable history.
 
 Logging
 -------
@@ -80,6 +84,7 @@ from gpt_review.fs_utils import (
     language_census,
     read_text_normalized,
     summarize_repo,
+    git,  # reuse git helper for precise, path-scoped commits
 )
 
 log = get_logger(__name__)
@@ -101,7 +106,7 @@ MAX_ERROR_ROUNDS = int(os.getenv("GPT_REVIEW_MAX_ERROR_ROUNDS", "6"))
 HEAD_TAIL_BYTES = int(os.getenv("GPT_REVIEW_HEAD_TAIL_BYTES", "60000"))
 
 # =============================================================================
-# Small OpenAI client shim (local to avoid cross‑module tight coupling)
+# Small OpenAI client shim (local; avoids cross‑module tight coupling)
 # =============================================================================
 
 
@@ -109,7 +114,7 @@ def _ensure_openai_client(api_timeout: int):
     """
     Return an OpenAI client instance. Raises on missing key.
 
-    The client type matches the official `openai>=1.0.0` SDK.
+    Type matches the official `openai>=1.0.0` SDK.
     """
     if not OPENAI_API_KEY:
         raise RuntimeError(
@@ -130,6 +135,9 @@ def _ensure_openai_client(api_timeout: int):
 
 
 def tool_propose_full_file() -> Dict[str, Any]:
+    """
+    File‑wise tool: requires COMPLETE file bodies for create/update.
+    """
     return {
         "type": "function",
         "function": {
@@ -158,6 +166,9 @@ def tool_propose_full_file() -> Dict[str, Any]:
 
 
 def tool_propose_new_files() -> Dict[str, Any]:
+    """
+    Discovery tool for **source** files only (docs/setup/examples excluded).
+    """
     return {
         "type": "function",
         "function": {
@@ -191,6 +202,9 @@ def tool_propose_new_files() -> Dict[str, Any]:
 
 
 def tool_propose_review_plan() -> Dict[str, Any]:
+    """
+    Planning tool (used at start and end).
+    """
     return {
         "type": "function",
         "function": {
@@ -215,6 +229,9 @@ def tool_propose_review_plan() -> Dict[str, Any]:
 
 
 def tool_propose_error_fixes() -> Dict[str, Any]:
+    """
+    Error‑fix tool: return **complete file** replacements for impacted files.
+    """
     return {
         "type": "function",
         "function": {
@@ -250,7 +267,7 @@ def tool_propose_error_fixes() -> Dict[str, Any]:
 
 
 # =============================================================================
-# Low‑level helpers: apply_patch, git, run commands
+# Utilities
 # =============================================================================
 
 @dataclass
@@ -286,11 +303,30 @@ def _apply_patch(repo: Path, patch: Dict[str, Any]) -> ApplyResult:
         return ApplyResult(ok=False, exit_code=1, stdout="", stderr=str(exc))
 
 
+def _commit(repo: Path, message: str, paths: Sequence[str]) -> None:
+    """
+    Stage only *paths* and commit with *message*. Keeps staging path‑scoped.
+    """
+    if not paths:
+        return
+    try:
+        git(repo, "add", "--", *paths, check=True)
+        git(repo, "commit", "-m", message, check=True)
+        log.info("Committed %s", ", ".join(paths))
+    except Exception as exc:
+        # Make failure explicit; avoid silent divergence between FS and history.
+        log.exception("Git commit failed: %s", exc)
+        raise
+
+
 def _apply_full_file(repo: Path, rel_path: str, action: str, content: Optional[str]) -> ApplyResult:
     """
     Convert a full‑file proposal into a schema‑compatible patch and apply it.
 
     action ∈ {"create","update","keep","delete"}
+
+    Side effect:
+      • Commits on success (one file per change), except for keep.
     """
     if action == "keep":
         log.debug("No‑op KEEP for %s", rel_path)
@@ -316,8 +352,15 @@ def _apply_full_file(repo: Path, rel_path: str, action: str, content: Optional[s
             res.stdout,
             res.stderr,
         )
-    else:
-        log.info("Applied: %-6s %s", action, rel_path)
+        return res
+
+    log.info("Applied: %-6s %s", action, rel_path)
+    # Commit on success (one file per change)
+    try:
+        _commit(repo, f"orchestrator: {action} {rel_path}", [rel_path])
+    except Exception:
+        # Surface commit failures as non‑fatal here; caller may choose to stop later.
+        pass
     return res
 
 
@@ -335,13 +378,17 @@ def _run_cmd(cmd: str, cwd: Path, timeout: int) -> Tuple[bool, str, int]:
         return False, banner + out, 124
 
 
+def _tail(text: str, n: int = 20000) -> str:
+    return text if len(text) <= n else text[-n:]
+
+
 # =============================================================================
 # Prompt builders
 # =============================================================================
 
 def _system_prompt(iteration: int, deferred_hint: bool) -> str:
     """
-    Keep the system prompt compact; enforce *full‑file* outputs and chunking rules.
+    Compact system prompt; enforces *full‑file* outputs and deferral rules.
     """
     defer_msg = (
         "Do NOT modify documentation/installation/setup/example files in this pass; "
@@ -351,7 +398,8 @@ def _system_prompt(iteration: int, deferred_hint: bool) -> str:
     )
     return (
         "You are GPT‑Review operating in **chunk‑by‑chunk** mode. "
-        "For each request, you MUST respond **only** by calling the provided function, "
+        "We will first establish a plan, then fix files **one by one**. "
+        "For each request, you MUST respond only by calling the provided function, "
         "returning a **COMPLETE file** (no diffs) or declaring KEEP/DELETE. "
         f"{defer_msg} Keep changes minimal and precise."
     )
@@ -409,15 +457,20 @@ def _new_files_prompt(*, instructions: str, repo_summary: str, iteration: int) -
     ).strip()
 
 
-def _plan_prompt(*, instructions: str, repo_summary: str) -> str:
+def _plan_prompt(*, instructions: str, repo_summary: str, phase: str) -> str:
+    """
+    'phase' is 'initial' (before edits) or 'final' (after consistency pass).
+    """
+    preface = (
+        "Before we start editing files, produce an initial execution plan with "
+        "**actionable commands** to run the software and (optionally) tests on a clean machine."
+        if phase == "initial"
+        else "We have completed the third iteration of code review. Produce a concise execution plan with "
+             "**actionable commands** to run the software and its tests."
+    )
     return textwrap.dedent(
         f"""
-        We finished the third iteration of code review.
-
-        Using the project's instructions (below) and the current repository layout,
-        produce a concise execution plan with **actionable commands** to run the
-        software and its tests on a clean machine. Include a one‑paragraph
-        description and a few human hints.
+        {preface}
 
         Return ONLY a function call `propose_review_plan` with:
           - run_commands: list[str]  (required)
@@ -528,7 +581,7 @@ def _excerpt_for_prompt(p: Path) -> str:
 
 
 # =============================================================================
-# Core orchestration
+# Core orchestration helpers
 # =============================================================================
 
 def _apply_new_files(repo: Path, new_files: List[Dict[str, Any]]) -> None:
@@ -558,7 +611,7 @@ def _review_files_in_bucket(
     deferred_hint: bool,
 ) -> None:
     """
-    Review each file in *files*; apply changes via `apply_patch.py`.
+    Review each file in *files*; apply changes via `apply_patch.py` and commit them.
     """
     repo_summary = summarize_repo(repo)
     census = language_census(files)
@@ -597,7 +650,7 @@ def _review_files_in_bucket(
             log.exception("Model call failed for %s: %s", rel, exc)
             continue
 
-        # Record assistant message + tool call to keep minimal continuity
+        # Record the assistant tool-call message before sending the tool result
         messages.append(
             {
                 "role": "assistant",
@@ -650,7 +703,7 @@ def _discover_new_files(
     ]
 
     try:
-        args, call_id = _call_tool_only(
+        args, _ = _call_tool_only(
             client,
             model=model,
             api_timeout=api_timeout,
@@ -670,8 +723,9 @@ def _discover_new_files(
     _apply_new_files(repo, new_files)
 
 
-def _generate_review_artifacts(
+def _generate_plan_artifacts(
     *,
+    phase: str,  # "initial" or "final"
     client,
     model: str,
     api_timeout: int,
@@ -679,18 +733,21 @@ def _generate_review_artifacts(
     instructions: str,
 ) -> Tuple[List[str], List[str]]:
     """
-    Create `.gpt-review/review_plan.json` and `REVIEW_GUIDE.md`.
+    Create plan artifacts for a given *phase*.
 
-    Returns (run_commands, test_commands).
+    Returns (run_commands, test_commands). When 'initial', artifacts are:
+        .gpt-review/initial_plan.json, INITIAL_REVIEW_PLAN.md
+    When 'final', artifacts are:
+        .gpt-review/review_plan.json, REVIEW_GUIDE.md
     """
     repo_summary = summarize_repo(repo)
-    system_msg = {"role": "system", "content": _system_prompt(iteration=3, deferred_hint=False)}
+    system_msg = {"role": "system", "content": _system_prompt(iteration=1 if phase == "initial" else 3, deferred_hint=False)}
     messages: List[Dict[str, Any]] = [
         system_msg,
-        {"role": "user", "content": _plan_prompt(instructions=instructions, repo_summary=repo_summary)},
+        {"role": "user", "content": _plan_prompt(instructions=instructions, repo_summary=repo_summary, phase=phase)},
     ]
 
-    args, call_id = _call_tool_only(
+    args, _ = _call_tool_only(
         client,
         model=model,
         api_timeout=api_timeout,
@@ -703,10 +760,22 @@ def _generate_review_artifacts(
     test_cmds = [c for c in (args.get("test_commands") or []) if isinstance(c, str) and c.strip()]
     hints = [h for h in (args.get("hints") or []) if isinstance(h, str) and h.strip()]
 
-    plan_path = ".gpt-review/review_plan.json"
-    guide_path = "REVIEW_GUIDE.md"
+    # Ensure the dot‑dir exists by creating a harmless .keep via apply_patch
+    res_keep = _apply_full_file(repo, ".gpt-review/.keep", "create", "")
+    if not res_keep.ok:
+        raise RuntimeError("Failed to create .gpt-review/.keep")
+
+    if phase == "initial":
+        plan_path = ".gpt-review/initial_plan.json"
+        guide_path = "INITIAL_REVIEW_PLAN.md"
+        heading = "# Initial Review Plan"
+    else:
+        plan_path = ".gpt-review/review_plan.json"
+        guide_path = "REVIEW_GUIDE.md"
+        heading = "# Review Guide"
 
     plan_json = {
+        "phase": phase,
         "description": description,
         "run_commands": run_cmds,
         "test_commands": test_cmds,
@@ -715,7 +784,7 @@ def _generate_review_artifacts(
     }
     guide_md = textwrap.dedent(
         f"""
-        # Review Guide
+        {heading}
 
         {description.strip() or "_(no description returned)_"}
 
@@ -730,16 +799,13 @@ def _generate_review_artifacts(
         """
     ).strip() + "\n"
 
-    # Ensure the dot‑dir exists by creating a harmless .keep via apply_patch
-    _apply_full_file(repo, ".gpt-review/.keep", "create", "")
-
     res1 = _apply_full_file(
         repo, plan_path, "create", json.dumps(plan_json, indent=2, ensure_ascii=False) + "\n"
     )
     res2 = _apply_full_file(repo, guide_path, "create", guide_md)
 
     if not (res1.ok and res2.ok):
-        raise RuntimeError("Failed to create review artifacts")
+        raise RuntimeError(f"Failed to create {phase} plan artifacts")
 
     return run_cmds, test_cmds
 
@@ -804,7 +870,7 @@ def _run_error_fix_loop(
             system_msg,
             {"role": "user", "content": _error_fix_prompt(combined_errors=combined, last_commands=commands)},
         ]
-        args, call_id = _call_tool_only(
+        args, _ = _call_tool_only(
             client,
             model=model,
             api_timeout=api_timeout,
@@ -878,12 +944,12 @@ def run_iterations(
     max_error_rounds: int,
 ) -> None:
     """
-    High‑level orchestration entrypoint.
+    High‑level orchestration entrypoint (plan‑first + 3 iterations + error fix).
     """
     client = _ensure_openai_client(api_timeout)
     instr = instructions_path.read_text(encoding="utf-8").strip()
 
-    # Initial classification
+    # Initial classification (for logging only)
     code_like, deferred = classify_paths(repo)
     log.info("Initial classification → code: %d, deferred: %d", len(code_like), len(deferred))
 
@@ -893,6 +959,20 @@ def run_iterations(
     # ── Iteration 1 ──────────────────────────────────────────────────────────
     b1 = _iteration_branch_name(1)
     checkout_branch(repo, b1)
+
+    # Plan‑first artifacts (initial) — guides the upcoming edits
+    try:
+        _generate_plan_artifacts(
+            phase="initial",
+            client=client,
+            model=model,
+            api_timeout=api_timeout,
+            repo=repo,
+            instructions=instr,
+        )
+    except Exception as exc:
+        log.warning("Initial plan artifacts step failed: %s (continuing).", exc)
+
     code_like, _ = classify_paths(repo)
     _review_files_in_bucket(
         client=client,
@@ -946,9 +1026,14 @@ def run_iterations(
         deferred_hint=False,
     )
 
-    # Generate plan artifacts
-    run_cmds, test_cmds = _generate_review_artifacts(
-        client=client, model=model, api_timeout=api_timeout, repo=repo, instructions=instr
+    # Final plan artifacts (after consistency)
+    run_cmds, test_cmds = _generate_plan_artifacts(
+        phase="final",
+        client=client,
+        model=model,
+        api_timeout=api_timeout,
+        repo=repo,
+        instructions=instr,
     )
 
     # Now explicitly (re)visit deferred files (docs/setup/examples) — they may be

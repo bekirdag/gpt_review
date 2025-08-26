@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 ===============================================================================
 GPT‑Review ▸ Unified Logging Facility (packaged)
@@ -11,7 +12,7 @@ project.  Other modules should obtain loggers via:
 
     from gpt_review.logger import get_logger
 
-A thin compatibility shim lives at the repository root `logger.py` so legacy
+A thin compatibility shim can live at the repository root `logger.py` so legacy
 imports (`from logger import get_logger`) continue to work without duplication.
 
 Key features
@@ -127,15 +128,22 @@ def _ensure_log_dir(preferred: Path) -> Path:
         # 3) Final fallback handled by get_logger (console‑only)
         return Path(".")
 
-
-def _make_file_handler(log_dir: Path, log_name: str) -> Optional[TimedRotatingFileHandler]:
+def _root_log_filename(base_dir: Path) -> Path:
     """
-    Create a rotating file handler for *log_name* inside *log_dir*.
+    Use a single rotating file for the package ('gpt_review.log') so
+    sub‑loggers don't create many separate files.
+    """
+    return base_dir / "gpt_review.log"
+
+
+def _make_file_handler(log_dir: Path) -> Optional[TimedRotatingFileHandler]:
+    """
+    Create a rotating file handler inside *log_dir*.
 
     Returns None if the file handler cannot be created (permissions, etc.).
     """
     try:
-        file_path = log_dir / f"{log_name}.log"
+        file_path = _root_log_filename(log_dir)
         fh = TimedRotatingFileHandler(
             filename=file_path,
             when=ROTATE_WHEN,
@@ -192,8 +200,8 @@ def get_logger(name: str | None = None) -> logging.Logger:
     preferred_dir = Path(_LOG_DIR_ENV)
     log_dir = _ensure_log_dir(preferred_dir)
 
-    # File handler (if possible)
-    fh = _make_file_handler(log_dir, log_name)
+    # File handler (if possible) – single shared file for the package
+    fh = _make_file_handler(log_dir)
     if fh is not None:
         logger.addHandler(fh)
 

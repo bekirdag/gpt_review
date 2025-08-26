@@ -13,14 +13,14 @@ support the multi‑iteration workflow:
   • Iteration 1 & 2 → operate on *code* (and tests) only
   • Iteration 3      → include docs (.md/.rst), install/setup, and examples
 
-This module never mutates the repo; it only inspects it.  Writing happens
+This module never mutates the repo; it only inspects it. Writing happens
 through the existing patch applier (apply_patch.py) to preserve invariants
 like **path‑scoped staging**, normalization, and safety checks.
 
 Key features
 ------------
 * Fast recursive walk with ignore patterns (e.g., .git/, venv/, node_modules/)
-* Robust binary sniff (null‑byte / control‑density heuristic)
+* Robust binary sniff (NUL‑byte / control‑density heuristic)
 * Reproducible, stable ordering (POSIX‑style paths, lexicographic sort)
 * Clear classification buckets:
     - code_files
@@ -94,9 +94,7 @@ _SETUP_BASENAMES: Set[str] = {
 _SETUP_DIR_HINTS: Set[str] = {".github/workflows", ".github/actions", "ci", ".ci"}
 
 # Example assets & prompts
-_EXAMPLE_HINTS: Set[str] = {
-    "examples", "example", "sample", "samples",
-}
+_EXAMPLE_HINTS: Set[str] = {"examples", "example", "sample", "samples"}
 _EXAMPLE_BASENAMES: Set[str] = {"example_instructions.txt"}
 
 # Tests
@@ -107,7 +105,7 @@ _TEST_FILE_PATTERNS: Set[str] = {"test_*.py", "*_test.py", "*.spec.js", "*.spec.
 _TEXT_CODE_EXTS: Set[str] = {
     # Languages
     ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
-    ".ts", ".tsx", ".go", ".rb", ".rs", ".c", ".cc", ".cpp", ".h", ".hpp",
+    ".go", ".rb", ".rs", ".c", ".cc", ".cpp", ".h", ".hpp",
     ".java", ".kt", ".kts", ".scala", ".swift", ".php", ".pl", ".cs",
     # Shell / scripting
     ".sh", ".bash", ".zsh", ".ps1", ".cmd", ".bat",
@@ -177,10 +175,7 @@ class RepoScanner:
             Collected, sorted file lists by category.
         """
         log.info("Scanning repository: %s", self.root)
-        files: List[Path] = []
-
-        for p in self._iter_files(self.root):
-            files.append(p)
+        files: List[Path] = [p for p in self._iter_files(self.root)]
 
         files_rel = [self._relposix(p) for p in files]
         files_rel.sort()
@@ -323,8 +318,7 @@ class RepoScanner:
             # Skip directories
             if p.is_dir():
                 if self._is_ignored_dir(p):
-                    # Prune: skip walking into ignored directories
-                    # rglob can't be pruned directly; we filter by path prefix.
+                    # We can't prune rglob traversal, but we will skip members later.
                     pass
                 continue
             # Skip non-regular files (symlinks etc. are allowed if they resolve to files)
@@ -362,7 +356,7 @@ class RepoScanner:
         """
         Preserve first occurrence order while removing duplicates.
         """
-        seen = set()
+        seen: set[str] = set()
         out: List[str] = []
         for it in items:
             if it not in seen:

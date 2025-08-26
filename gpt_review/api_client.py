@@ -2,40 +2,60 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
-GPT‑Review ▸ OpenAI API Client Wrapper
+GPT‑Review ▸ OpenAI API Client Wrapper (Strict Tools + Plan‑First Support)
 ===============================================================================
 
 Purpose
 -------
 A small, dependency‑light wrapper around the OpenAI Chat Completions API that
-our orchestrator can use to:
+the orchestrator (or other drivers) can use to:
+
   • keep a short rolling history (token‑aware),
-  • force a structured **tool call** (`submit_patch`) that returns a *full file*
-    patch compatible with our canonical schema (gpt_review/schema.json),
-  • request strict **JSON arrays** (no prose; robust parsing).
+  • force a structured **tool call** returning a *complete file* patch that
+    matches our canonical JSON schema (gpt_review/schema.json),
+  • request strict **JSON arrays** (no prose),
+  • explicitly support a **plan‑first** step (description + run/test commands),
+  • drive **error‑fix** edits using complete file replacements.
 
 Design notes
 ------------
-• We prefer *tools* for patches (same fields as schema.json). This keeps a
+• We prefer *tools* for file edits (same shape as schema.json). This keeps a
   single contract across API and browser modes.
-• For lists (e.g., “new files to create”), we ask for a raw **JSON array**.
-  We still defensively parse: first try `json.loads()`, then attempt to find
-  the first balanced array substring if there is accidental prose.
-• Context is pruned to keep cost down; the orchestrator can call `.note(...)`
-  to add a one‑time overview message before iteration 1.
+• For lists (e.g., “new files to create”), we ask for a raw **JSON array** and
+  parse defensively: try JSON first, then a crude first‑[`[ .. ]`] extraction.
+• Context pruning keeps cost down; callers can add an overview message via
+  `.note(...)` before iteration 1.
 
 Environment
 -----------
-OPENAI_API_KEY    – required
-OPENAI_BASE_URL   – optional (a compatible gateway/base)
-GPT_REVIEW_CTX_TURNS – max assistant/tool “turn pairs” to retain (default 6)
+OPENAI_API_KEY           – required
+OPENAI_BASE_URL|API_BASE – optional (OpenAI‑compatible base)
+GPT_REVIEW_CTX_TURNS     – max assistant/tool “turn pairs” to retain (default 6)
+
+Compatibility
+-------------
+This module preserves the legacy helper functions:
+
+    strict_json_array(client, prompt) -> list[dict]
+    submit_patch_call(client, prompt, *, rel_path, expected_kind="update") -> dict
+
+and an object interface:
+
+    OpenAIClient(...).ask_json_array(...)
+    OpenAIClient(...).call_submit_patch(...)
+    OpenAIClient(...).call_propose_review_plan(...)
+    OpenAIClient(...).call_propose_error_fixes(...)
+
+Logging
+-------
+INFO for high‑level flow; DEBUG for detailed diagnostics.
 """
 from __future__ import annotations
 
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from gpt_review import get_logger
 
@@ -50,14 +70,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tool schema – mirrors gpt_review/schema.json (kept in sync manually)
+# Tool schemas (kept consistent with gpt_review/schema.json & api_driver.py)
 # ─────────────────────────────────────────────────────────────────────────────
 def _submit_patch_tool() -> Dict[str, Any]:
     """
     OpenAI tool/function schema for `submit_patch`.
 
-    We accept 3-/4-digit octal for chmod modes, and we constrain operation enums
-    and status enums to match the canonical JSON‑Schema.
+    Enforces complete file bodies for create/update, supports delete/rename/chmod,
+    and constrains enums to match the canonical JSON‑Schema.
     """
     return {
         "type": "function",
@@ -96,20 +116,87 @@ def _submit_patch_tool() -> Dict[str, Any]:
     }
 
 
+def _propose_review_plan_tool() -> Dict[str, Any]:
+    """
+    Tool for the plan‑first step: how to run/test + short description and hints.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": "propose_review_plan",
+            "description": (
+                "Summarize how to run/test this repository on a clean machine. "
+                "Return actionable commands and a short description."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string"},
+                    "run_commands": {"type": "array", "items": {"type": "string"}},
+                    "test_commands": {"type": "array", "items": {"type": "string"}},
+                    "hints": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["description", "run_commands"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _propose_error_fixes_tool() -> Dict[str, Any]:
+    """
+    Tool for error‑fix rounds: return complete file replacements for impacted files.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": "propose_error_fixes",
+            "description": (
+                "Given error logs from running the software, return COMPLETE file replacements "
+                "for affected files (create/update/delete)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["path", "action"],
+                            "additionalProperties": False,
+                            "properties": {
+                                "path": {"type": "string"},
+                                "action": {"type": "string", "enum": ["create", "update", "delete"]},
+                                "content": {"type": "string"},
+                                "notes": {"type": "string"},
+                            },
+                        },
+                    },
+                    "rationale": {"type": "string"},
+                },
+                "required": ["edits"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# System prompt
+# System prompt (compact & directive)
 # ─────────────────────────────────────────────────────────────────────────────
 def _system_prompt() -> str:
     """
-    Minimal, directive system message to keep tokens down. Detailed iteration
-    framing lives in higher‑level prompts (gpt_review.prompts).
+    Minimal, directive system message to keep tokens down. Iteration‑level
+    framing (e.g., deferral rules) is handled by the orchestrator prompts.
     """
     return (
-        "You are GPT‑Review. Respond **only** by calling the function "
-        "`submit_patch` when asked to modify a file, returning a **complete file** "
-        "for create/update operations. When asked for lists, reply with a strict "
-        "JSON array only (no prose, no code fences). Keep changes minimal and "
-        "self‑contained; use status='in_progress' until the last patch, then 'completed'."
+        "You are GPT‑Review. For file changes, respond **only** by calling the tool "
+        "`submit_patch` and return a **complete file** for create/update operations. "
+        "For lists, reply with a strict JSON array only (no prose, no code fences). "
+        "For planning, call `propose_review_plan` with concise, actionable commands. "
+        "For runtime errors, call `propose_error_fixes` with COMPLETE file replacements. "
+        "Keep changes minimal and self‑contained; use status='in_progress' until the last patch, "
+        "then 'completed'."
     )
 
 
@@ -119,8 +206,7 @@ def _system_prompt() -> str:
 def _prune_messages(msgs: List[Dict[str, Any]], max_turn_pairs: int) -> List[Dict[str, Any]]:
     """
     Keep system + initial user notes, plus the last *approximate* set of
-    assistant/tool pairs. This is an approximation that works well enough for
-    bounded conversations in this tool.
+    assistant/tool pairs. This is an approximation that works well for our bounded flows.
     """
     if len(msgs) <= 2:
         return msgs
@@ -143,11 +229,10 @@ def _extract_json_array(text: str) -> List[Any]:
     Best‑effort extraction of a JSON array from *text*.
 
     Strategy:
-    1) If the entire content parses to a list → return it.
-    2) Otherwise, scan for the **first** '[' and the **last** ']' and try to
-       parse that slice. This catches common cases where the model added stray
-       prose (despite the strict prompt).
-    3) On failure, raise ValueError with a concise snippet.
+      1) If the entire content parses to a list → return it.
+      2) Otherwise, scan for the **first** '[' and the **last** ']' and try to
+         parse that slice. This addresses common stray prose cases.
+      3) On failure, raise ValueError with a concise snippet.
     """
     # 1) Straight parse
     try:
@@ -157,7 +242,7 @@ def _extract_json_array(text: str) -> List[Any]:
     except Exception:
         pass
 
-    # 2) Substring try (naive but effective for flat arrays)
+    # 2) Substring try
     first = text.find("[")
     last = text.rfind("]")
     if first != -1 and last != -1 and last > first:
@@ -207,8 +292,12 @@ class OpenAIClient:
 
     def __post_init__(self) -> None:
         self.messages = [{"role": "system", "content": _system_prompt()}]
-        log.info("OpenAI client initialised | model=%s | timeout=%ss | base=%s",
-                 self.model, self.timeout_s, OPENAI_BASE_URL or "<default>")
+        log.info(
+            "OpenAI client initialised | model=%s | timeout=%ss | base=%s",
+            self.model,
+            self.timeout_s,
+            OPENAI_BASE_URL or "<default>",
+        )
 
     # --- SDK bootstrap ----------------------------------------------------- #
     def _ensure_sdk(self) -> Any:
@@ -236,14 +325,74 @@ class OpenAIClient:
         """
         self.messages.append({"role": "user", "content": user_content})
         self.messages = _prune_messages(self.messages, self.max_turn_pairs)
-        log.debug("Added overview/user note (%d chars); messages=%d",
-                  len(user_content or ""), len(self.messages))
+        log.debug(
+            "Added overview/user note (%d chars); messages=%d",
+            len(user_content or ""),
+            len(self.messages),
+        )
 
-    # --- Calls: JSON array ------------------------------------------------- #
+    # --- Internal: generic tool call -------------------------------------- #
+    def _call_tool_only(self, tool_schema: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+        """
+        Force a single tool call with the last user message already present.
+        Returns (tool_args_dict, call_id).
+        """
+        sdk = self._ensure_sdk()
+        tool_name = tool_schema["function"]["name"]
+        try:
+            resp = sdk.chat.completions.create(
+                model=self.model,
+                messages=self.messages,
+                temperature=0,
+                tools=[tool_schema],
+                tool_choice={"type": "function", "function": {"name": tool_name}},
+                timeout=self.timeout_s,  # type: ignore[call-arg]
+            )
+        except Exception as exc:
+            log.exception("OpenAI request (tool=%s) failed: %s", tool_name, exc)
+            raise
+
+        try:
+            choice = resp.choices[0]
+            msg = choice.message
+            calls = getattr(msg, "tool_calls", None) or []
+        except Exception as exc:
+            raise RuntimeError(f"Malformed API response (tool={tool_name}): {exc}") from exc
+
+        if not calls:
+            # Record assistant content to aid debugging
+            self.messages.append({"role": "assistant", "content": msg.content or ""})
+            self.messages = _prune_messages(self.messages, self.max_turn_pairs)
+            raise RuntimeError(f"Assistant did not call the required tool '{tool_name}'.")
+
+        tc = calls[0]
+        fn = getattr(tc, "function", None)
+        fn_name = getattr(fn, "name", None)
+        raw_args = getattr(fn, "arguments", "") or ""
+        call_id = getattr(tc, "id", None) or "call_0"
+
+        # Keep assistant message (with tool_calls) in the transcript
+        self.messages.append(
+            {"role": "assistant", "content": msg.content or "", "tool_calls": calls}
+        )
+        self.messages = _prune_messages(self.messages, self.max_turn_pairs)
+
+        if fn_name != tool_name:
+            raise RuntimeError(f"Unexpected function name: {fn_name}")
+
+        try:
+            args = json.loads(raw_args)
+            log.info("Tool '%s' returned keys=%s", tool_name, sorted(args.keys()))
+        except Exception as exc:
+            raise RuntimeError(f"Failed to decode tool arguments as JSON: {exc}") from exc
+
+        return args, call_id
+
+    # --- Calls: strict JSON array ----------------------------------------- #
     def ask_json_array(self, prompt: str) -> List[dict]:
         """
-        Ask the assistant to return a strict JSON array (no prose). The prompt
-        should *explicitly* repeat that requirement (our prompts do).
+        Ask the assistant to return a strict JSON array (no prose).
+        The prompt should *explicitly* repeat that requirement.
         """
         sdk = self._ensure_sdk()
         self.messages.append({"role": "user", "content": prompt})
@@ -267,7 +416,7 @@ class OpenAIClient:
             raise RuntimeError(f"Malformed API response (json array): {exc}") from exc
 
         arr = _extract_json_array(content)
-        # Append the assistant message to history; avoid clutter with huge arrays.
+        # Append assistant message to history; avoid clutter with huge arrays.
         self.messages.append({"role": "assistant", "content": "[…JSON array…]"})
         self.messages = _prune_messages(self.messages, self.max_turn_pairs)
         log.info("Strict JSON array received with %d entries.", len(arr))
@@ -282,76 +431,40 @@ class OpenAIClient:
                 out.append({"value": item})
         return out
 
-    # --- Calls: tool‑forced full‑file patch -------------------------------- #
+    # --- Calls: submit_patch ------------------------------------------------ #
     def call_submit_patch(self, user_prompt: str) -> Dict[str, Any]:
         """
         Force a tool call to `submit_patch` and return the decoded arguments
-        as a plain dict. This does **not** validate against the JSON‑Schema;
-        the orchestrator does that immediately afterwards.
+        as a plain dict. Schema validation is performed by the caller.
         """
-        sdk = self._ensure_sdk()
-        tools = [_submit_patch_tool()]
-        tool_name = tools[0]["function"]["name"]
-
         self.messages.append({"role": "user", "content": user_prompt})
         self.messages = _prune_messages(self.messages, self.max_turn_pairs)
+        args, _ = self._call_tool_only(_submit_patch_tool())
+        return args
 
-        try:
-            resp = sdk.chat.completions.create(
-                model=self.model,
-                messages=self.messages,
-                temperature=0,
-                tools=tools,
-                tool_choice={"type": "function", "function": {"name": tool_name}},
-                timeout=self.timeout_s,  # type: ignore[call-arg]
-            )
-        except Exception as exc:
-            log.exception("OpenAI request (submit_patch tool) failed: %s", exc)
-            raise
-
-        try:
-            choice = resp.choices[0]
-            msg = choice.message
-            tool_calls = getattr(msg, "tool_calls", None) or []
-        except Exception as exc:
-            raise RuntimeError(f"Malformed API response (tool call): {exc}") from exc
-
-        if not tool_calls:
-            # Record the assistant content to aid debugging
-            self.messages.append({"role": "assistant", "content": msg.content or ""})
-            self.messages = _prune_messages(self.messages, self.max_turn_pairs)
-            raise RuntimeError("Assistant did not call the required tool 'submit_patch'.")
-
-        tc = tool_calls[0]
-        fn = getattr(tc, "function", None)
-        fn_name = getattr(fn, "name", None)
-        raw_args = getattr(fn, "arguments", "") or ""
-        call_id = getattr(tc, "id", None) or "call_0"
-
-        # Keep assistant message (with tool_calls) in the transcript
-        self.messages.append({"role": "assistant", "content": msg.content or "", "tool_calls": tool_calls})
+    # --- Calls: plan‑first -------------------------------------------------- #
+    def call_propose_review_plan(self, user_prompt: str) -> Dict[str, Any]:
+        """
+        Force a tool call to `propose_review_plan` (plan‑first step).
+        """
+        self.messages.append({"role": "user", "content": user_prompt})
         self.messages = _prune_messages(self.messages, self.max_turn_pairs)
+        args, _ = self._call_tool_only(_propose_review_plan_tool())
+        return args
 
-        if fn_name != tool_name:
-            raise RuntimeError(f"Unexpected function name: {fn_name}")
-
-        try:
-            patch = json.loads(raw_args)
-            log.info("Tool call returned op=%s file=%s status=%s",
-                     patch.get("op"), patch.get("file"), patch.get("status"))
-        except Exception as exc:
-            raise RuntimeError(f"Failed to decode tool arguments as JSON: {exc}") from exc
-
-        # We do **not** send a tool result message here (one‑shot call). If you
-        # want to continue the tool‑call chain, you could append a "tool" role
-        # message linked via tool_call_id=call_id. The orchestrator applies the
-        # patch locally and starts a new user turn instead.
-        log.debug("submit_patch call id=%s captured; returning args to caller.", call_id)
-        return patch
+    # --- Calls: error fixes ------------------------------------------------- #
+    def call_propose_error_fixes(self, user_prompt: str) -> Dict[str, Any]:
+        """
+        Force a tool call to `propose_error_fixes` for runtime errors.
+        """
+        self.messages.append({"role": "user", "content": user_prompt})
+        self.messages = _prune_messages(self.messages, self.max_turn_pairs)
+        args, _ = self._call_tool_only(_propose_error_fixes_tool())
+        return args
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public helpers used by the orchestrator
+# Public helpers (backward‑compatible)
 # ─────────────────────────────────────────────────────────────────────────────
 def strict_json_array(client: OpenAIClient, prompt: str) -> List[dict]:
     """
@@ -365,14 +478,14 @@ def submit_patch_call(
     prompt: str,
     *,
     rel_path: str,
-    expected_kind: str = "update",  # "update" or "create" – only for sanity checks
+    expected_kind: str = "update",  # "update" or "create" – sanity checks only
 ) -> Dict[str, Any]:
     """
     Send `prompt` and force a `submit_patch` tool call. Perform light sanity
     checks against the expected action for the given file path.
 
-    The caller (orchestrator) must still run `validate_patch(...)` on the
-    returned dict to enforce the canonical schema.
+    The caller should run `patch_validator.validate_patch(...)` on the returned
+    dict to enforce the canonical schema.
     """
     patch = client.call_submit_patch(prompt)
 
@@ -382,19 +495,27 @@ def submit_patch_call(
         log.warning("Assistant omitted 'file' → setting it to %s", rel_path)
         patch["file"] = rel_path
     elif file_from_model != rel_path:
-        log.warning("Assistant returned mismatched file %r (expected %r) → overriding.",
-                    file_from_model, rel_path)
+        log.warning(
+            "Assistant returned mismatched file %r (expected %r) → overriding.",
+            file_from_model,
+            rel_path,
+        )
         patch["file"] = rel_path
 
     # For create/update, **full file content** must be present.
     if patch.get("op") in {"create", "update"}:
         if "body" not in patch and "body_b64" not in patch:
-            raise RuntimeError("Expected a full‑file body/body_b64 in the patch but none was provided.")
+            raise RuntimeError(
+                "Expected a full‑file body/body_b64 in the patch but none was provided."
+            )
 
-    # Light expected_kind check (we won't mutate here; the orchestrator may).
+    # Light expected_kind check (the orchestrator may further enforce).
     if expected_kind == "create" and patch.get("op") not in {"create", "update"}:
         log.warning("Expected a create/update for new file, got op=%s", patch.get("op"))
     if expected_kind == "update" and patch.get("op") not in {"update", "create"}:
-        log.warning("Expected an update/create for existing file, got op=%s", patch.get("op"))
+        log.warning(
+            "Expected an update/create for existing file, got op=%s",
+            patch.get("op"),
+        )
 
     return patch

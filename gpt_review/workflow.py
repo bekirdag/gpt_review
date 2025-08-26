@@ -2,36 +2,43 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
-GPT‑Review ▸ Multi‑Iteration Orchestrator
+GPT‑Review ▸ Multi‑Iteration Orchestrator (API mode, compatibility path)
 ===============================================================================
 
 Responsibilities
 ----------------
-• Create a fresh branch per run (e.g., iteration1, iteration2, …).
+• Create a fresh branch per run (iteration1, iteration2, iteration3).
 • Read the instructions + repository structure; build a manifest.
 • Run three iterations:
-  1) Review/replace *code+config* files one‑by‑one (full files only).
-     Then ask for a list of *new files* and create them *one‑by‑one*.
-  2) Repeat the process (existing + new files); ask for additional new files.
-  3) Review *all files for consistency*; only now process docs/install/setup/examples.
+  1) Review/replace *code+tests* one‑by‑one (return **complete files** only).
+     Then ask for a list of *new files* (JSON list) and create them one‑by‑one.
+  2) Repeat the process; again ask for additional new files.
+  3) Review *all non‑binary files for consistency* (docs/setup/examples
+     included now), still one file at a time and still **complete files only**.
 
 • After iteration 3:
-  - Ask the API to generate a *Software Review Instructions* file that states
-    how to run the software and what success looks like.
+  - Generate an authoritative **review instructions** file that states how to
+    run the software and what success looks like (full file via tool call).
   - Enter an error‑fix loop: run the provided command, collect logs, ask for
-    affected files & full replacements; iterate until success.
+    affected files (JSON list) & full replacements; iterate until success.
 
 • Commit after every file; push branch at the end if requested.
 
 Design choices
 --------------
-• Full‑file semantics: the assistant must always return an *entire* file as
-  the replacement (never a diff). We enforce this via the tool schema (same
-  shape as schema.json) and strict prompting.
+• Full‑file semantics: the assistant must always return an *entire* file as the
+  replacement (never a diff). We enforce this with a tool schema and schema
+  validation before writing through `apply_patch`.
 • Deferral: docs/installation/setup/example files are intentionally skipped
   in iterations 1 & 2 and processed in iteration 3 to avoid churn.
-• Explicit paths: every action uses repo‑root‑relative paths to prevent
+• Explicit paths: every action uses repo‑root‑relative POSIX paths to prevent
   accidental nesting/misplacement.
+
+This module uses:
+  - `gpt_review.api_client.OpenAIClient` for tool‑forced calls & strict arrays
+  - `gpt_review.file_scanner` facade (wrapping the robust RepoScanner)
+  - `gpt_review.prompts` for strict, concise user prompts
+  - `apply_patch.apply_patch` to perform **path‑scoped**, validated writes
 """
 from __future__ import annotations
 
@@ -50,17 +57,6 @@ from typing import Any, Iterable, List, Optional, Sequence, Tuple
 from gpt_review import get_logger
 from patch_validator import validate_patch
 
-# NOTE: These modules will be added next (one file per message):
-#   - from gpt_review.prompts import build_overview_prompt, build_file_prompt, build_new_files_prompt, build_consistency_prompt, build_error_fix_list_prompt, build_error_fix_file_prompt, build_final_instructions_prompt
-#   - from gpt_review.file_scanner import RepoScan, scan_repository, classify_for_iteration
-#   - from gpt_review.api_client import OpenAIClient, submit_patch_call, strict_json_array
-
-# For applying patches (complete file writes with path‑scoped staging)
-#   - from apply_patch import apply_patch
-
-# -----------------------------------------------------------------------------
-# Logger
-# -----------------------------------------------------------------------------
 log = get_logger(__name__)
 
 # -----------------------------------------------------------------------------
@@ -73,7 +69,7 @@ DEFAULT_BRANCH_PREFIX = os.getenv("GPT_REVIEW_BRANCH_PREFIX", "iteration")
 DEFAULT_REMOTE = os.getenv("GPT_REVIEW_REMOTE", "origin")
 LOG_TAIL_CHARS = int(os.getenv("GPT_REVIEW_LOG_TAIL_CHARS", "20000"))
 
-# Paths/dirs we always ignore when scanning the repo
+# Paths/dirs we always ignore when scanning the repo (kept for CLI parity only)
 DEFAULT_IGNORES = (
     ".git",
     ".hg",
@@ -109,7 +105,7 @@ class OrchestratorConfig:
     push_at_end: bool = True
     run_cmd: Optional[str] = None  # e.g. "pytest -q"
 
-    # scanning / categorisation settings
+    # scanning / categorisation settings (accepted for backwards compatibility)
     ignores: Sequence[str] = DEFAULT_IGNORES
 
 
@@ -163,7 +159,6 @@ def _ensure_branch(repo: Path, prefix: str) -> str:
     next_num = max(nums) + 1 if nums else 1
     name = f"{prefix}{next_num}"
 
-    # Create branch at current HEAD (or initial commit after an orphan)
     log.info("Creating/checkout branch: %s", name)
     _git(repo, "checkout", "-B", name, check=True)
     return name
@@ -220,7 +215,7 @@ def _tail(text: str, n: int = LOG_TAIL_CHARS) -> str:
 # =============================================================================
 class ReviewWorkflow:
     """
-    High‑level multi‑iteration review loop.
+    High‑level multi‑iteration review loop (API‑driven).
 
     Usage:
         cfg = OrchestratorConfig(instructions_path=Path(...), repo=Path(...))
@@ -232,9 +227,9 @@ class ReviewWorkflow:
         self.repo = cfg.repo
         self.instructions = self._read_instructions(cfg.instructions_path)
 
-        # Placeholders; wired up after companion modules are added.
-        self._client = None  # will be OpenAIClient
-        self._scan = None    # will be RepoScan
+        # Late‑bound components
+        self._client = None  # type: ignore[assignment]  # OpenAIClient
+        self._scan = None    # type: ignore[assignment]  # RepoScan manifest
 
         # Bookkeeping
         self.branch_name: Optional[str] = None
@@ -257,8 +252,8 @@ class ReviewWorkflow:
 
     def _init_clients(self) -> None:
         """
-        Late import to keep module load light; avoids hard dependency if the
-        orchestrator isn't used. This connects the OpenAI client wrapper.
+        Connect the OpenAI client wrapper (tool‑forced).  Keep imports local
+        so other entry points don't pay this cost unless needed.
         """
         try:
             from gpt_review.api_client import OpenAIClient
@@ -273,7 +268,7 @@ class ReviewWorkflow:
 
     def _scan_repo(self) -> None:
         """
-        Build a manifest of files and their categories.
+        Build a manifest of files and their categories (non‑binary split).
         """
         try:
             from gpt_review.file_scanner import scan_repository
@@ -282,7 +277,7 @@ class ReviewWorkflow:
             raise SystemExit(1) from exc
 
         self._scan = scan_repository(self.repo, ignores=self.cfg.ignores)
-        log.info("Scanned repo: %s files (code=%s, docs/setup/examples=%s)",
+        log.info("Scanned repo: %s files (code+tests=%s, deferred=%s)",
                  len(self._scan.all_files),
                  len(self._scan.code_and_config),
                  len(self._scan.docs_and_extras))
@@ -292,71 +287,95 @@ class ReviewWorkflow:
         log.info("Working on branch '%s' (HEAD=%s)", self.branch_name, _current_commit(self.repo))
 
     # ────────────────────────────────────────────────────────────────────── #
-    # Prompt helpers (defers to prompts.py)
+    # Prompt helpers (wired to gpt_review.prompts)
     # ────────────────────────────────────────────────────────────────────── #
-    def _overview_prompt(self) -> str:
-        from gpt_review.prompts import build_overview_prompt
-
-        return build_overview_prompt(
-            instructions=self.instructions,
-            manifest=self._scan.manifest_text(),
-        )
+    def _overview_note_text(self) -> str:
+        """
+        One‑time primer before iteration 1: align on goals, repo view, and
+        the **full‑file + deferral** contract. Stored in the conversation as
+        a user note; the actual edit prompts rely on tool calls.
+        """
+        manifest = self._scan.manifest_text()
+        rules = textwrap.dedent(
+            """
+            Rules for this review:
+            1) We will fix the software one file at a time. For each file you MUST return a
+               **complete replacement file** via the `submit_patch` tool (never a diff).
+            2) Keep changes minimal and behavior‑preserving unless a bug is evident.
+            3) Iterations 1–2: focus on code & tests only. Defer docs/install/setup/examples.
+            4) Iteration 3: include all non‑binary files, ensure cross‑file consistency,
+               and only then handle docs/install/setup/examples.
+            5) Use exact repo‑relative POSIX paths; do not create nested directories
+               unless explicitly asked in a dedicated step.
+            """
+        ).strip()
+        return f"Objectives:\n{self.instructions}\n\nRepository manifest:\n{manifest}\n\n{rules}"
 
     def _file_prompt(self, rel_path: str, content: str, iteration: int) -> str:
-        from gpt_review.prompts import build_file_prompt
+        from gpt_review.prompts import build_file_review_prompt
 
-        return build_file_prompt(
-            instructions=self.instructions,
-            manifest=self._scan.manifest_text(),
+        return build_file_review_prompt(
             iteration=iteration,
             rel_path=rel_path,
-            content=content,
+            file_text=content,
+            file_notes=None,
         )
 
     def _consistency_prompt(self, rel_path: str, content: str) -> str:
-        from gpt_review.prompts import build_consistency_prompt
+        from gpt_review.prompts import build_file_review_prompt
 
-        return build_consistency_prompt(
-            instructions=self.instructions,
-            manifest=self._scan.manifest_text(),
+        # Reuse the same strict full‑file prompt, but iteration=3 and with notes.
+        return build_file_review_prompt(
+            iteration=3,
             rel_path=rel_path,
-            content=content,
+            file_text=content,
+            file_notes=(
+                "Consistency pass context: align naming, imports, error handling, logging, "
+                "and configuration with the rest of the codebase. Prefer minimal, coherent changes."
+            ),
         )
 
-    def _new_files_list_prompt(self, iteration: int) -> str:
-        from gpt_review.prompts import build_new_files_prompt
+    def _new_files_list_prompt(self, iteration: int, processed: Sequence[str]) -> str:
+        from gpt_review.prompts import build_new_files_discovery_prompt
 
-        return build_new_files_prompt(
-            instructions=self.instructions,
-            manifest=self._scan.manifest_text(),
+        return build_new_files_discovery_prompt(
             iteration=iteration,
+            processed_paths=list(processed),
+            repo_overview=self._scan.manifest_text(),
         )
 
     def _error_fix_list_prompt(self, log_tail: str) -> str:
-        from gpt_review.prompts import build_error_fix_list_prompt
+        from gpt_review.prompts import build_error_diagnosis_prompt
 
-        return build_error_fix_list_prompt(
-            instructions=self.instructions,
-            manifest=self._scan.manifest_text(),
+        run_cmd = self.cfg.run_cmd or "<no-run-command-provided>"
+        return build_error_diagnosis_prompt(
+            run_command=run_cmd,
             error_log_tail=log_tail,
         )
 
     def _error_fix_file_prompt(self, file_path: str, reason: str) -> str:
-        from gpt_review.prompts import build_error_fix_file_prompt
+        from gpt_review.prompts import build_error_fix_prompt_for_file
 
-        return build_error_fix_file_prompt(
-            instructions=self.instructions,
-            manifest=self._scan.manifest_text(),
+        # Current file text (empty string for new files) to anchor the full‑file replacement.
+        p = (self.repo / file_path)
+        current_text = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
+        return build_error_fix_prompt_for_file(
             rel_path=file_path,
-            reason=reason,
+            current_text=current_text,
+            error_excerpt=None,
+            diagnosis_reason=reason,
         )
 
     def _final_instructions_prompt(self) -> str:
-        from gpt_review.prompts import build_final_instructions_prompt
+        from gpt_review.prompts import build_review_spec_prompt
 
-        return build_final_instructions_prompt(
-            instructions=self.instructions,
-            manifest=self._scan.manifest_text(),
+        # Generate an authoritative run/spec guide after iteration 3.
+        return build_review_spec_prompt(
+            goals_from_user=self.instructions,
+            observed_behavior="(to date) See commit history from automated review.",
+            run_instructions=self.cfg.run_cmd or "(not specified by user)",
+            success_criteria="Software runs without errors as per this file; tests (if any) pass.",
+            file_name="REVIEW_INSTRUCTIONS.md",
         )
 
     # ────────────────────────────────────────────────────────────────────── #
@@ -412,8 +431,8 @@ class ReviewWorkflow:
         """
         Return the list of files to process for *iteration*.
 
-        Iteration 1 & 2: code+config only.
-        Iteration 3:     all files (code+config + docs/setup/examples).
+        Iteration 1 & 2: code+tests only.
+        Iteration 3:     all non‑binary files (code+tests + docs/setup/examples).
         """
         from gpt_review.file_scanner import classify_for_iteration
 
@@ -429,13 +448,9 @@ class ReviewWorkflow:
             return
 
         content = full_path.read_text(encoding="utf-8", errors="replace")
-        if consistency:
-            prompt = self._consistency_prompt(rel_path, content)
-        else:
-            prompt = self._file_prompt(rel_path, content, iteration)
+        prompt = self._consistency_prompt(rel_path, content) if consistency else self._file_prompt(rel_path, content, iteration)
 
-        kind = "update"
-        patch = self._ask_fullfile_patch(prompt, rel_path=rel_path, kind=kind)
+        patch = self._ask_fullfile_patch(prompt, rel_path=rel_path, kind="update")
 
         # Enforce full‑file semantics: op must be update/create; body present.
         if patch.get("op") not in {"update", "create"} or ("body" not in patch and "body_b64" not in patch):
@@ -447,29 +462,30 @@ class ReviewWorkflow:
 
         self._apply_and_commit(patch, f"{self.branch_name}: {patch['op']} {rel_path}")
 
-    def _ask_and_create_new_files(self, iteration: int) -> None:
+    def _ask_and_create_new_files(self, iteration: int, processed_paths: Sequence[str]) -> None:
         """
         Ask for a list of new files (strict JSON), then create them one‑by‑one.
-        The JSON items must include:
-            { "path": "relative/path", "reason": "why" }
+
+        Expected JSON items (flexible keys supported):
+            { "path": "relative/path", "purpose|reason|notes": "why", "type": "...", "priority": 1 }
         """
-        items = self._ask_json_array(self._new_files_list_prompt(iteration))
+        items = self._ask_json_array(self._new_files_list_prompt(iteration, processed_paths))
         if not items:
             log.info("No new files suggested after iteration %d.", iteration)
             return
 
         for it in items:
             path = (it.get("path") or "").strip()
-            reason = (it.get("reason") or "").strip()
+            reason = (it.get("reason") or it.get("purpose") or it.get("notes") or "New file requested").strip()
             if not path:
                 log.warning("Skipping new file suggestion without 'path': %r", it)
                 continue
 
             # Ask for the full file content now (structured tool call).
-            prompt = self._error_fix_file_prompt(file_path=path, reason=reason or "New file requested")
-            patch = self._ask_fullfile_patch(prompt, rel_path=path, expected_kind="create")
+            prompt = self._error_fix_file_prompt(file_path=path, reason=reason)
+            patch = self._ask_fullfile_patch(prompt, rel_path=path, kind="create")
 
-            # Force op=create to avoid accidental updates
+            # Force op=create to avoid accidental updates to existing files with similar names
             patch["op"] = "create"
             patch["file"] = path
             patch["status"] = patch.get("status") or "in_progress"
@@ -490,16 +506,18 @@ class ReviewWorkflow:
         # On the first iteration, send a one‑time overview to align the model.
         if n == 1:
             self._require_api()
-            overview = self._overview_prompt()
-            self._client.note(overview)  # stores as a user message (see api_client)
+            self._client.note(self._overview_note_text())
 
         # Process target files one‑by‑one (full replacements)
         targets = self._iter_paths(iteration=n)
         log.info("Iteration %d: processing %d files …", n, len(targets))
+
+        processed: List[str] = []
         for rel in targets:
             try:
                 consistency = (n == 3)  # iteration 3: consistency across codebase
                 self._process_single_file(rel_path=rel, iteration=n, consistency=consistency)
+                processed.append(rel)
             except SystemExit:
                 raise
             except Exception as exc:
@@ -507,40 +525,28 @@ class ReviewWorkflow:
                 raise SystemExit(1) from exc
 
         # Ask for new files list and create them one‑by‑one
-        self._ask_and_create_new_files(iteration=n)
+        self._ask_and_create_new_files(iteration=n, processed_paths=processed)
 
     # ────────────────────────────────────────────────────────────────────── #
     # Post‑iterations: final instructions & error‑fix loop
     # ────────────────────────────────────────────────────────────────────── #
     def _generate_final_instructions(self) -> None:
         """
-        Ask the model to synthesize an authoritative *Software Review Instructions*
-        file based on what it has learned. We store it at:
-            REVIEW_INSTRUCTIONS.md
+        Ask the model to synthesize an authoritative *Review Instructions* file
+        after iteration 3. We store it at: REVIEW_INSTRUCTIONS.md
         """
         prompt = self._final_instructions_prompt()
-        items = self._ask_json_array(prompt)
-        # We expect exactly one file in the array:
-        #   [{ "path": "REVIEW_INSTRUCTIONS.md", "body": "<markdown>" }]
-        if not items:
-            log.warning("Model did not propose a REVIEW_INSTRUCTIONS file; skipping.")
-            return
+        # Create/update via a **tool call** (full file)
+        patch = self._ask_fullfile_patch(prompt, rel_path="REVIEW_INSTRUCTIONS.md", kind="create")
+        if patch.get("op") not in {"create", "update"}:
+            patch["op"] = "create" if not (self.repo / "REVIEW_INSTRUCTIONS.md").exists() else "update"
+        patch["file"] = "REVIEW_INSTRUCTIONS.md"
+        patch["status"] = patch.get("status") or "in_progress"
 
-        itm = items[0]
-        path = itm.get("path") or "REVIEW_INSTRUCTIONS.md"
-        body = itm.get("body") or ""
-        if not body:
-            log.warning("REVIEW_INSTRUCTIONS empty; skipping.")
-            return
+        if "body" not in patch and "body_b64" not in patch:
+            raise SystemExit("Assistant did not provide body/body_b64 for REVIEW_INSTRUCTIONS.md")
 
-        patch = {
-            "op": "create" if not (self.repo / path).exists() else "update",
-            "file": path,
-            "body": body,
-            "status": "in_progress",
-        }
-        validate_patch(json.dumps(patch, ensure_ascii=False))
-        self._apply_and_commit(patch, f"{self.branch_name}: write {path}")
+        self._apply_and_commit(patch, f"{self.branch_name}: write REVIEW_INSTRUCTIONS.md")
 
     def _error_fix_loop(self) -> None:
         """
@@ -564,14 +570,14 @@ class ReviewWorkflow:
                 raise SystemExit("Model returned no affected files for the error log; aborting.")
 
             for it in items:
-                path = (it.get("path") or "").strip()
+                path = (it.get("file") or it.get("path") or "").strip()
                 reason = (it.get("reason") or "error fix").strip()
                 if not path:
-                    log.warning("Skipping error fix without 'path': %r", it)
+                    log.warning("Skipping error fix without a valid path: %r", it)
                     continue
 
                 prompt = self._error_fix_file_prompt(file_path=path, reason=reason)
-                patch = self._ask_fullfile_patch(prompt, rel_path=path, expected_kind="update")
+                patch = self._ask_fullfile_patch(prompt, rel_path=path, kind="update")
 
                 if "body" not in patch and "body_b64" not in patch:
                     raise SystemExit(f"Assistant did not provide full body for error fix: {path}")

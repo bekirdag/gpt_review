@@ -68,7 +68,6 @@ FORCE=0
 DEV_CLI=""  # "yes" or "no" when set via flags
 
 PYTHON="${PYTHON:-python3}"
-VENV_DIR_DEFAULT="\$REPO_DIR/venv"  # keep literal for help text; we resolve later
 BIN_DIR="${BIN_DIR:-/usr/local/bin}"
 
 # Parse args
@@ -82,7 +81,7 @@ while [[ $# -gt 0 ]]; do
     --dev) DEV_CLI="yes"; shift ;;
     --no-dev) DEV_CLI="no"; shift ;;
     -h|--help)
-      sed -n '1,120p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '1,160p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) die "Unknown argument: $1 (use --help)";;
   esac
@@ -114,40 +113,63 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1";
 require_cmd git
 require_cmd "$PYTHON"
 
-mkdir -p "$REPO_DIR"
-
-# ------------------------------ clone / update ------------------------------ #
+# Helpers around git in target
 git_in()      { git -C "$REPO_DIR" "$@"; }
 is_repo()     { git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; }
 has_changes() { [[ -n "$(git -C "$REPO_DIR" status --porcelain 2>/dev/null || true)" ]]; }
 
+ensure_origin_remote() {
+  if ! git -C "$REPO_DIR" remote get-url origin >/dev/null 2>&1; then
+    info "Setting 'origin' remote → $REPO_URL"
+    git -C "$REPO_DIR" remote add origin "$REPO_URL" || true
+  fi
+}
+
+mkdir -p "$(dirname "$REPO_DIR")"
+
+# ------------------------------ clone / update ------------------------------ #
 if ! is_repo; then
   info "No git repo found at $REPO_DIR → cloning fresh"
-  rm -rf "$REPO_DIR"/*
+  # Recreate directory cleanly to avoid leftover files (incl. dotfiles)
+  rm -rf -- "$REPO_DIR"
   git clone --branch "$BRANCH" --depth 1 "$REPO_URL" "$REPO_DIR" || die "Git clone failed"
 else
+  ensure_origin_remote
   info "Fetching updates from origin …"
-  git_in fetch --prune origin
+  git_in fetch --prune --tags origin || warn "Fetch failed; attempting local update anyway."
 
   info "Checking out branch '$BRANCH' …"
   if git_in show-ref --verify --quiet "refs/heads/$BRANCH"; then
     git_in checkout -q "$BRANCH"
   else
-    git_in checkout -B "$BRANCH" "origin/$BRANCH" || git_in checkout -B "$BRANCH"
+    # Create local branch tracking origin if present
+    if git_in show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+      git_in checkout -B "$BRANCH" "origin/$BRANCH"
+    else
+      git_in checkout -B "$BRANCH" || true
+    fi
   fi
 
   if [[ $FORCE -eq 1 ]]; then
     warn "Discarding local changes (forced reset) …"
-    git_in reset --hard "origin/$BRANCH"
+    if git_in show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+      git_in reset --hard "origin/$BRANCH"
+    else
+      git_in reset --hard
+    fi
     git_in clean -fd
   else
     if has_changes; then
       warn "Local changes detected; attempting fast‑forward merge"
     fi
-    if ! git_in merge --ff-only "origin/$BRANCH"; then
-      warn "Non fast‑forward. Resetting to origin/$BRANCH …"
-      git_in reset --hard "origin/$BRANCH"
-      git_in clean -fd
+    if git_in show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+      if ! git_in merge --ff-only "origin/$BRANCH"; then
+        warn "Non fast‑forward. Resetting to origin/$BRANCH …"
+        git_in reset --hard "origin/$BRANCH"
+        git_in clean -fd
+      fi
+    else
+      warn "No origin/$BRANCH reference; skipping merge."
     fi
   fi
 fi

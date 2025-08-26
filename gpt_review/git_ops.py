@@ -11,6 +11,7 @@ Responsibilities
 * Resolve a sensible **base branch** (origin/HEAD → main/master → current).
 * Create a **new iteration branch** (e.g. iteration1, iteration2, …).
   - If the desired name already exists, append a timestamp suffix safely.
+  - Works on fresh repositories (no commits) by falling back to an **orphan** branch.
 * Query commit / branch state in a resilient way (works on fresh repos too).
 * Push the current branch to a remote (if configured), setting upstream on first push.
 
@@ -28,12 +29,10 @@ Usage (example)
     from gpt_review.git_ops import GitOps
 
     repo = GitOps(Path("/path/to/repo"))
-    repo.ensure_repo_ready()         # raises early if not a repo or dirty
+    repo.ensure_repo_ready()               # raises early if not a repo or dirty
     branch = repo.create_iteration_branch(iteration=1)   # → "iteration1"
     # ... run the review workflow which creates commits one by one ...
-    repo.push_current_branch()       # optional (if remote exists)
-
-The orchestrator will call these helpers at iteration boundaries.
+    repo.push_current_branch()             # optional (if remote exists)
 """
 from __future__ import annotations
 
@@ -61,7 +60,7 @@ class GitOps:
     """
     Convenience wrapper around common `git` shell operations.
 
-    This class is intentionally minimal and dependency‑free.  It centralises
+    This class is intentionally minimal and dependency‑free. It centralises
     logging and error messages so higher‑level orchestration code stays clean.
     """
 
@@ -125,7 +124,7 @@ class GitOps:
         if not (self.repo / ".git").exists():
             raise RuntimeError(f"Not a git repository: {self.repo}")
 
-        # `status --porcelain` is empty when clean
+        # `status --porcelain` is empty when clean (includes untracked files)
         res = self._git("status", "--porcelain")
         if res.out:
             log.error("Working tree has uncommitted changes:\n%s", res.out)
@@ -133,6 +132,13 @@ class GitOps:
                 "Working tree is not clean. Please commit/stash your changes before starting."
             )
         log.info("Repository ready: %s (clean working tree)", self.repo)
+
+    def has_commits(self) -> bool:
+        """
+        Return True if the repository has at least one commit.
+        """
+        res = self._git("rev-parse", "--verify", "-q", "HEAD")
+        return res.ok and bool(res.out)
 
     def current_branch(self) -> str:
         """
@@ -242,15 +248,31 @@ class GitOps:
         RuntimeError
             If branch creation fails.
         """
+        if iteration < 1:
+            raise RuntimeError(f"Iteration must be >= 1 (got {iteration})")
+
         desired = f"iteration{int(iteration)}"
         name = self._unique_branch_name(desired)
         base = base or self._guess_default_base()
 
-        # `checkout -b <name> <base>` works for branch or commit
-        self._git("checkout", "-b", name, base, check=True)
+        # Prefer a normal branch off a base when possible.
+        if self.has_commits():
+            try:
+                self._git("checkout", "-b", name, base, check=True)
+                log.info(
+                    "Created and switched to branch %s (base=%s, head=%s)",
+                    name, base, self.current_commit(),
+                )
+                return name
+            except RuntimeError as exc:
+                # Fall back to orphan only if the base checkout fails for unexpected reasons.
+                log.warning("Failed to create branch off base %r (%s). Falling back to orphan branch.", base, exc)
+
+        # Fresh repo (no commits) or base creation failed: create an **orphan** branch.
+        self._git("checkout", "--orphan", name, check=True)
         log.info(
-            "Created and switched to branch %s (base=%s, head=%s)",
-            name, base, self.current_commit(),
+            "Created orphan branch %s (fresh repository). First commit will be created by the workflow.",
+            name,
         )
         return name
 
@@ -287,7 +309,7 @@ class GitOps:
 
         args = ["push", remote, f"HEAD:{branch}"]
         if set_upstream:
-            # --set-upstream only on first push; harmless if already set.
+            # --set-upstream only on first push; harmless to repeat.
             args.insert(1, "--set-upstream")
 
         self._git(*args, check=True)

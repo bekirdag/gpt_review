@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 ===============================================================================
 GPT‑Review ▸ Module Entry Point  (python -m gpt_review)
@@ -80,6 +81,33 @@ def _print_banner(version: str) -> None:
     )
 
 
+def _import_review_main():
+    """
+    Import the CLI driver function `main` with resilience.
+
+    We prefer the historical top-level `review` module (console script target),
+    but also support a packaged `gpt_review.review` for environments that install
+    the CLI within the package namespace.
+    """
+    try:
+        from review import main as review_main  # type: ignore
+        return review_main
+    except Exception as exc_first:  # pragma: no cover
+        # Fallback to a namespaced import (keeps the entrypoint robust).
+        try:
+            from gpt_review.review import main as review_main  # type: ignore
+            return review_main
+        except Exception as exc_second:
+            from gpt_review import get_logger
+
+            get_logger(__name__).exception(
+                "Failed to import CLI driver: review.main (%s) and gpt_review.review.main (%s)",
+                exc_first,
+                exc_second,
+            )
+            sys.exit(1)
+
+
 def main() -> None:
     """
     Top‑level dispatcher for `python -m gpt_review`.
@@ -94,17 +122,10 @@ def main() -> None:
     version = _resolve_version()
     _print_banner(version)
 
-    # Delegate to the actual CLI implementation.
-    try:
-        # Lazy import keeps `-m gpt_review --version` fast and dependency‑light.
-        from review import main as review_main
-    except Exception as exc:  # pragma: no cover (import errors are rare)
-        from gpt_review import get_logger  # lazy to keep import graph clean
+    # Resolve the actual CLI implementation.
+    review_main = _import_review_main()
 
-        get_logger(__name__).exception("Failed to import CLI driver (review.main): %s", exc)
-        sys.exit(1)
-
-    # Ensure `review.main()` sees the expected argv vector.
+    # Ensure the CLI driver sees the expected argv vector.
     sys.argv = [Path(sys.argv[0]).as_posix(), *remaining]
 
     try:

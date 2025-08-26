@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 ===============================================================================
 GPT‑Review ▸ Main Driver
@@ -6,63 +7,54 @@ GPT‑Review ▸ Main Driver
 
 Modes
 -----
-1) Browser (default)
+1) **browser**  (default)
    • Automates ChatGPT in a real Chrome/Chromium window via Selenium.
-   • Robust textarea detection, chunked error logs, crash‑safe resume.
+   • Robust composer detection, chunked error logs, crash‑safe resume.
+   • Assistant returns **one JSON patch** per turn (raw JSON; no prose).
 
-2) API
+2) **api**
    • Talks directly to an OpenAI‑compatible API (no browser).
+   • Uses the structured `submit_patch` tool call to return **one patch** at a time.
    • Token‑aware: short rolling history and truncated error logs.
-   • Zero Selenium dependency path; useful for servers/CI.
 
-How it works (both modes)
--------------------------
-1. Present *instructions* plus session rules to the assistant.
-2. Receive **one JSON patch** per reply (see README/schema).
+3) **iterate**
+   • Runs the **multi‑iteration orchestrator**:
+       - Creates a fresh branch (iteration1, iteration2, iteration3).
+       - Iterations 1–2: review **code/tests only** (full‑file replacements).
+       - Iteration 3: consistency pass across all files; then process docs/setup/examples.
+       - Generates plan artifacts and enters a structured error‑fix loop.
+       - Pushes the final branch (optional).
+
+How it works (browser/api single‑loop)
+--------------------------------------
+1. Present instructions + session rules to the assistant.
+2. Receive **one JSON patch** per reply (see `gpt_review/schema.json`).
 3. Apply the patch to a Git repository & commit.
-4. Optionally run *any shell command* (tests, linter, build, …).
+4. Optionally run a shell command (tests, linter, build, …).
 5. If the command fails, send the failing log back (chunked/tail).
-6. Repeat until the command passes **and** "status": "completed".
+6. Repeat until the command passes **and** `"status": "completed"`.
 
-Session rule
-------------
-*ChatGPT must:*
-* deliver **one script per answer** (chunk‑by‑chunk),
-* explicitly ask the user to **continue** before proceeding.
-
-High‑impact robustness
-----------------------
-• **Browser provisioning order (most reliable first)**:
-  1) Respect **CHROMEDRIVER** env (absolute path to chromedriver).
-  2) Try **Selenium Manager** (built into Selenium 4.6+).
-  3) Fall back to **webdriver‑manager** (works online).
-
-• **Composer detection/clearing**:
-  - Prefer <textarea>; fall back to div[contenteditable="true"].
-  - Always clear drafts safely (Select‑All + Backspace) before sending.
-  - **Unicode safety**: non‑BMP characters are replaced before send_keys
-    to avoid "ChromeDriver only supports characters in the BMP".
-
-• **Apply‑failure reporting (non‑fatal)**:
-  - If `apply_patch.py` fails, send a concise report (includes the **patch JSON**
-    and the tool’s **stdout/stderr**) and continue the loop.
-
-• **Patch delivery via STDIN**:
-  - Use `"-"` + `input=...` to avoid OS argv length limits.
-
-• **Safe commit lookup**:
-  - `_current_commit()` returns `"<no-commits-yet>"` on fresh repos.
+Contract for patches
+--------------------
+Always return **complete files** for create/update operations (never a diff).
+The schema is enforced by `patch_validator.validate_patch` and the
+`apply_patch.py` safety layer.
 
 CLI
 ---
-    gpt-review [-h] [--mode {browser,api}] [--model NAME] [--api-timeout N]
+    gpt-review [-h]
+               [--mode {browser,api,iterate}]
+               [--model NAME] [--api-timeout N]
                [--cmd CMD] [--auto] [--timeout N]
+               [--remote NAME] [--no-push]
+               [--max-error-rounds N]
                instructions repo
 
 Defaults:
     --mode browser
-    --model gpt-5-pro           (API mode only; env GPT_REVIEW_MODEL respected)
-    --api-timeout 120           (API mode only; env GPT_REVIEW_API_TIMEOUT)
+    --model gpt-5-pro             (API/iterate modes; env GPT_REVIEW_MODEL)
+    --api-timeout 120             (API/iterate modes; env GPT_REVIEW_API_TIMEOUT)
+    --remote origin               (iterate mode; env GPT_REVIEW_REMOTE)
 """
 from __future__ import annotations
 
@@ -101,9 +93,11 @@ NUDGE_RETRIES: int = int(os.getenv("GPT_REVIEW_NUDGE_RETRIES", "2"))
 PROBE_RETRIES: int = int(os.getenv("GPT_REVIEW_PROBE_RETRIES", "1"))
 STATE_FILE: str = ".gpt-review-state.json"
 
-# API mode defaults (used only when --mode=api)
+# API/iterate mode defaults
 DEFAULT_MODEL = os.getenv("GPT_REVIEW_MODEL", "gpt-5-pro")
 DEFAULT_API_TIMEOUT = int(os.getenv("GPT_REVIEW_API_TIMEOUT", "120"))
+DEFAULT_REMOTE = os.getenv("GPT_REVIEW_REMOTE", "origin")
+DEFAULT_MAX_ERROR_ROUNDS = int(os.getenv("GPT_REVIEW_MAX_ERROR_ROUNDS", "6"))
 
 EXTRA_RULES: str = (
     "Your fixes must be **chunk by chunk**. "
@@ -115,7 +109,7 @@ RAW_JSON_REMINDER: str = (
     "Format reminder: return exactly **one** JSON object — raw JSON only, "
     "no prose, no markdown, no code fences. "
     "Keys: op, file, (body|body_b64), target, mode, status. "
-    'Use status="in_progress" until the last patch, then "completed".'
+    'Use status=\"in_progress\" until the last patch, then \"completed\".'
 )
 
 PROBE_FILE_MAGIC = "__gpt_review_probe__"
@@ -193,7 +187,7 @@ def _lazy_import_selenium():
     """
     Import Selenium and related classes **only when needed**.
 
-    This keeps API mode free of Selenium import/installation requirements.
+    This keeps API/iterate modes free of Selenium requirements.
     """
     global webdriver, WebDriverException, Options, Service, By, Keys
     global EC, WebDriverWait, ChromeDriverManager, _WDM_AVAILABLE
@@ -215,7 +209,6 @@ def _lazy_import_selenium():
         ChromeDriverManager = None  # type: ignore
         _WDM_AVAILABLE = False
 
-    # Expose imported names to caller scope (via globals above)
     return {
         "webdriver": webdriver,
         "WebDriverException": WebDriverException,
@@ -277,9 +270,8 @@ def _chrome_driver():
     Honors:
     • GPT_REVIEW_PROFILE – persistent user‑data dir (cookies live here)
     • GPT_REVIEW_HEADLESS – any non‑empty value enables headless
-    • CHROME_BIN – explicit browser binary location (google‑chrome/chromium)
-    • CHROMEDRIVER – explicit chromedriver binary (takes precedence)
-    • Provisioning order: CHROMEDRIVER → Selenium Manager → webdriver‑manager
+    • CHROME_BIN – explicit browser binary location
+    • CHROMEDRIVER – explicit chromedriver binary
     """
     syms = _lazy_import_selenium()  # import only now
     Options = syms["Options"]
@@ -288,9 +280,7 @@ def _chrome_driver():
     _WDM_AVAILABLE = syms["_WDM_AVAILABLE"]
     ChromeDriverManager = syms["ChromeDriverManager"]
 
-    profile = Path(
-        os.getenv("GPT_REVIEW_PROFILE", "~/.cache/gpt-review/chrome")
-    ).expanduser()
+    profile = Path(os.getenv("GPT_REVIEW_PROFILE", "~/.cache/gpt-review/chrome")).expanduser()
     profile.parent.mkdir(parents=True, exist_ok=True)
 
     opts = Options()
@@ -317,7 +307,7 @@ def _chrome_driver():
         _log_driver_versions(drv)
         return drv
 
-    # 2) Selenium Manager (best default; works with system Chrome/Chromium)
+    # 2) Selenium Manager (best default)
     try:
         drv = webdriver.Chrome(options=opts)
         _log_driver_versions(drv)
@@ -328,14 +318,13 @@ def _chrome_driver():
     # 3) Fallback: webdriver‑manager (online only)
     if _WDM_AVAILABLE:
         try:
-            service = Service(ChromeDriverManager().install())  # no ChromeType dependency
+            service = Service(ChromeDriverManager().install())
             drv = webdriver.Chrome(service=service, options=opts)
             _log_driver_versions(drv)
             return drv
         except Exception as exc:  # pragma: no cover
             log.warning("webdriver‑manager failed as fallback: %s", exc)
 
-    # All strategies failed
     raise RuntimeError(
         "Unable to provision a Chrome driver. "
         "Set CHROMEDRIVER to a working chromedriver path, or ensure Selenium "
@@ -364,11 +353,7 @@ def _retry(action, what: str):
 #  Composer detection & interaction (browser mode)
 # ────────────────────────────────────────────────────────────────────────────
 def _is_interactable(el) -> bool:
-    """
-    Return True if *el* is visible and enabled, and not aria-hidden.
-
-    ChatGPT sometimes renders hidden/disabled inputs during UI re-mounts.
-    """
+    """True if *el* is visible and enabled, and not aria-hidden."""
     try:
         if not el.is_displayed():
             return False
@@ -458,9 +443,8 @@ def _wait_textarea(drv, *, bounded: bool = False, max_wait: int = WAIT_UI):  # p
 
 def _sanitize_for_send_keys(text: str) -> str:
     """
-    Replace non‑BMP characters (e.g. emoji) with spaces to avoid:
+    Replace non‑BMP characters (e.g., emoji) with spaces to avoid:
         "ChromeDriver only supports characters in the BMP"
-    See: https://bugs.chromium.org/p/chromedriver/issues/detail?id=2470 (historic)
     """
     return "".join(ch if ord(ch) <= 0xFFFF else " " for ch in text)
 
@@ -511,18 +495,14 @@ def _assistant_block(drv):
     syms = _lazy_import_selenium()
     By = syms["By"]
     try:
-        blocks = drv.find_elements(
-            By.CSS_SELECTOR, "div[data-message-author-role='assistant']"
-        )
+        blocks = drv.find_elements(By.CSS_SELECTOR, "div[data-message-author-role='assistant']")
     except Exception:
         blocks = []
     return blocks[-1] if blocks else None
 
 
 def _wait_reply(drv) -> str:
-    """
-    Wait for ChatGPT to finish streaming and return the reply text.
-    """
+    """Wait for ChatGPT to finish streaming and return the reply text."""
     _wait_composer(drv, bounded=True, max_wait=WAIT_UI)
     start = time.time()
     last_txt, last_change = "", time.time()
@@ -555,7 +535,6 @@ def _navigate_to_chat(drv) -> None:
 
 # ════════════════════════════════════════════════════════════════════════════
 # Patch extraction – code‑fence tolerant, balanced braces
-# (shared by both modes; tests import this symbol)
 # ════════════════════════════════════════════════════════════════════════════
 _FENCE_RE = re.compile(r"```(?:jsonc?|text)?\s*(.*?)\s*```", re.S)
 
@@ -656,14 +635,11 @@ def _send_error_chunks(
     """
     Post a failing log back to ChatGPT in **tagged, safe‑sized chunks**.
 
-    Each message is prefixed with `[gpt-review#<session>] (i/N)` so interleaving
-    cannot confuse the assistant. The **first** chunk includes a compact metadata
-    header (commit SHA, command, exit code, timestamp). Commit lookup is safe on
-    fresh repos.
+    The first chunk includes compact metadata (commit, command, exit code, time).
     """
     chunks = _chunk(output)
     N = len(chunks)
-    commit = _current_commit(repo)  # safe on empty repos
+    commit = _current_commit(repo)
     ts = _now_iso_utc()
 
     header = textwrap.dedent(
@@ -736,7 +712,7 @@ def _send_apply_error(
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Prompt helpers
+# Prompt helpers (browser/api single‑loop)
 # ════════════════════════════════════════════════════════════════════════════
 def _initial_prompt(instr: str) -> str:
     """
@@ -766,7 +742,7 @@ def _nudge_resend_raw_json() -> str:
         "Please **resend** the patch as a single **raw JSON** object only — "
         "no prose, no markdown, no code fences. "
         "Remember the keys: op, file, (body|body_b64), target, mode, status. "
-        'Use status="in_progress" until the final patch, then "completed".'
+        'Use status=\"in_progress\" until the final patch, then \"completed\".'
     )
 
 
@@ -774,13 +750,7 @@ def _probe_prompt() -> str:
     """
     Minimal schema echo – reliably elicits a valid JSON object we can parse.
 
-    We use a **harmless marker patch** so we can detect it and **skip applying**:
-    {
-      "op": "create",
-      "file": "__gpt_review_probe__",
-      "body": "ok",
-      "status": "in_progress"
-    }
+    We use a harmless marker patch so we can detect it and **skip applying**.
     """
     return (
         "Capability probe: reply with this **exact JSON object only** "
@@ -809,33 +779,34 @@ def _cli_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="gpt-review")
     p.add_argument("instructions", help="Plain‑text instructions file")
     p.add_argument("repo", help="Path to Git repository")
-    p.add_argument("--cmd", help="Shell command to run after each patch")
-    p.add_argument("--auto", action="store_true", help="Auto‑send 'continue'")
-    p.add_argument(
-        "--timeout",
-        type=int,
-        default=DEFAULT_TIMEOUT,
-        help=f"Command timeout (s) [env default {DEFAULT_TIMEOUT}]",
-    )
 
-    # Mode switch (default browser)
+    # Common options
+    p.add_argument("--cmd", help="Shell command to run after each patch (browser/api modes)")
+    p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"Command timeout (s). Default: {DEFAULT_TIMEOUT}")
+
+    # Mode switch
     p.add_argument(
         "--mode",
-        choices=("browser", "api"),
+        choices=("browser", "api", "iterate"),
         default=os.getenv("GPT_REVIEW_MODE", "browser"),
-        help="Interaction mode: browser (Selenium) or api (OpenAI‑compatible). Default: browser.",
+        help="Interaction mode. Default: browser.",
     )
-    # API‑mode options
+
+    # Browser mode quality‑of‑life
+    p.add_argument("--auto", action="store_true", help="Browser mode: auto‑send 'continue' after each patch.")
+
+    # API/iterate shared options
+    p.add_argument("--model", default=DEFAULT_MODEL, help="API/iterate: model id (e.g., gpt-5-pro).")
+    p.add_argument("--api-timeout", type=int, default=DEFAULT_API_TIMEOUT, help="API/iterate: HTTP timeout (seconds).")
+
+    # Iterate‑mode extras
+    p.add_argument("--remote", default=DEFAULT_REMOTE, help=f"Iterate: Git remote to push (default: {DEFAULT_REMOTE}).")
+    p.add_argument("--no-push", action="store_true", help="Iterate: do not push at the end (treat remote as None).")
     p.add_argument(
-        "--model",
-        default=DEFAULT_MODEL,
-        help="API mode: model name (e.g., gpt-5-pro). Env: GPT_REVIEW_MODEL.",
-    )
-    p.add_argument(
-        "--api-timeout",
+        "--max-error-rounds",
         type=int,
-        default=DEFAULT_API_TIMEOUT,
-        help="API mode: HTTP request timeout in seconds. Env: GPT_REVIEW_API_TIMEOUT.",
+        default=DEFAULT_MAX_ERROR_ROUNDS,
+        help=f"Iterate: maximum error‑fix rounds. Default: {DEFAULT_MAX_ERROR_ROUNDS}",
     )
     return p.parse_args()
 
@@ -850,14 +821,48 @@ def main() -> None:
     if not (repo / ".git").exists():
         sys.exit("❌ Not a git repository: " + str(repo))
 
-    # ── API MODE ─────────────────────────────────────────────────────────────
+    # ── ITERATE MODE (multi‑iteration orchestrator) ──────────────────────────
+    if args.mode == "iterate":
+        log.info(
+            "Mode: iterate | model=%s | api_timeout=%s | remote=%s | max_error_rounds=%s",
+            args.model,
+            args.api_timeout,
+            (None if args.no_push else args.remote),
+            args.max_error_rounds,
+        )
+        try:
+            from gpt_review.orchestrator import run_iterations
+        except Exception as exc:
+            log.exception("Failed to import orchestrator: %s", exc)
+            sys.exit(1)
+
+        try:
+            run_iterations(
+                instructions_path=Path(args.instructions).expanduser().resolve(),
+                repo=repo,
+                model=args.model,
+                api_timeout=args.api_timeout,
+                remote=None if args.no_push else (args.remote or None),
+                timeout=args.timeout,
+                max_error_rounds=args.max_error_rounds,
+            )
+        except SystemExit:
+            raise
+        except KeyboardInterrupt:
+            log.info("Interrupted by user (Ctrl‑C). Exiting.")
+            sys.exit(130)
+        except Exception as exc:
+            log.exception("Unhandled error in orchestrator: %s", exc)
+            sys.exit(1)
+        return
+
+    # ── API MODE (single‑loop, tool‑enforced patches) ────────────────────────
     if args.mode == "api":
         log.info(
             "Mode: api | model=%s | api_timeout=%s",
             args.model,
             args.api_timeout,
         )
-        # Lazy import keeps Selenium completely out of the API path.
         try:
             from gpt_review.api_driver import run as api_run
         except Exception as exc:
@@ -882,12 +887,10 @@ def main() -> None:
         except Exception as exc:
             log.exception("Unhandled error in API driver: %s", exc)
             sys.exit(1)
-        return  # API mode finished
+        return
 
     # ── BROWSER MODE (default) ───────────────────────────────────────────────
     log.info("Mode: browser")
-
-    # Short, stable session id for this run (used in error‑log chunk tags)
     session_id = uuid.uuid4().hex[:12]
     log.info("Session id: %s", session_id)
 
@@ -931,8 +934,7 @@ def main() -> None:
         while True:
             reply = _wait_reply(driver)
 
-            # Persist **as soon as** we have a complete assistant reply, keeping
-            # the conversation pointer fresh even if patch application fails.
+            # Persist **as soon as** we have a complete assistant reply
             _save_state_quiet(repo, driver.current_url)
 
             patch = _extract_patch(reply)
@@ -959,7 +961,6 @@ def main() -> None:
                         PROBE_RETRIES,
                     )
                     _send_message(driver, _probe_prompt())
-                    # Wait for probe response
                     probe_reply = _wait_reply(driver)
                     _save_state_quiet(repo, driver.current_url)
                     probe_patch = _extract_patch(probe_reply)
@@ -967,36 +968,32 @@ def main() -> None:
                     if probe_patch is None:
                         log.error("Probe response still not a valid JSON object.")
                         probe_budget -= 1
-                        # Give the assistant one more clear nudge after the probe
                         if probe_budget > 0:
                             _send_message(driver, _nudge_resend_raw_json())
                         continue
 
-                    # If we received the *marker* probe, skip applying; ask for real patch
+                    # Marker probe → skip apply, ask for real patch
                     if _is_probe_patch(probe_patch):
                         log.info("Capability probe succeeded (marker patch received).")
-                        # Reset the nudge budget; ask for the *real* patch now
                         nudge_budget = NUDGE_RETRIES
                         _send_message(
                             driver,
                             "Thanks. Now please **resend the actual patch** as a single "
                             "**raw JSON** object only (no prose, no fences).",
                         )
-                        # Loop for the real patch
                         continue
 
-                    # We got a real valid patch (great!) → proceed with it
+                    # A real valid patch → proceed
                     log.info("Probe returned a valid non‑marker patch; proceeding.")
                     patch = probe_patch
-
                 else:
                     log.error("Exceeded capability probe attempts (%d). Stopping.", PROBE_RETRIES)
                     break
 
-            # Reset nudge budget once we successfully parsed any valid patch
+            # Reset nudge budget once we parsed any valid patch
             nudge_budget = NUDGE_RETRIES
 
-            # Guard: ignore the probe patch if it slipped through (extra safety)
+            # Guard: ignore the marker probe if it slipped through
             if _is_probe_patch(patch):
                 log.info("Ignoring marker probe patch (no apply). Requesting real patch.")
                 _send_message(driver, _nudge_resend_raw_json())
@@ -1021,7 +1018,6 @@ def main() -> None:
                         stderr=proc.stderr or "",
                         exit_code=proc.returncode,
                     )
-                    # Conversation URL might change while sending logs
                     _save_state_quiet(repo, driver.current_url)
                     continue
             except Exception as exc:
@@ -1058,7 +1054,7 @@ def main() -> None:
 
             # Finished?
             if patch["status"] == "completed":
-                log.info("🎉 All done – tests pass and status=completed.")
+                log.info("🎉 All done – command (if any) passed and status=completed.")
                 _clear_state(repo)
                 break
 

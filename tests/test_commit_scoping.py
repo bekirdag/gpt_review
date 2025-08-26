@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 ===============================================================================
 Regression tests ▸ Commit path‑scoping (no sibling sweep)

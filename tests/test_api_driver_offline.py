@@ -5,17 +5,16 @@ Offline unit test for the API driver (`gpt_review.api_driver`).
 
 Goals
 -----
-• Exercise the end-to-end control flow in API mode without network access.
-• Inject a fake OpenAI client that always returns a single `submit_patch` tool call
-  with `status="completed"` so the loop exits cleanly after one turn.
-• Stub subprocess.run to:
+• Exercise the end-to-end control flow in API mode **without** network access.
+• Inject a fake OpenAI client that always returns a `submit_patch` tool call
+  (first invalid, then valid in the error-flow test) so we can verify the loop.
+• Stub `subprocess.run` to:
     - emulate `apply_patch.py` success (returncode=0),
-    - emulate `git rev-parse` (no commits yet, harmless),
-    - pass-through everything else to the original runner (rare).
+    - emulate `git rev-parse` (no commits yet),
+    - pass-through everything else to the original runner.
 
-This test does *not* assert filesystem changes because the patch application is
-stubbed at the process layer; it focuses on API-driver orchestration and error
-handling boundaries.
+This suite focuses on API-driver orchestration & error handling boundaries,
+not on file system changes (apply is stubbed at the process layer).
 
 Run with:
     pytest -q tests/test_api_driver_offline.py
@@ -23,7 +22,6 @@ Run with:
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -43,8 +41,7 @@ class _FakeCompletions:
     def __init__(self, responses: List[Dict[str, Any]]):
         """
         responses: a list of dicts describing the tool-call payloads to return.
-        Each item should be a Python dict that will be JSON-encoded into the tool
-        call's `.function.arguments`.
+        Each item is JSON-encoded into the tool call's `.function.arguments`.
         """
         self._responses = list(responses)
         self.calls: List[Dict[str, Any]] = []
@@ -56,8 +53,7 @@ class _FakeCompletions:
         """
         self.calls.append(kwargs)
         if not self._responses:
-            # If more calls are made than responses provided, return a no-op
-            # assistant turn without tool calls to surface a failure.
+            # No more scripted responses → simulate a no-op assistant turn
             msg = _Obj(role="assistant", content="(no tool_calls)", tool_calls=[])
             return _Obj(choices=[_Obj(message=msg)])
 
@@ -112,7 +108,7 @@ def stub_subprocess_run(monkeypatch):
         # Normalize program vector for pattern checks
         vector = args if isinstance(args, (list, tuple)) else [args]
 
-        # 1) apply_patch.py (Python -m invocation with script path at argv[1])
+        # 1) apply_patch.py (Python interpreter + script path at argv[1])
         if (
             isinstance(vector, (list, tuple))
             and len(vector) >= 2
@@ -168,21 +164,24 @@ def test_api_driver_completes_with_single_completed_patch(tmp_path, stub_subproc
         instructions_path=instructions,
         repo=repo,
         cmd=None,           # no command to run
-        auto=True,          # doesn't matter; we exit in one turn
+        auto=True,          # ignored in API mode
         timeout=120,        # unused here
         model="test-model", # carried through to the fake client log only
         api_timeout=30,
         client=fake_client, # injected: no network calls
     )
 
-    # Assert: one API call made, with our forced tool_choice & tools present.
+    # Assert: one API call made, with forced tool schema/choice present.
     calls = fake_client.chat.completions.calls
     assert len(calls) == 1, "expected exactly one API round-trip"
-    # Basic shape checks (not brittle to exact SDK internals)
+
     sent = calls[0]
     assert "messages" in sent and isinstance(sent["messages"], list)
+    assert sent["messages"][0]["role"] == "system"
     assert "tools" in sent and sent["tools"], "tools schema must be sent"
+    assert sent["tools"][0]["function"]["name"] == "submit_patch"
     assert "tool_choice" in sent and sent["tool_choice"], "tool_choice must be forced"
+    assert sent["tool_choice"]["function"]["name"] == "submit_patch"
 
 
 def test_api_driver_handles_validation_error_then_nudge(tmp_path, stub_subprocess_run):

@@ -485,3 +485,280 @@ def build_review_spec_prompt(
     ).strip()
     log.debug("Review spec prompt built for %s (%d chars).", file_name, len(msg))
     return msg
+
+
+# =============================================================================
+# Compatibility wrappers (used by `gpt_review.workflow`)
+# =============================================================================
+def build_overview_prompt(*, instructions: str, manifest: str) -> str:
+    """
+    One‑time “understand first” overview message used at the **start of iteration 1**.
+    This is a **plain user message** (no tool call) that frames the whole run.
+    """
+    msg = textwrap.dedent(
+        f"""
+        You are GPT‑Review running a three‑iteration software review.
+
+        Objectives:
+        1) Understand the repository structure and the user's instructions.
+        2) Review **each file one by one**, returning **complete files** via `submit_patch`.
+        3) After finishing all files in an iteration, propose any **new files** as a JSON list.
+        4) Only in iteration 3, also review **docs/setup/examples** and ensure cross‑project consistency.
+        5) During the error‑fix phase, use the logs to propose **complete file** fixes.
+
+        Instructions from user:
+        {instructions}
+
+        Repository manifest (non‑binary, repo‑relative paths):
+        {manifest}
+
+        Ground rules:
+        - Preserve behavior unless fixing clear defects.
+        - Keep changes minimal and self‑contained.
+        - All paths must be **repo‑relative POSIX**.
+        - {PATCH_OUTPUT_RULES}
+        """
+    ).strip()
+    log.debug("Overview prompt built (%d chars).", len(msg))
+    return msg
+
+
+def build_file_prompt(
+    *,
+    instructions: str,
+    manifest: str,
+    iteration: int,
+    rel_path: str,
+    content: str,
+) -> str:
+    """
+    Per‑file prompt used by `workflow.ReviewWorkflow` (iterations 1–3).
+    Requires a `submit_patch` call that returns a **complete file**.
+    """
+    defer = ("\n" + DEFER_RULES_EARLY) if iteration in (1, 2) else ("\n" + CONSISTENCY_RULES)
+    msg = textwrap.dedent(
+        f"""
+        Review iteration {iteration} — file: `{rel_path}`.
+
+        Project instructions:
+        {instructions}
+
+        Repository manifest:
+        {manifest}
+
+        The file below is the **current ground truth**. Return a COMPLETE file
+        if changes are required; otherwise use op="update" with an identical body
+        or op="delete" only if the file must be removed.
+
+        Current content:
+        ```text
+        {content}
+        ```
+
+        Requirements:
+        - Keep behavior unless clearly buggy; modernize APIs for Python 3.12 if applicable.
+        - Ensure imports, logging, typing, and style align with the project.
+        - Use the exact repo‑relative path I gave.
+        - If the file should be renamed: `submit_patch` with op="rename" and set `target`.
+        {defer}
+
+        {PATCH_OUTPUT_RULES}
+        """
+    ).strip()
+    log.debug("Workflow file prompt built for %s (%d chars).", rel_path, len(msg))
+    return msg
+
+
+def build_new_files_prompt(*, instructions: str, manifest: str, iteration: int) -> str:
+    """
+    Ask for a **strict JSON array** of new files after an iteration.
+    The `workflow` will then request each file body via a separate `submit_patch` call.
+    """
+    phase = "early (no docs/setup/examples)" if iteration in (1, 2) else "full (docs allowed)"
+    msg = textwrap.dedent(
+        f"""
+        We have finished per‑file edits for iteration {iteration} — {phase}.
+
+        Based on the repository state and the instructions below, return a **strict JSON array**
+        (no prose, no code fences) where each item is:
+
+        {{ "path": "relative/posix/path.ext", "reason": "why this file is needed now" }}
+
+        Rules:
+        - Paths MUST be **repo‑relative POSIX**.
+        - For iterations 1–2, **exclude** docs/setup/examples; include only source/tests/config.
+        - Do not include files that already exist.
+
+        Instructions:
+        {instructions}
+
+        Repository manifest:
+        {manifest}
+        """
+    ).strip()
+    log.debug("Workflow new-files prompt built (%d chars).", len(msg))
+    return msg
+
+
+def build_consistency_prompt(
+    *,
+    instructions: str,
+    manifest: str,
+    rel_path: str,
+    content: str,
+) -> str:
+    """
+    Iteration‑3 consistency prompt for a single file (full replacement required).
+    """
+    msg = textwrap.dedent(
+        f"""
+        Iteration 3 — **consistency pass** for file `{rel_path}`.
+
+        Instructions:
+        {instructions}
+
+        Repository manifest:
+        {manifest}
+
+        The goal is cross‑file consistency (naming, imports, error handling, logging,
+        configuration). If you change conventions here, ensure they align with the
+        rest of the project. Return a **complete file**.
+
+        Current content:
+        ```text
+        {content}
+        ```
+
+        {CONSISTENCY_RULES}
+
+        {PATCH_OUTPUT_RULES}
+        """
+    ).strip()
+    log.debug("Workflow consistency prompt built for %s (%d chars).", rel_path, len(msg))
+    return msg
+
+
+def build_error_fix_list_prompt(*, instructions: str, manifest: str, error_log_tail: str) -> str:
+    """
+    Ask for a **strict JSON array** of files to change given error logs.
+    Each item: { "path": "relative/path", "reason": "short explanation" }.
+    """
+    msg = textwrap.dedent(
+        f"""
+        The following run produced errors. Analyze and list only the files that must change.
+
+        Error log (tail):
+        ```text
+        {error_log_tail}
+        ```
+
+        Return a **strict JSON array** (no prose) with items of shape:
+        {{ "path": "relative/posix/path", "reason": "short explanation" }}
+
+        Rules:
+        - Include only files you are confident must change.
+        - Exclude generated artefacts and build outputs.
+        - Paths MUST be repo‑relative POSIX.
+
+        Context:
+        • Instructions: {instructions}
+        • Repository manifest:
+        {manifest}
+        """
+    ).strip()
+    log.debug("Workflow error-fix list prompt built (%d chars).", len(msg))
+    return msg
+
+
+def build_error_fix_file_prompt(*, instructions: str, manifest: str, rel_path: str, reason: str) -> str:
+    """
+    Ask for a **complete file** (create/update) for a single target path.
+    Used both for new file creation and for error‑driven fixes to existing files.
+    """
+    msg = textwrap.dedent(
+        f"""
+        Provide a **complete file** for this path via `submit_patch`.
+
+        Path:
+        {rel_path}
+
+        Reason:
+        {reason}
+
+        Constraints:
+        - Use the exact repo‑relative POSIX path above.
+        - Include all required imports and code; do not return a diff.
+        - Maintain project conventions (logging, typing, structure).
+        - If this replaces an existing file, ensure backward compatibility unless fixing a defect.
+
+        Context:
+        • Instructions: {instructions}
+        • Repository manifest:
+        {manifest}
+
+        {PATCH_OUTPUT_RULES}
+        """
+    ).strip()
+    log.debug("Workflow error-fix file prompt built for %s (%d chars).", rel_path, len(msg))
+    return msg
+
+
+def build_final_instructions_prompt(*, instructions: str, manifest: str) -> str:
+    """
+    Ask the assistant to synthesize an authoritative **REVIEW_INSTRUCTIONS.md**
+    as a **strict JSON array** with a single object:
+      [{ "path": "REVIEW_INSTRUCTIONS.md", "body": "<full markdown>" }]
+    """
+    msg = textwrap.dedent(
+        f"""
+        Create a **single Markdown file** named `REVIEW_INSTRUCTIONS.md` that explains:
+        - What this software does (your own words, based on the code)
+        - How to run it (commands)
+        - What success looks like (observable outputs)
+        - Supported tech stack(s) and versions
+        - Known constraints / non‑goals
+        - Checklist for future review runs
+
+        Return a **strict JSON array** (no prose) with exactly one item:
+        [{{ "path": "REVIEW_INSTRUCTIONS.md", "body": "<full markdown content>" }}]
+
+        Context:
+        • Instructions: {instructions}
+        • Repository manifest:
+        {manifest}
+        """
+    ).strip()
+    log.debug("Workflow final-instructions prompt built (%d chars).", len(msg))
+    return msg
+
+
+# =============================================================================
+# __all__
+# =============================================================================
+__all__ = [
+    # tool schema
+    "get_submit_patch_tool",
+    # system / iteration
+    "IterationContext",
+    "build_system_prompt",
+    # per-file
+    "build_file_review_prompt",
+    # discovery
+    "build_new_files_discovery_prompt",
+    # consistency/docs
+    "build_consistency_pass_prompt",
+    "build_docs_phase_prompt",
+    # error diagnostics / fixes
+    "build_error_diagnosis_prompt",
+    "build_error_fix_prompt_for_file",
+    # review spec
+    "build_review_spec_prompt",
+    # workflow compatibility wrappers
+    "build_overview_prompt",
+    "build_file_prompt",
+    "build_new_files_prompt",
+    "build_consistency_prompt",
+    "build_error_fix_list_prompt",
+    "build_error_fix_file_prompt",
+    "build_final_instructions_prompt",
+]
