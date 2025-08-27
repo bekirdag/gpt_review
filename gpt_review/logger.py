@@ -19,14 +19,14 @@ Key features
 ------------
 * Console output – INFO level by default (override via env).
 * Daily rotating file – DEBUG level, 7 days retention (both tunable).
-* Idempotent – repeated calls do not duplicate handlers.
+* Idempotent – root handlers are configured **once**; child loggers propagate.
 * Resilient – falls back to a temp dir, then console‑only, if log dir unwritable.
 * Environment overrides:
     GPT_REVIEW_LOG_DIR   – log directory (default: ./logs)
     GPT_REVIEW_LOG_LVL   – console level  (DEBUG / INFO / WARNING / …)
     GPT_REVIEW_LOG_ROT   – rotation schedule ("midnight", "H", "M", …)
     GPT_REVIEW_LOG_BACK  – number of backup files (default 7)
-    GPT_REVIEW_LOG_UTC   – truthy → timestamps in UTC (1/true/yes/on)
+    GPT_REVIEW_LOG_UTC   – truthy → timestamps & rotation in UTC (1/true/yes/on)
     GPT_REVIEW_LOG_JSON  – truthy → emit JSON lines to console
 """
 from __future__ import annotations
@@ -39,6 +39,9 @@ import time
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Optional
+
+# Only the root project logger "gpt_review" owns handlers; children propagate.
+_ROOT_LOGGER_NAME = "gpt_review"
 
 # ════════════════════════════════════════════════════════════════════════════
 # Helpers
@@ -56,7 +59,7 @@ def _is_truthy(val: str | None) -> bool:
 _DEFAULT_DIR = Path("logs")
 _LOG_DIR_ENV = os.getenv("GPT_REVIEW_LOG_DIR", str(_DEFAULT_DIR))
 CONSOLE_LEVEL = os.getenv("GPT_REVIEW_LOG_LVL", "INFO").upper()
-ROTATE_WHEN = os.getenv("GPT_REVIEW_LOG_ROT", "midnight")  # see TimedRotatingFileHandler
+ROTATE_WHEN = os.getenv("GPT_REVIEW_LOG_ROT", "midnight")  # TimedRotatingFileHandler 'when'
 BACKUP_COUNT = int(os.getenv("GPT_REVIEW_LOG_BACK", "7"))
 USE_UTC = _is_truthy(os.getenv("GPT_REVIEW_LOG_UTC"))
 JSON_CONSOLE = _is_truthy(os.getenv("GPT_REVIEW_LOG_JSON"))
@@ -128,6 +131,7 @@ def _ensure_log_dir(preferred: Path) -> Path:
         # 3) Final fallback handled by get_logger (console‑only)
         return Path(".")
 
+
 def _root_log_filename(base_dir: Path) -> Path:
     """
     Use a single rotating file for the package ('gpt_review.log') so
@@ -150,6 +154,7 @@ def _make_file_handler(log_dir: Path) -> Optional[TimedRotatingFileHandler]:
             interval=1,
             backupCount=BACKUP_COUNT,
             encoding="utf-8",
+            utc=USE_UTC,  # rotate based on UTC when requested
         )
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(_human_formatter())
@@ -183,44 +188,50 @@ def get_logger(name: str | None = None) -> logging.Logger:
 
     Notes
     -----
-    The function is *idempotent*: handlers are added only once per logger,
-    so repeated calls are safe and inexpensive.
+    Handlers are attached **only to the root** "gpt_review" logger. Child loggers
+    are returned without handlers and **propagate** to the root, avoiding duplicate
+    console/file outputs across modules.
     """
-    log_name = name or "gpt_review"
-    logger = logging.getLogger(log_name)
+    root = logging.getLogger(_ROOT_LOGGER_NAME)
 
-    # Already configured?
-    if logger.handlers:
-        return logger
+    # Configure root once
+    if not root.handlers:
+        root.setLevel(logging.DEBUG)
 
-    # Capture everything; handlers will filter.
+        # Determine log directory (resilient)
+        preferred_dir = Path(_LOG_DIR_ENV)
+        log_dir = _ensure_log_dir(preferred_dir)
+
+        # File handler (if possible) – single shared file for the package
+        fh = _make_file_handler(log_dir)
+        if fh is not None:
+            root.addHandler(fh)
+
+        # Console handler (always attach)
+        root.addHandler(_make_console_handler())
+
+        # Root does not propagate to ancestors
+        root.propagate = False
+
+        # Startup banner at DEBUG so we don't spam normal console INFO output
+        root.debug(
+            "Logger initialised | dir=%s | console=%s | rotate=%s | backups=%s | utc=%s | json-console=%s",
+            str(log_dir),
+            CONSOLE_LEVEL,
+            ROTATE_WHEN,
+            BACKUP_COUNT,
+            USE_UTC,
+            JSON_CONSOLE,
+        )
+
+    # Return root or a child that propagates to root
+    if name is None or name == _ROOT_LOGGER_NAME:
+        return root
+
+    logger = logging.getLogger(name)
+    # Ensure child loggers don't attach their own handlers; propagate to root.
     logger.setLevel(logging.DEBUG)
-
-    # Determine log directory (resilient)
-    preferred_dir = Path(_LOG_DIR_ENV)
-    log_dir = _ensure_log_dir(preferred_dir)
-
-    # File handler (if possible) – single shared file for the package
-    fh = _make_file_handler(log_dir)
-    if fh is not None:
-        logger.addHandler(fh)
-
-    # Console handler (always attach)
-    logger.addHandler(_make_console_handler())
-
-    # Avoid double‑logging via ancestor propagation
-    logger.propagate = False
-
-    # Startup banner at DEBUG so we don't spam normal console INFO output
-    logger.debug(
-        "Logger initialised | dir=%s | console=%s | rotate=%s | backups=%s | utc=%s | json-console=%s",
-        str(log_dir),
-        CONSOLE_LEVEL,
-        ROTATE_WHEN,
-        BACKUP_COUNT,
-        USE_UTC,
-        JSON_CONSOLE,
-    )
+    logger.propagate = True
     return logger
 
 

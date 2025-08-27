@@ -203,7 +203,14 @@ fi
 # -------------------------------- validations ------------------------------ #
 [[ -f "$INSTRUCTIONS" ]] || die "'$INSTRUCTIONS' not found"
 [[ -r "$INSTRUCTIONS" ]] || die "'$INSTRUCTIONS' is not readable"
-[[ -d "$REPO/.git"   ]] || die "'$REPO' is not a git repository"
+
+# Ensure git is available and repo is valid (supports worktrees)
+if ! command -v git >/dev/null 2>&1; then
+  die "git is required but not found in PATH"
+fi
+if ! git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  die "'$REPO' is not a git repository (or worktree)"
+fi
 
 if [[ $FRESH -eq 1 ]]; then
   if [[ -f "$REPO/.gpt-review-state.json" ]]; then

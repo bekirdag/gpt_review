@@ -178,11 +178,7 @@ The official image is Debian‑based and uses system **Chromium** (headless by d
 ```bash
 docker build -t gpt-review .
 
-docker run -it --rm \
-  -v $HOME/.cache/gpt-review/chrome:/home/nonroot/.cache/chrome \
-  -v "$(pwd)":/workspace \
-  gpt-review /workspace/example_instructions.txt /workspace \
-  --cmd "pytest -q" --auto
+docker run -it --rm   -v $HOME/.cache/gpt-review/chrome:/home/nonroot/.cache/chrome   -v "$(pwd)":/workspace   gpt-review /workspace/example_instructions.txt /workspace   --cmd "pytest -q" --auto
 ```
 
 ### Update (in‑place upgrade)

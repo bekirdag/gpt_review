@@ -15,6 +15,14 @@ Provide strict, reusable prompt text for every stage of the orchestrated review:
   • Documentation / setup / install files phase (deferred to iteration 3)
   • Error diagnosis and per‑file fix prompts (stages 8–9)
 
+Blueprint awareness
+-------------------
+When available, the orchestrator can pass an abridged summary of the four
+blueprint documents (Whitepaper, Build Guide, SDS, Project Instructions) via
+the optional `blueprints_summary` keyword parameter. This content is spliced
+into prompts to keep the review aligned with the project’s authoritative
+requirements. If not provided, prompts behave as before.
+
 Design choices
 --------------
 • Output contract is crystal‑clear: **one tool call** to `submit_patch`
@@ -34,13 +42,14 @@ Dependencies
 No external deps. The orchestrator provides:
   - repo metadata (language census, file list),
   - file contents (normalized LF),
-  - error logs for fix phases.
+  - error logs for fix phases,
+  - (optionally) blueprints summary text.
 """
 from __future__ import annotations
 
 import textwrap
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence
+from typing import List, Optional, Sequence
 
 from gpt_review import get_logger
 
@@ -149,6 +158,15 @@ NEW_FILES_SPEC = textwrap.dedent(
 ).strip()
 
 
+def _bp_block(blueprints_summary: Optional[str]) -> str:
+    """
+    Small helper: materialize the blueprint documents block if provided.
+    """
+    if not blueprints_summary:
+        return ""
+    return f"\nBlueprint documents (abridged):\n{blueprints_summary}\n"
+
+
 # =============================================================================
 # Iteration system prompts
 # =============================================================================
@@ -162,12 +180,23 @@ class IterationContext:
     goals: str                     # user instruction summary (concise)
 
 
-def build_system_prompt(ctx: IterationContext) -> str:
+def build_system_prompt(
+    ctx: IterationContext,
+    *,
+    blueprints_summary: Optional[str] = None,
+) -> str:
     """
     Build a strict system prompt that frames the entire iteration.
 
     The orchestrator sends this as the `system` message for the turn sequence
     it drives during the iteration.
+
+    Parameters
+    ----------
+    ctx : IterationContext
+        Iteration metadata.
+    blueprints_summary : Optional[str]
+        Optional abridged text of the four blueprint docs to ground the review.
     """
     lang_line = ", ".join(ctx.languages) or "<unknown>"
     if ctx.iteration in (1, 2):
@@ -175,11 +204,13 @@ def build_system_prompt(ctx: IterationContext) -> str:
     else:
         extra = DOCS_PHASE_RULES + "\n" + CONSISTENCY_RULES
 
+    bp = _bp_block(blueprints_summary)
+
     prompt = textwrap.dedent(
         f"""
         You are GPT‑Review. You will audit and fix files **one at a time**.
         You will return **full files** only via the `submit_patch` tool; no diffs/prose.
-
+        {bp}
         Review plan for iteration {ctx.iteration}:
           1) Understand the project, folder structure, and goals.
           2) For each file I send, produce the corrected full file body.
@@ -216,6 +247,7 @@ def build_file_review_prompt(
     rel_path: str,
     file_text: str,
     file_notes: Optional[str] = None,
+    blueprints_summary: Optional[str] = None,
 ) -> str:
     """
     Construct the per‑file **user** message that carries the current file's
@@ -232,13 +264,17 @@ def build_file_review_prompt(
         The current full file content (LF normalized).
     file_notes : Optional[str]
         Optional hints (e.g., known issues, failing tests related to this file).
+    blueprints_summary : Optional[str]
+        Abridged blueprint docs to ground the per‑file decision.
     """
     notes = f"\nNotes:\n{file_notes.strip()}\n" if file_notes else ""
     defer = ("\n" + DEFER_RULES_EARLY) if iteration in (1, 2) else ""
+    bp = _bp_block(blueprints_summary)
+
     user = textwrap.dedent(
         f"""
         Review and fix **this file**. Return a complete file via `submit_patch`.
-
+        {bp}
         Path:
         {rel_path}
 
@@ -270,6 +306,7 @@ def build_new_files_discovery_prompt(
     iteration: int,
     processed_paths: Sequence[str],
     repo_overview: str,
+    blueprints_summary: Optional[str] = None,
 ) -> str:
     """
     Ask the assistant to propose **new files** to be created next.
@@ -280,10 +317,12 @@ def build_new_files_discovery_prompt(
     """
     processed = "\n".join(processed_paths) or "<none>"
     phase = "early (no docs/install/setup/examples yet)" if iteration in (1, 2) else "full (docs allowed)"
+    bp = _bp_block(blueprints_summary)
+
     msg = textwrap.dedent(
         f"""
         We have finished per‑file edits for iteration {iteration} ({phase}).
-
+        {bp}
         Repository overview:
         {repo_overview}
 
@@ -305,6 +344,7 @@ def build_consistency_pass_prompt(
     *,
     repo_overview: str,
     invariant_notes: Optional[str] = None,
+    blueprints_summary: Optional[str] = None,
 ) -> str:
     """
     In iteration 3, request cross‑project alignment. The assistant should still
@@ -312,10 +352,12 @@ def build_consistency_pass_prompt(
     primer sets the expectations.
     """
     inv = f"\nProject invariants:\n{invariant_notes.strip()}\n" if invariant_notes else ""
+    bp = _bp_block(blueprints_summary)
+
     msg = textwrap.dedent(
         f"""
         Iteration 3 consistency pass.
-
+        {bp}
         Overview:
         {repo_overview}
         {inv}
@@ -337,16 +379,19 @@ def build_docs_phase_prompt(
     *,
     repo_overview: str,
     guidance: Optional[str] = None,
+    blueprints_summary: Optional[str] = None,
 ) -> str:
     """
     Enable the deferred classes (docs, install scripts, packaging/setup, examples).
     The orchestrator will drive concrete file edits/creations subsequently.
     """
     guide = f"\nAdditional guidance:\n{guidance.strip()}\n" if guidance else ""
+    bp = _bp_block(blueprints_summary)
+
     msg = textwrap.dedent(
         f"""
         Iteration 3 documentation & setup phase begins.
-
+        {bp}
         Overview:
         {repo_overview}
         {guide}
@@ -368,6 +413,7 @@ def build_error_diagnosis_prompt(
     *,
     run_command: str,
     error_log_tail: str,
+    blueprints_summary: Optional[str] = None,
 ) -> str:
     """
     Ask the assistant to identify impacted files based on a failing run.
@@ -377,12 +423,14 @@ def build_error_diagnosis_prompt(
 
     The orchestrator will then ask for fixes **one file at a time** via submit_patch.
     """
+    bp = _bp_block(blueprints_summary)
+
     msg = textwrap.dedent(
         f"""
         The following command failed:
 
         $ {run_command}
-
+        {bp}
         Error log (tail):
         ```text
         {error_log_tail}
@@ -405,6 +453,7 @@ def build_error_fix_prompt_for_file(
     current_text: str,
     error_excerpt: Optional[str] = None,
     diagnosis_reason: Optional[str] = None,
+    blueprints_summary: Optional[str] = None,
 ) -> str:
     """
     Request a **complete file** fix for a single target file implicated by
@@ -417,10 +466,12 @@ def build_error_fix_prompt_for_file(
         f"\nError excerpts:\n```text\n{error_excerpt.strip()}\n```\n"
         if error_excerpt else ""
     )
+    bp = _bp_block(blueprints_summary)
+
     user = textwrap.dedent(
         f"""
         Apply a fix to this file and return the **entire file** via `submit_patch`.
-
+        {bp}
         File:
         {rel_path}
 
@@ -453,6 +504,7 @@ def build_review_spec_prompt(
     run_instructions: str,
     success_criteria: str,
     file_name: str = "SOFTWARE_REVIEW_SPEC.md",
+    blueprints_summary: Optional[str] = None,
 ) -> str:
     """
     Ask the assistant to generate a **self‑contained review guide** that becomes
@@ -460,11 +512,13 @@ def build_review_spec_prompt(
 
     The orchestrator will request a `submit_patch` create/update for `file_name`.
     """
+    bp = _bp_block(blueprints_summary)
+
     msg = textwrap.dedent(
         f"""
         Create or update `{file_name}` documenting the software review objectives and
         expected outcomes. Return a **complete Markdown file** via `submit_patch`.
-
+        {bp}
         Include:
         - Project overview
         - What the software does (in your words)
@@ -490,15 +544,22 @@ def build_review_spec_prompt(
 # =============================================================================
 # Compatibility wrappers (used by `gpt_review.workflow`)
 # =============================================================================
-def build_overview_prompt(*, instructions: str, manifest: str) -> str:
+def build_overview_prompt(
+    *,
+    instructions: str,
+    manifest: str,
+    blueprints_summary: Optional[str] = None,
+) -> str:
     """
     One‑time “understand first” overview message used at the **start of iteration 1**.
     This is a **plain user message** (no tool call) that frames the whole run.
     """
+    bp = _bp_block(blueprints_summary)
+
     msg = textwrap.dedent(
         f"""
         You are GPT‑Review running a three‑iteration software review.
-
+        {bp}
         Objectives:
         1) Understand the repository structure and the user's instructions.
         2) Review **each file one by one**, returning **complete files** via `submit_patch`.
@@ -530,16 +591,19 @@ def build_file_prompt(
     iteration: int,
     rel_path: str,
     content: str,
+    blueprints_summary: Optional[str] = None,
 ) -> str:
     """
     Per‑file prompt used by `workflow.ReviewWorkflow` (iterations 1–3).
     Requires a `submit_patch` call that returns a **complete file**.
     """
     defer = ("\n" + DEFER_RULES_EARLY) if iteration in (1, 2) else ("\n" + CONSISTENCY_RULES)
+    bp = _bp_block(blueprints_summary)
+
     msg = textwrap.dedent(
         f"""
         Review iteration {iteration} — file: `{rel_path}`.
-
+        {bp}
         Project instructions:
         {instructions}
 
@@ -569,16 +633,24 @@ def build_file_prompt(
     return msg
 
 
-def build_new_files_prompt(*, instructions: str, manifest: str, iteration: int) -> str:
+def build_new_files_prompt(
+    *,
+    instructions: str,
+    manifest: str,
+    iteration: int,
+    blueprints_summary: Optional[str] = None,
+) -> str:
     """
     Ask for a **strict JSON array** of new files after an iteration.
     The `workflow` will then request each file body via a separate `submit_patch` call.
     """
     phase = "early (no docs/setup/examples)" if iteration in (1, 2) else "full (docs allowed)"
+    bp = _bp_block(blueprints_summary)
+
     msg = textwrap.dedent(
         f"""
         We have finished per‑file edits for iteration {iteration} — {phase}.
-
+        {bp}
         Based on the repository state and the instructions below, return a **strict JSON array**
         (no prose, no code fences) where each item is:
 
@@ -606,14 +678,17 @@ def build_consistency_prompt(
     manifest: str,
     rel_path: str,
     content: str,
+    blueprints_summary: Optional[str] = None,
 ) -> str:
     """
     Iteration‑3 consistency prompt for a single file (full replacement required).
     """
+    bp = _bp_block(blueprints_summary)
+
     msg = textwrap.dedent(
         f"""
         Iteration 3 — **consistency pass** for file `{rel_path}`.
-
+        {bp}
         Instructions:
         {instructions}
 
@@ -638,15 +713,23 @@ def build_consistency_prompt(
     return msg
 
 
-def build_error_fix_list_prompt(*, instructions: str, manifest: str, error_log_tail: str) -> str:
+def build_error_fix_list_prompt(
+    *,
+    instructions: str,
+    manifest: str,
+    error_log_tail: str,
+    blueprints_summary: Optional[str] = None,
+) -> str:
     """
     Ask for a **strict JSON array** of files to change given error logs.
     Each item: { "path": "relative/path", "reason": "short explanation" }.
     """
+    bp = _bp_block(blueprints_summary)
+
     msg = textwrap.dedent(
         f"""
         The following run produced errors. Analyze and list only the files that must change.
-
+        {bp}
         Error log (tail):
         ```text
         {error_log_tail}
@@ -670,15 +753,24 @@ def build_error_fix_list_prompt(*, instructions: str, manifest: str, error_log_t
     return msg
 
 
-def build_error_fix_file_prompt(*, instructions: str, manifest: str, rel_path: str, reason: str) -> str:
+def build_error_fix_file_prompt(
+    *,
+    instructions: str,
+    manifest: str,
+    rel_path: str,
+    reason: str,
+    blueprints_summary: Optional[str] = None,
+) -> str:
     """
     Ask for a **complete file** (create/update) for a single target path.
     Used both for new file creation and for error‑driven fixes to existing files.
     """
+    bp = _bp_block(blueprints_summary)
+
     msg = textwrap.dedent(
         f"""
         Provide a **complete file** for this path via `submit_patch`.
-
+        {bp}
         Path:
         {rel_path}
 
@@ -703,12 +795,19 @@ def build_error_fix_file_prompt(*, instructions: str, manifest: str, rel_path: s
     return msg
 
 
-def build_final_instructions_prompt(*, instructions: str, manifest: str) -> str:
+def build_final_instructions_prompt(
+    *,
+    instructions: str,
+    manifest: str,
+    blueprints_summary: Optional[str] = None,
+) -> str:
     """
     Ask the assistant to synthesize an authoritative **REVIEW_INSTRUCTIONS.md**
     as a **strict JSON array** with a single object:
       [{ "path": "REVIEW_INSTRUCTIONS.md", "body": "<full markdown>" }]
     """
+    bp = _bp_block(blueprints_summary)
+
     msg = textwrap.dedent(
         f"""
         Create a **single Markdown file** named `REVIEW_INSTRUCTIONS.md` that explains:
@@ -718,7 +817,7 @@ def build_final_instructions_prompt(*, instructions: str, manifest: str) -> str:
         - Supported tech stack(s) and versions
         - Known constraints / non‑goals
         - Checklist for future review runs
-
+        {bp}
         Return a **strict JSON array** (no prose) with exactly one item:
         [{{ "path": "REVIEW_INSTRUCTIONS.md", "body": "<full markdown content>" }}]
 

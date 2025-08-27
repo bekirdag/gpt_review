@@ -7,69 +7,79 @@ GPT‑Review ▸ Iteration Orchestrator
 
 Overview
 --------
-Implements the three‑iteration, plan‑first review workflow:
+Implements the three‑iteration, plan‑first review workflow **with blueprint
+documents generated up-front** and strict full‑file review semantics:
 
-  0) **Plan‑first** (before touching code):
+  0) **Preflight & Blueprints**:
+        • If the CLI 'repo' looks like a Git URL, clone into a temp workdir.
+        • Generate (if missing) and persist four blueprint docs:
+            - WHITEPAPER & Engineering Blueprint
+            - BUILD GUIDE
+            - SDS (Software Design Specifications)
+            - PROJECT CODE FILES & INSTRUCTIONS
+          These are saved under .gpt-review/blueprints/*.md and committed.
+
+  1) **Plan‑first** (before touching code):
         • Ask the model for an initial *review plan* (description + run/test
-          commands + hints) based on the repository snapshot and instructions.
-        • Persist it under `.gpt-review/initial_plan.json` and
-          `INITIAL_REVIEW_PLAN.md` to guide the upcoming iterations.
+          commands + hints) using the repository snapshot **and** blueprint summary.
+        • Persist under `.gpt-review/initial_plan.json` and `INITIAL_REVIEW_PLAN.md`.
 
-  1) **Iteration 1** (branch "iteration1"):
+  2) **Iteration 1** (branch "iteration1"):
         • For each *code‑like text* file, request a **COMPLETE file** replacement
-          (or KEEP/DELETE) via a forced tool call; apply via `apply_patch.py`.
+          (or KEEP/DELETE). We **send full file contents** (no excerpts).
         • **Commit after every file** to keep a readable history.
-        • After all files, ask the model for **new source files** (strict JSON
-          list); create them one‑by‑one (full file bodies); **commit each**.
+        • After all files, ask the model for **new source files**; create them
+          one‑by‑one (full content); **commit each**.
 
-  2) **Iteration 2** (branch "iteration2"):
+  3) **Iteration 2** (branch "iteration2"):
         • Repeat file‑wise review over *code‑like* files, including newly created.
-        • Ask again for additional **new source files** and create them **one by one**,
-          committing each created file.
+        • Ask again for additional **new source files** and create them **one by one**.
 
-  3) **Iteration 3** (branch "iteration3"):
-        • Consistency pass over **all files** (code + deferred bucket).
+  4) **Iteration 3** (branch "iteration3"):
+        • Consistency pass over **all files** (code + deferred).
         • Generate final **plan artifacts**:
             - machine‑readable: `.gpt-review/review_plan.json`
             - human guide     : `REVIEW_GUIDE.md`
           (both are committed).
         • Review/generate **deferred** files now (docs/setup/examples) — commit each.
 
-  4) **Error‑fix loop**:
+  5) **Error‑fix loop**:
         • Execute the plan’s commands (run/test). On failure, send logs to the
           model and apply returned **COMPLETE file** fixes; **commit each**.
         • Repeat until commands pass or max rounds reached.
 
-  5) **Push** the final branch.
+  6) **Push** the final branch and **create a Pull Request** (when possible).
 
 Strictness
 ----------
 • The model must always return **complete files** (never diffs).
-• Docs/install/setup/examples are **deferred** until iteration 3.
-• All actions use repo‑root‑relative paths.
+• Docs/install/setup/examples are **deferred** until iteration 3 (except the
+  blueprint documents generated up‑front for context).
+• All actions use repo‑root‑relative POSIX paths.
 • We commit **one file per change** to preserve a readable history.
-
-Logging
--------
-INFO for high‑level flow; DEBUG for payloads and tool results.
 
 CLI
 ---
-    python -m gpt_review.orchestrator instructions.txt /path/to/repo \
+    python -m gpt_review.orchestrator instructions.txt <repo-or-url> \
         --model gpt-5-pro --remote origin --api-timeout 120 \
         --max-error-rounds 6
 
 Environment:
   OPENAI_API_KEY (required), OPENAI_BASE_URL (optional)
+  ALWAYS_SEND_FULL_FILE=1 (default) → always send full file contents to the API
+  GPT_REVIEW_CREATE_PR=1           → attempt to open a GitHub PR at the end
+  GITHUB_TOKEN / GH_TOKEN          → token for 'gh' CLI or API auth
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
@@ -84,7 +94,14 @@ from gpt_review.fs_utils import (
     language_census,
     read_text_normalized,
     summarize_repo,
-    git,  # reuse git helper for precise, path-scoped commits
+    git,  # precise, path-scoped commits
+)
+from gpt_review.blueprints_util import (  # central blueprint helpers
+    ensure_blueprint_dir,
+    blueprint_paths,
+    summarize_blueprints,
+    blueprints_exist,
+    normalize_markdown,
 )
 
 log = get_logger(__name__)
@@ -102,13 +119,13 @@ DEFAULT_API_TIMEOUT = int(os.getenv("GPT_REVIEW_API_TIMEOUT", "120"))
 MAX_PROMPT_BYTES = int(os.getenv("GPT_REVIEW_MAX_PROMPT_BYTES", str(200_000)))
 MAX_ERROR_ROUNDS = int(os.getenv("GPT_REVIEW_MAX_ERROR_ROUNDS", "6"))
 
-# When file content exceeds this, we only send head+tail excerpts to the model.
-HEAD_TAIL_BYTES = int(os.getenv("GPT_REVIEW_HEAD_TAIL_BYTES", "60000"))
+# When file content exceeds this, earlier versions excerpted head+tail. We now
+# prefer **full files** by default (can be overridden).
+ALWAYS_SEND_FULL_FILE = os.getenv("ALWAYS_SEND_FULL_FILE", "1").strip().lower() not in {"0", "false", "no", ""}
 
 # =============================================================================
-# Small OpenAI client shim (local; avoids cross‑module tight coupling)
+# OpenAI client shim (local; avoids cross‑module tight coupling)
 # =============================================================================
-
 
 def _ensure_openai_client(api_timeout: int):
     """
@@ -124,8 +141,6 @@ def _ensure_openai_client(api_timeout: int):
         from openai import OpenAI  # type: ignore
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("The 'openai' package is not installed. pip install openai") from exc
-
-    # Per‑call timeouts are used later; the client itself is lightweight.
     return OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY)
 
 
@@ -133,11 +148,8 @@ def _ensure_openai_client(api_timeout: int):
 # Tool schemas (OpenAI "functions")
 # =============================================================================
 
-
 def tool_propose_full_file() -> Dict[str, Any]:
-    """
-    File‑wise tool: requires COMPLETE file bodies for create/update.
-    """
+    """File‑wise tool: requires COMPLETE file bodies for create/update."""
     return {
         "type": "function",
         "function": {
@@ -151,10 +163,7 @@ def tool_propose_full_file() -> Dict[str, Any]:
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Relative path from repo root."},
-                    "action": {
-                        "type": "string",
-                        "enum": ["create", "update", "keep", "delete"],
-                    },
+                    "action": {"type": "string", "enum": ["create", "update", "keep", "delete"]},
                     "content": {"type": "string", "description": "Full file content when creating/updating."},
                     "notes": {"type": "string", "description": "Short rationale (optional)."},
                 },
@@ -166,9 +175,7 @@ def tool_propose_full_file() -> Dict[str, Any]:
 
 
 def tool_propose_new_files() -> Dict[str, Any]:
-    """
-    Discovery tool for **source** files only (docs/setup/examples excluded).
-    """
+    """Discovery tool for **source** files only (docs/setup/examples excluded)."""
     return {
         "type": "function",
         "function": {
@@ -202,9 +209,7 @@ def tool_propose_new_files() -> Dict[str, Any]:
 
 
 def tool_propose_review_plan() -> Dict[str, Any]:
-    """
-    Planning tool (used at start and end).
-    """
+    """Planning tool (used at start and end)."""
     return {
         "type": "function",
         "function": {
@@ -229,9 +234,7 @@ def tool_propose_review_plan() -> Dict[str, Any]:
 
 
 def tool_propose_error_fixes() -> Dict[str, Any]:
-    """
-    Error‑fix tool: return **complete file** replacements for impacted files.
-    """
+    """Error‑fix tool: return **complete file** replacements for impacted files."""
     return {
         "type": "function",
         "function": {
@@ -266,6 +269,35 @@ def tool_propose_error_fixes() -> Dict[str, Any]:
     }
 
 
+def tool_generate_blueprints() -> Dict[str, Any]:
+    """
+    Blueprint tool: request the four required documents in one response.
+
+    The orchestrator saves them under .gpt-review/blueprints/*.md and commits them.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": "generate_blueprints",
+            "description": (
+                "Generate the four foundational documents (Markdown): "
+                "whitepaper, build_guide, sds, and project_instructions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "whitepaper": {"type": "string", "description": "Whitepaper & Engineering Blueprint (Markdown)"},
+                    "build_guide": {"type": "string", "description": "Build Guide (Markdown)"},
+                    "sds": {"type": "string", "description": "Software Design Specifications (Markdown)"},
+                    "project_instructions": {"type": "string", "description": "Project Code Files & Instructions (Markdown)"},
+                },
+                "required": ["whitepaper", "build_guide", "sds", "project_instructions"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
 # =============================================================================
 # Utilities
 # =============================================================================
@@ -285,7 +317,6 @@ def _apply_patch(repo: Path, patch: Dict[str, Any]) -> ApplyResult:
     NOTE: apply_patch.py lives at the project **root**, not inside the package.
     """
     try:
-        # Resolve project root (package dir/..)
         apply_tool = Path(__file__).resolve().parent.parent / "apply_patch.py"
         proc = subprocess.run(
             [sys.executable, str(apply_tool), "-", str(repo)],
@@ -304,9 +335,7 @@ def _apply_patch(repo: Path, patch: Dict[str, Any]) -> ApplyResult:
 
 
 def _commit(repo: Path, message: str, paths: Sequence[str]) -> None:
-    """
-    Stage only *paths* and commit with *message*. Keeps staging path‑scoped.
-    """
+    """Stage only *paths* and commit with *message* (path‑scoped)."""
     if not paths:
         return
     try:
@@ -314,9 +343,264 @@ def _commit(repo: Path, message: str, paths: Sequence[str]) -> None:
         git(repo, "commit", "-m", message, check=True)
         log.info("Committed %s", ", ".join(paths))
     except Exception as exc:
-        # Make failure explicit; avoid silent divergence between FS and history.
         log.exception("Git commit failed: %s", exc)
         raise
+
+
+def _run_cmd(cmd: str, cwd: Path, timeout: int) -> Tuple[bool, str, int]:
+    """Run a shell command and return (ok, combined_output, exit_code)."""
+    try:
+        proc = subprocess.run(cmd, cwd=str(cwd), shell=True, capture_output=True, text=True, timeout=timeout)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        return (proc.returncode == 0), out, proc.returncode
+    except subprocess.TimeoutExpired as exc:
+        out = (exc.stdout or "") + (exc.stderr or "")
+        banner = f"TIMEOUT after {timeout}s\n"
+        return False, banner + out, 124
+
+
+def _tail(text: str, n: int = 20000) -> str:
+    return text if len(text) <= n else text[-n:]
+
+
+# -----------------------------------------------------------------------------
+# Repo acquisition helpers (clone-if-URL)
+# -----------------------------------------------------------------------------
+_GIT_URL_RE = re.compile(r"^(?:https?://|git@|ssh://).*|.*\.git$")
+
+def _looks_like_git_url(arg: str) -> bool:
+    try:
+        return bool(_GIT_URL_RE.match(arg.strip()))
+    except Exception:
+        return False
+
+
+def _clone_repo_to_temp(url: str) -> Path:
+    tmpdir = Path(tempfile.mkdtemp(prefix="gpt-review-"))
+    log.info("Cloning %s into %s …", url, tmpdir)
+    subprocess.run(["git", "clone", "--depth", "1", url, str(tmpdir)], check=True)
+    return tmpdir
+
+
+# =============================================================================
+# Prompt builders
+# =============================================================================
+
+def _system_prompt(iteration: int, deferred_hint: bool) -> str:
+    """Compact system prompt; enforces *full‑file* outputs and deferral rules."""
+    defer_msg = (
+        "Do NOT modify documentation/installation/setup/example files in this pass; "
+        "we will handle them in iteration 3."
+        if deferred_hint
+        else "This pass may include documentation and setup files."
+    )
+    return (
+        "You are GPT‑Review operating in **chunk‑by‑chunk** mode. "
+        "We will first establish a plan, then fix files **one by one**. "
+        "For each request, you MUST respond only by calling the provided function, "
+        "returning a **COMPLETE file** (no diffs) or declaring KEEP/DELETE. "
+        f"{defer_msg} Keep changes minimal and precise."
+    )
+
+
+def _file_review_prompt(
+    *,
+    instructions: str,
+    repo_summary: str,
+    census: List[str],
+    rel_path: str,
+    file_text: str,
+    iteration: int,
+    blueprints_summary: str,
+) -> str:
+    header = textwrap.dedent(
+        f"""
+        Review iteration {iteration} – file: `{rel_path}`.
+
+        Project instructions:
+        {instructions.strip()}
+
+        Blueprint documents (abridged):
+        {blueprints_summary}
+
+        Repository overview (sampled paths):
+        ```
+        {repo_summary}
+        ```
+
+        Language census: {", ".join(census)}
+
+        The file below is the **current ground truth**. Return a COMPLETE file
+        if changes are required; otherwise return KEEP. Avoid unrelated edits.
+        """
+    ).strip()
+    body = f"\n\n--- FILE START `{rel_path}` ---\n{file_text}\n--- FILE END ---\n"
+    return header + body
+
+
+def _new_files_prompt(*, instructions: str, repo_summary: str, iteration: int, blueprints_summary: str) -> str:
+    return textwrap.dedent(
+        f"""
+        Iteration {iteration} – discovery of missing **source** files.
+
+        Blueprint documents (abridged):
+        {blueprints_summary}
+
+        Based on the current repository state (below) and the project instructions,
+        propose additional **source** files that should be present *now* to make the
+        software coherent. Exclude documentation/installation/setup/examples for
+        this iteration.
+
+        Return ONLY a function call with `new_files=[{{path, content}}]` (full content).
+
+        Repository overview:
+        ```
+        {repo_summary}
+        ```
+        """
+    ).strip()
+
+
+def _plan_prompt(*, instructions: str, repo_summary: str, phase: str, blueprints_summary: str) -> str:
+    """
+    'phase' is 'initial' (before edits) or 'final' (after consistency pass).
+    """
+    preface = (
+        "Before we start editing files, produce an initial execution plan with "
+        "**actionable commands** to run the software and (optionally) tests on a clean machine."
+        if phase == "initial"
+        else "We have completed the third iteration of code review. Produce a concise execution plan with "
+             "**actionable commands** to run the software and its tests."
+    )
+    return textwrap.dedent(
+        f"""
+        {preface}
+
+        Blueprint documents (abridged):
+        {blueprints_summary}
+
+        Return ONLY a function call `propose_review_plan` with:
+          - run_commands: list[str]  (required)
+          - test_commands: list[str] (optional)
+          - description: str
+          - hints: list[str] (optional)
+
+        Instructions:
+        {instructions.strip()}
+
+        Repository overview:
+        ```
+        {repo_summary}
+        ```
+        """
+    ).strip()
+
+
+def _error_fix_prompt(*, combined_errors: str, last_commands: List[str], blueprints_summary: str) -> str:
+    cmds = "\n".join(f"$ {c}" for c in last_commands)
+    return textwrap.dedent(
+        f"""
+        The following commands were executed and produced errors:
+
+        {cmds}
+
+        Blueprint documents (abridged):
+        {blueprints_summary}
+
+        Error logs (tail, possibly truncated):
+        ```text
+        {combined_errors}
+        ```
+
+        Please return ONLY a function call `propose_error_fixes` with a list of
+        COMPLETE file replacements (edits=[{{path, action, content?}}]) to fix
+        the issues. Avoid unrelated changes. Limit to the minimal set of files.
+        """
+    ).strip()
+
+
+# =============================================================================
+# Chat utilities
+# =============================================================================
+
+def _prune_messages(msgs: List[Dict[str, Any]], keep: int = 12) -> List[Dict[str, Any]]:
+    """Keep the last *keep* messages to control token growth. Always keep the first 2."""
+    if len(msgs) <= 2:
+        return msgs
+    return msgs[:2] + msgs[-keep:]
+
+
+def _call_tool_only(
+    client,
+    *,
+    model: str,
+    api_timeout: int,
+    messages: List[Dict[str, Any]],
+    tool_schema: Dict[str, Any],
+) -> Tuple[Dict[str, Any], str]:
+    """Force a single function/tool call. Returns (tool_args_dict, call_id)."""
+    tool_name = tool_schema["function"]["name"]
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0,
+        tools=[tool_schema],
+        tool_choice={"type": "function", "function": {"name": tool_name}},
+        timeout=api_timeout,  # type: ignore[arg-type]
+    )
+    choice = resp.choices[0]
+    msg = choice.message
+    calls = getattr(msg, "tool_calls", None) or []
+    if not calls:
+        raise RuntimeError(f"Assistant did not call {tool_name}")
+    tc = calls[0]
+    fn = tc.function
+    if getattr(fn, "name", None) != tool_name:
+        raise RuntimeError(f"Unexpected tool name: {fn.name}")
+    args = json.loads(fn.arguments or "{}")
+    return args, getattr(tc, "id", "call_0")
+
+
+# =============================================================================
+# Core orchestration helpers
+# =============================================================================
+
+def _apply_new_files(repo: Path, new_files: List[Dict[str, Any]]) -> None:
+    for item in new_files:
+        rel = (item.get("path") or "").strip()
+        content = item.get("content")
+        if not rel or content is None:
+            log.warning("Skipping malformed new file entry: %r", item)
+            continue
+        if Path(rel).parts and rel.split("/")[0] == ".git":
+            log.warning("Rejecting unsafe target under .git/: %s", rel)
+            continue
+        res = _apply_full_file(repo, rel, "create", content)
+        if not res.ok:
+            raise RuntimeError(f"Failed to create new file: {rel}")
+
+
+def _excerpt_for_prompt(p: Path) -> str:
+    """
+    Return the whole file (LF-normalized) by default. If ALWAYS_SEND_FULL_FILE=0,
+    fall back to head+tail excerpting for very large files.
+    """
+    if ALWAYS_SEND_FULL_FILE:
+        try:
+            return read_text_normalized(p)
+        except Exception:
+            data = p.read_bytes()
+            return data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+
+    # Fallback (rare): excerpt extremely large files to avoid runaway tokens.
+    data = p.read_bytes()
+    if len(data) <= MAX_PROMPT_BYTES:
+        return data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    head = data[: int(MAX_PROMPT_BYTES // 2)]
+    tail = data[-int(MAX_PROMPT_BYTES // 2):]
+    h = head.decode("utf-8", errors="replace")
+    t = tail.decode("utf-8", errors="replace")
+    return f"<<EXCERPT: file too large ({len(data)} bytes); sending head+tail>>\n{h}\n…\n{t}"
 
 
 def _apply_full_file(repo: Path, rel_path: str, action: str, content: Optional[str]) -> ApplyResult:
@@ -346,257 +630,16 @@ def _apply_full_file(repo: Path, rel_path: str, action: str, content: Optional[s
     if not res.ok:
         log.warning(
             "apply_patch failed for %s (%s): rc=%s\nstdout:\n%s\nstderr:\n%s",
-            rel_path,
-            action,
-            res.exit_code,
-            res.stdout,
-            res.stderr,
+            rel_path, action, res.exit_code, res.stdout, res.stderr,
         )
         return res
 
     log.info("Applied: %-6s %s", action, rel_path)
-    # Commit on success (one file per change)
     try:
         _commit(repo, f"orchestrator: {action} {rel_path}", [rel_path])
     except Exception:
-        # Surface commit failures as non‑fatal here; caller may choose to stop later.
         pass
     return res
-
-
-def _run_cmd(cmd: str, cwd: Path, timeout: int) -> Tuple[bool, str, int]:
-    """
-    Run a shell command and return (ok, combined_output, exit_code).
-    """
-    try:
-        proc = subprocess.run(cmd, cwd=str(cwd), shell=True, capture_output=True, text=True, timeout=timeout)
-        out = (proc.stdout or "") + (proc.stderr or "")
-        return (proc.returncode == 0), out, proc.returncode
-    except subprocess.TimeoutExpired as exc:
-        out = (exc.stdout or "") + (exc.stderr or "")
-        banner = f"TIMEOUT after {timeout}s\n"
-        return False, banner + out, 124
-
-
-def _tail(text: str, n: int = 20000) -> str:
-    return text if len(text) <= n else text[-n:]
-
-
-# =============================================================================
-# Prompt builders
-# =============================================================================
-
-def _system_prompt(iteration: int, deferred_hint: bool) -> str:
-    """
-    Compact system prompt; enforces *full‑file* outputs and deferral rules.
-    """
-    defer_msg = (
-        "Do NOT modify documentation/installation/setup/example files in this pass; "
-        "we will handle them in iteration 3."
-        if deferred_hint
-        else "This pass may include documentation and setup files."
-    )
-    return (
-        "You are GPT‑Review operating in **chunk‑by‑chunk** mode. "
-        "We will first establish a plan, then fix files **one by one**. "
-        "For each request, you MUST respond only by calling the provided function, "
-        "returning a **COMPLETE file** (no diffs) or declaring KEEP/DELETE. "
-        f"{defer_msg} Keep changes minimal and precise."
-    )
-
-
-def _file_review_prompt(
-    *,
-    instructions: str,
-    repo_summary: str,
-    census: List[str],
-    rel_path: str,
-    file_excerpt: str,
-    iteration: int,
-) -> str:
-    header = textwrap.dedent(
-        f"""
-        Review iteration {iteration} – file: `{rel_path}`.
-
-        Project instructions:
-        {instructions.strip()}
-
-        Repository overview (sampled paths):
-        ```
-        {repo_summary}
-        ```
-
-        Language census: {", ".join(census)}
-
-        The file below is the **current ground truth**. Return a COMPLETE file
-        if changes are required; otherwise return KEEP. Avoid unrelated edits.
-        """
-    ).strip()
-
-    body = f"\n\n--- FILE START `{rel_path}` ---\n{file_excerpt}\n--- FILE END ---\n"
-    return header + body
-
-
-def _new_files_prompt(*, instructions: str, repo_summary: str, iteration: int) -> str:
-    return textwrap.dedent(
-        f"""
-        Iteration {iteration} – discovery of missing **source** files.
-
-        Based on the current repository state (below) and the project instructions,
-        propose additional **source** files that should be present *now* to make the
-        software coherent. Exclude documentation/installation/setup/examples for
-        this iteration.
-
-        Return ONLY a function call with `new_files=[{{path, content}}]` (full content).
-
-        Repository overview:
-        ```
-        {repo_summary}
-        ```
-        """
-    ).strip()
-
-
-def _plan_prompt(*, instructions: str, repo_summary: str, phase: str) -> str:
-    """
-    'phase' is 'initial' (before edits) or 'final' (after consistency pass).
-    """
-    preface = (
-        "Before we start editing files, produce an initial execution plan with "
-        "**actionable commands** to run the software and (optionally) tests on a clean machine."
-        if phase == "initial"
-        else "We have completed the third iteration of code review. Produce a concise execution plan with "
-             "**actionable commands** to run the software and its tests."
-    )
-    return textwrap.dedent(
-        f"""
-        {preface}
-
-        Return ONLY a function call `propose_review_plan` with:
-          - run_commands: list[str]  (required)
-          - test_commands: list[str] (optional)
-          - description: str
-          - hints: list[str] (optional)
-
-        Instructions:
-        {instructions.strip()}
-
-        Repository overview:
-        ```
-        {repo_summary}
-        ```
-        """
-    ).strip()
-
-
-def _error_fix_prompt(*, combined_errors: str, last_commands: List[str]) -> str:
-    cmds = "\n".join(f"$ {c}" for c in last_commands)
-    return textwrap.dedent(
-        f"""
-        The following commands were executed and produced errors:
-
-        {cmds}
-
-        Error logs (tail, possibly truncated):
-        ```text
-        {combined_errors}
-        ```
-
-        Please return ONLY a function call `propose_error_fixes` with a list of
-        COMPLETE file replacements (edits=[{{path, action, content?}}]) to fix
-        the issues. Avoid unrelated changes. Limit to the minimal set of files.
-        """
-    ).strip()
-
-
-# =============================================================================
-# Chat utilities
-# =============================================================================
-
-def _prune_messages(msgs: List[Dict[str, Any]], keep: int = 12) -> List[Dict[str, Any]]:
-    """
-    Keep the last *keep* messages to control token growth. Always keep the first 2.
-    """
-    if len(msgs) <= 2:
-        return msgs
-    return msgs[:2] + msgs[-keep:]
-
-
-def _call_tool_only(
-    client,
-    *,
-    model: str,
-    api_timeout: int,
-    messages: List[Dict[str, Any]],
-    tool_schema: Dict[str, Any],
-) -> Tuple[Dict[str, Any], str]:
-    """
-    Force a single function/tool call. Returns (tool_args_dict, call_id).
-    """
-    tool_name = tool_schema["function"]["name"]
-    resp = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0,
-        tools=[tool_schema],
-        tool_choice={"type": "function", "function": {"name": tool_name}},
-        timeout=api_timeout,  # type: ignore[arg-type]
-    )
-    choice = resp.choices[0]
-    msg = choice.message
-    calls = getattr(msg, "tool_calls", None) or []
-    if not calls:
-        raise RuntimeError(f"Assistant did not call {tool_name}")
-    tc = calls[0]
-    fn = tc.function
-    if getattr(fn, "name", None) != tool_name:
-        raise RuntimeError(f"Unexpected tool name: {fn.name}")
-    # The SDK returns JSON as a string in fn.arguments
-    args = json.loads(fn.arguments or "{}")
-    return args, getattr(tc, "id", "call_0")
-
-
-def _excerpt_for_prompt(p: Path) -> str:
-    """
-    Return either the whole file (when small) or head+tail excerpts to keep
-    prompts within a safe token budget. Always normalize EOL to LF.
-    """
-    try:
-        data = p.read_bytes()
-    except Exception as exc:
-        return f"<<error reading file: {exc}>>"
-
-    if len(data) <= MAX_PROMPT_BYTES:
-        try:
-            return read_text_normalized(p)
-        except Exception:
-            # Fall back to a lossy decode if necessary
-            return data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
-
-    head = data[: HEAD_TAIL_BYTES]
-    tail = data[-HEAD_TAIL_BYTES :]
-    h = head.decode("utf-8", errors="replace")
-    t = tail.decode("utf-8", errors="replace")
-    return f"<<EXCERPT: file too large ({len(data)} bytes); sending head+tail>>\n{h}\n…\n{t}"
-
-
-# =============================================================================
-# Core orchestration helpers
-# =============================================================================
-
-def _apply_new_files(repo: Path, new_files: List[Dict[str, Any]]) -> None:
-    for item in new_files:
-        rel = (item.get("path") or "").strip()
-        content = item.get("content")
-        if not rel or content is None:
-            log.warning("Skipping malformed new file entry: %r", item)
-            continue
-        if Path(rel).parts and rel.split("/")[0] == ".git":
-            log.warning("Rejecting unsafe target under .git/: %s", rel)
-            continue
-        res = _apply_full_file(repo, rel, "create", content)
-        if not res.ok:
-            raise RuntimeError(f"Failed to create new file: {rel}")
 
 
 def _review_files_in_bucket(
@@ -609,6 +652,7 @@ def _review_files_in_bucket(
     instructions: str,
     iteration: int,
     deferred_hint: bool,
+    blueprints_summary: str,
 ) -> None:
     """
     Review each file in *files*; apply changes via `apply_patch.py` and commit them.
@@ -621,7 +665,6 @@ def _review_files_in_bucket(
 
     for p in files:
         rel = p.relative_to(repo).as_posix()
-
         if is_binary_file(p):
             log.info("Skipping binary file: %s", rel)
             continue
@@ -631,8 +674,9 @@ def _review_files_in_bucket(
             repo_summary=repo_summary,
             census=census,
             rel_path=rel,
-            file_excerpt=_excerpt_for_prompt(p),
+            file_text=_excerpt_for_prompt(p),
             iteration=iteration,
+            blueprints_summary=blueprints_summary,
         )
 
         messages = _prune_messages(messages)
@@ -658,10 +702,7 @@ def _review_files_in_bucket(
                 "tool_calls": [
                     {
                         "id": call_id,
-                        "function": {
-                            "name": "propose_full_file",
-                            "arguments": json.dumps(args, ensure_ascii=False),
-                        },
+                        "function": {"name": "propose_full_file", "arguments": json.dumps(args, ensure_ascii=False)},
                     }
                 ],
             }
@@ -689,6 +730,7 @@ def _discover_new_files(
     repo: Path,
     instructions: str,
     iteration: int,
+    blueprints_summary: str,
 ) -> None:
     repo_summary = summarize_repo(repo)
     system_msg = {"role": "system", "content": _system_prompt(iteration, deferred_hint=True)}
@@ -697,7 +739,10 @@ def _discover_new_files(
         {
             "role": "user",
             "content": _new_files_prompt(
-                instructions=instructions, repo_summary=repo_summary, iteration=iteration
+                instructions=instructions,
+                repo_summary=repo_summary,
+                iteration=iteration,
+                blueprints_summary=blueprints_summary,
             ),
         },
     ]
@@ -731,6 +776,7 @@ def _generate_plan_artifacts(
     api_timeout: int,
     repo: Path,
     instructions: str,
+    blueprints_summary: str,
 ) -> Tuple[List[str], List[str]]:
     """
     Create plan artifacts for a given *phase*.
@@ -744,7 +790,7 @@ def _generate_plan_artifacts(
     system_msg = {"role": "system", "content": _system_prompt(iteration=1 if phase == "initial" else 3, deferred_hint=False)}
     messages: List[Dict[str, Any]] = [
         system_msg,
-        {"role": "user", "content": _plan_prompt(instructions=instructions, repo_summary=repo_summary, phase=phase)},
+        {"role": "user", "content": _plan_prompt(instructions=instructions, repo_summary=repo_summary, phase=phase, blueprints_summary=blueprints_summary)},
     ]
 
     args, _ = _call_tool_only(
@@ -761,9 +807,7 @@ def _generate_plan_artifacts(
     hints = [h for h in (args.get("hints") or []) if isinstance(h, str) and h.strip()]
 
     # Ensure the dot‑dir exists by creating a harmless .keep via apply_patch
-    res_keep = _apply_full_file(repo, ".gpt-review/.keep", "create", "")
-    if not res_keep.ok:
-        raise RuntimeError("Failed to create .gpt-review/.keep")
+    _ = _apply_full_file(repo, ".gpt-review/.keep", "create", "")
 
     if phase == "initial":
         plan_path = ".gpt-review/initial_plan.json"
@@ -810,99 +854,160 @@ def _generate_plan_artifacts(
     return run_cmds, test_cmds
 
 
-def _deferred_bucket(repo: Path) -> List[Path]:
-    """
-    Return documentation/setup/example files (deferred until iteration 3).
-    """
-    _code, deferred = classify_paths(repo)
-    return deferred
+# -----------------------------------------------------------------------------
+# Blueprints generation (uses blueprints_util)
+# -----------------------------------------------------------------------------
 
-
-# =============================================================================
-# Error‑fix loop
-# =============================================================================
-
-def _error_fix_prompt_commands(commands: List[str]) -> str:
-    return "\n".join(f"- {c}" for c in commands) or "_none_"
-
-
-def _run_error_fix_loop(
+def _generate_blueprints(
     *,
     client,
     model: str,
     api_timeout: int,
     repo: Path,
     instructions: str,
-    run_cmds: List[str],
-    test_cmds: List[str],
-    max_rounds: int,
-    timeout: int,
 ) -> None:
     """
-    Execute commands and iteratively fix errors via COMPLETE file replacements.
+    Generate the four blueprint docs if missing, commit them, and log paths.
     """
-    commands = [*run_cmds, *test_cmds]
-    if not commands:
-        log.info("No run/test commands provided; skipping error‑fix loop.")
+    ensure_blueprint_dir(repo)
+    if blueprints_exist(repo):
+        log.info("Blueprint documents already present; skipping generation.")
         return
 
-    log.info("Starting error‑fix loop with commands:\n%s", _error_fix_prompt_commands(commands))
+    repo_summary = summarize_repo(repo)
+    system_msg = {"role": "system", "content": _system_prompt(iteration=1, deferred_hint=True)}
+    messages: List[Dict[str, Any]] = [
+        system_msg,
+        {
+            "role": "user",
+            "content": textwrap.dedent(
+                f"""
+                Generate the following four Markdown documents **in one function call**:
 
-    for round_idx in range(1, max_rounds + 1):
-        logs: List[str] = []
-        all_ok = True
-        for cmd in commands:
-            ok, out, code = _run_cmd(cmd, cwd=repo, timeout=timeout)
-            logs.append(f"$ {cmd}\n(exit={code})\n{out}\n")
-            if not ok:
-                all_ok = False
+                1) Whitepaper & Engineering Blueprint
+                2) Build Guide
+                3) Project Software Design Specifications (SDS)
+                4) Project Code Files & Instructions
 
-        combined = "\n".join(logs)[-MAX_PROMPT_BYTES:]
-        if all_ok:
-            log.info("All commands passed on round %d.", round_idx)
+                These documents must be **self‑contained** and tailored to the repository.
+
+                Inputs:
+                • Project instructions (user): {instructions.strip()}
+                • Repository overview:
+                ```
+                {repo_summary}
+                ```
+
+                Return ONLY the tool call `generate_blueprints` with fields:
+                - whitepaper
+                - build_guide
+                - sds
+                - project_instructions
+                """
+            ).strip(),
+        },
+    ]
+
+    args, _ = _call_tool_only(
+        client,
+        model=model,
+        api_timeout=api_timeout,
+        messages=messages,
+        tool_schema=tool_generate_blueprints(),
+    )
+
+    docs = {
+        "whitepaper": normalize_markdown(args.get("whitepaper") or ""),
+        "build_guide": normalize_markdown(args.get("build_guide") or ""),
+        "sds": normalize_markdown(args.get("sds") or ""),
+        "project_instructions": normalize_markdown(args.get("project_instructions") or ""),
+    }
+
+    paths = blueprint_paths(repo)
+    to_commit: List[str] = []
+    for key, content in docs.items():
+        path = paths[key]
+        patch = {"op": "create", "file": path.as_posix(), "body": content, "status": "in_progress"}
+        res = _apply_patch(repo, patch)
+        if not res.ok:
+            raise RuntimeError(f"Failed to create blueprint {key}: {res.stderr or res.stdout}")
+        to_commit.append(path.as_posix())
+
+    _commit(repo, "orchestrator: add initial blueprints", to_commit)
+    log.info("Blueprint documents created: %s", ", ".join(to_commit))
+
+
+def _deferred_bucket(repo: Path) -> List[Path]:
+    """Return documentation/setup/example files (deferred until iteration 3)."""
+    _code, deferred = classify_paths(repo)
+    return deferred
+
+
+# -----------------------------------------------------------------------------
+# PR creation
+# -----------------------------------------------------------------------------
+
+def _default_remote_branch(repo: Path, remote: str = "origin") -> str:
+    """
+    Try to resolve origin/HEAD → base branch; fallback to 'main' then 'master'.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo), "symbolic-ref", "-q", f"refs/remotes/{remote}/HEAD"],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        if out:
+            # e.g., refs/remotes/origin/main → 'main'
+            return out.rsplit("/", 1)[-1]
+    except Exception:
+        pass
+    for cand in ("main", "master"):
+        ok = subprocess.run(["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{cand}"]).returncode == 0
+        if ok:
+            return cand
+    return "main"
+
+
+def _which(cmd: str) -> Optional[str]:
+    from shutil import which
+    return which(cmd)
+
+
+def _maybe_create_pull_request(repo: Path, *, branch: str, remote: Optional[str]) -> None:
+    """
+    Attempt to open a PR for the current branch using 'gh' CLI if available.
+    """
+    if not os.getenv("GPT_REVIEW_CREATE_PR"):
+        log.info("PR creation disabled (set GPT_REVIEW_CREATE_PR=1 to enable).")
+        return
+    if not remote:
+        log.info("No remote configured; skipping PR creation.")
+        return
+
+    base = _default_remote_branch(repo, remote)
+    title = f"GPT‑Review: {branch}"
+    body = "Automated multi‑iteration review by GPT‑Review. See REVIEW_GUIDE.md and .gpt-review/review_plan.json."
+
+    gh = _which("gh")
+    if gh:
+        try:
+            subprocess.run(
+                ["gh", "pr", "create", "--repo", ".", "--base", base, "--head", branch, "--title", title, "--body", body],
+                cwd=str(repo),
+                check=True,
+            )
+            log.info("Pull request created via gh CLI (base=%s, head=%s).", base, branch)
             return
+        except subprocess.CalledProcessError as exc:
+            log.warning("gh pr create failed: %s", exc)
 
-        log.warning("Errors detected (round %d). Sending logs to model.", round_idx)
-
-        # Build prompt & call
-        system_msg = {"role": "system", "content": _system_prompt(iteration=3, deferred_hint=False)}
-        messages: List[Dict[str, Any]] = [
-            system_msg,
-            {"role": "user", "content": _error_fix_prompt(combined_errors=combined, last_commands=commands)},
-        ]
-        args, _ = _call_tool_only(
-            client,
-            model=model,
-            api_timeout=api_timeout,
-            messages=messages,
-            tool_schema=tool_propose_error_fixes(),
-        )
-
-        edits = args.get("edits") or []
-        if not isinstance(edits, list) or not edits:
-            log.warning("Model returned no edits in error‑fix round %d.", round_idx)
-            continue
-
-        applied_any = False
-        for e in edits:
-            path = (e.get("path") or "").strip()
-            action = (e.get("action") or "").strip()
-            content = e.get("content")
-            if not path or action not in {"create", "update", "delete"}:
-                log.warning("Skipping malformed edit: %r", e)
-                continue
-            res = _apply_full_file(repo, path, action, content)
-            applied_any = applied_any or res.ok
-
-        if not applied_any:
-            log.warning("No edits could be applied in round %d.", round_idx)
-
-    log.error("Exceeded maximum error‑fix rounds (%d).", max_rounds)
-    # Intentionally do not raise; leave the branch with best effort changes.
+    # Fallback: print guidance
+    log.info("PR not created automatically. You can create one with:\n"
+             "  gh pr create --base %s --head %s --title %r --body %r", base, branch, title, body)
 
 
 # =============================================================================
-# Branching & pipeline
+# High‑level orchestration
 # =============================================================================
 
 def _current_branch(repo: Path) -> str:
@@ -944,10 +1049,14 @@ def run_iterations(
     max_error_rounds: int,
 ) -> None:
     """
-    High‑level orchestration entrypoint (plan‑first + 3 iterations + error fix).
+    High‑level orchestration entrypoint (blueprints + plan‑first + 3 iterations + error fix + PR).
     """
     client = _ensure_openai_client(api_timeout)
     instr = instructions_path.read_text(encoding="utf-8").strip()
+
+    # Blueprints first (generate if missing)
+    _generate_blueprints(client=client, model=model, api_timeout=api_timeout, repo=repo, instructions=instr)
+    blueprints_summary = summarize_blueprints(repo)
 
     # Initial classification (for logging only)
     code_like, deferred = classify_paths(repo)
@@ -969,6 +1078,7 @@ def run_iterations(
             api_timeout=api_timeout,
             repo=repo,
             instructions=instr,
+            blueprints_summary=blueprints_summary,
         )
     except Exception as exc:
         log.warning("Initial plan artifacts step failed: %s (continuing).", exc)
@@ -983,9 +1093,16 @@ def run_iterations(
         instructions=instr,
         iteration=1,
         deferred_hint=True,
+        blueprints_summary=blueprints_summary,
     )
     _discover_new_files(
-        client=client, model=model, api_timeout=api_timeout, repo=repo, instructions=instr, iteration=1
+        client=client,
+        model=model,
+        api_timeout=api_timeout,
+        repo=repo,
+        instructions=instr,
+        iteration=1,
+        blueprints_summary=blueprints_summary,
     )
     _push_branch(repo, b1, remote)
 
@@ -1002,9 +1119,16 @@ def run_iterations(
         instructions=instr,
         iteration=2,
         deferred_hint=True,
+        blueprints_summary=blueprints_summary,
     )
     _discover_new_files(
-        client=client, model=model, api_timeout=api_timeout, repo=repo, instructions=instr, iteration=2
+        client=client,
+        model=model,
+        api_timeout=api_timeout,
+        repo=repo,
+        instructions=instr,
+        iteration=2,
+        blueprints_summary=blueprints_summary,
     )
     _push_branch(repo, b2, remote)
 
@@ -1024,6 +1148,7 @@ def run_iterations(
         instructions=instr,
         iteration=3,
         deferred_hint=False,
+        blueprints_summary=blueprints_summary,
     )
 
     # Final plan artifacts (after consistency)
@@ -1034,10 +1159,10 @@ def run_iterations(
         api_timeout=api_timeout,
         repo=repo,
         instructions=instr,
+        blueprints_summary=blueprints_summary,
     )
 
-    # Now explicitly (re)visit deferred files (docs/setup/examples) — they may be
-    # generated/updated after code stabilization, in case the previous pass skipped.
+    # Now explicitly (re)visit deferred files (docs/setup/examples)
     deferred = _deferred_bucket(repo)
     if deferred:
         log.info("Reviewing deferred files (%d).", len(deferred))
@@ -1050,22 +1175,71 @@ def run_iterations(
             instructions=instr,
             iteration=3,
             deferred_hint=False,
+            blueprints_summary=blueprints_summary,
         )
 
     # Error‑fix loop
-    _run_error_fix_loop(
-        client=client,
-        model=model,
-        api_timeout=api_timeout,
-        repo=repo,
-        instructions=instr,
-        run_cmds=run_cmds,
-        test_cmds=test_cmds,
-        max_rounds=max_error_rounds,
-        timeout=timeout,
-    )
+    commands = [*run_cmds, *test_cmds]
+    if commands:
+        log.info("Starting error‑fix loop with commands:\n%s", "\n".join(f"- {c}" for c in commands))
+        for round_idx in range(1, max_error_rounds + 1):
+            logs: List[str] = []
+            all_ok = True
+            for cmd in commands:
+                ok, out, code = _run_cmd(cmd, cwd=repo, timeout=timeout)
+                logs.append(f"$ {cmd}\n(exit={code})\n{out}\n")
+                if not ok:
+                    all_ok = False
+
+            combined = "\n".join(logs)[-MAX_PROMPT_BYTES:]
+            if all_ok:
+                log.info("All commands passed on round %d.", round_idx)
+                break
+
+            log.warning("Errors detected (round %d). Sending logs to model.", round_idx)
+            system_msg = {"role": "system", "content": _system_prompt(iteration=3, deferred_hint=False)}
+            messages: List[Dict[str, Any]] = [
+                system_msg,
+                {
+                    "role": "user",
+                    "content": _error_fix_prompt(
+                        combined_errors=combined,
+                        last_commands=commands,
+                        blueprints_summary=blueprints_summary,
+                    ),
+                },
+            ]
+            args, _ = _call_tool_only(
+                client,
+                model=model,
+                api_timeout=api_timeout,
+                messages=messages,
+                tool_schema=tool_propose_error_fixes(),
+            )
+
+            edits = args.get("edits") or []
+            if not isinstance(edits, list) or not edits:
+                log.warning("Model returned no edits in error‑fix round %d.", round_idx)
+                continue
+
+            applied_any = False
+            for e in edits:
+                path = (e.get("path") or "").strip()
+                action = (e.get("action") or "").strip()
+                content = e.get("content")
+                if not path or action not in {"create", "update", "delete"}:
+                    log.warning("Skipping malformed edit: %r", e)
+                    continue
+                res = _apply_full_file(repo, path, action, content)
+                applied_any = applied_any or res.ok
+
+            if not applied_any:
+                log.warning("No edits could be applied in round %d.", round_idx)
+    else:
+        log.info("No run/test commands provided; skipping error‑fix loop.")
 
     _push_branch(repo, b3, remote)
+    _maybe_create_pull_request(repo, branch=b3, remote=remote)
     log.info("Orchestration completed. Final branch: %s", b3)
 
 
@@ -1076,7 +1250,7 @@ def run_iterations(
 def _cli() -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="gpt-review-iterate")
     p.add_argument("instructions", help="Path to plain‑text project instructions.")
-    p.add_argument("repo", help="Path to the Git repository.")
+    p.add_argument("repo", help="Path to the Git repository OR a Git URL.")
     p.add_argument("--model", default=DEFAULT_MODEL, help="OpenAI model id (default: %(default)s)")
     p.add_argument("--api-timeout", type=int, default=DEFAULT_API_TIMEOUT, help="HTTP timeout (seconds).")
     p.add_argument("--remote", default=os.getenv("GPT_REVIEW_REMOTE", "origin"), help="Git remote name to push.")
@@ -1097,9 +1271,21 @@ def _cli() -> argparse.Namespace:
 
 def main() -> None:
     args = _cli()
-    repo = Path(args.repo).expanduser().resolve()
-    if not (repo / ".git").exists():
-        sys.exit(f"❌ Not a git repository: {repo}")
+
+    # Support Git URL input: clone into a temp directory
+    repo_arg = args.repo
+    repo_path = Path(repo_arg).expanduser()
+    if not (repo_path.exists() and (repo_path / ".git").exists()):
+        if _looks_like_git_url(repo_arg):
+            try:
+                repo_path = _clone_repo_to_temp(repo_arg)
+            except Exception as exc:
+                log.exception("Failed to clone repo %r: %s", repo_arg, exc)
+                sys.exit(1)
+        else:
+            sys.exit(f"❌ Not a git repository or URL: {repo_arg}")
+
+    repo = repo_path.resolve()
 
     try:
         run_iterations(

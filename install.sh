@@ -172,14 +172,14 @@ else
 fi
 
 # ---------------------------- Clone / update repo -------------------------- #
-if [[ -d "$REPO_DIR/.git" ]]; then
+if git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   info "Repository already exists: $REPO_DIR"
   pushd "$REPO_DIR" >/dev/null
   git fetch --all --tags
   if [[ $FORCE_RESET -eq 1 ]]; then
     warn "Forcing reset to origin/${BRANCH}"
-    git reset --hard "origin/${BRANCH}"
-    git checkout -q "${BRANCH}" || git checkout -b "${BRANCH}" "origin/${BRANCH}"
+    git reset --hard "origin/${BRANCH}" || true
+    git checkout -q "${BRANCH}" || git checkout -b "${BRANCH}" "origin/${BRANCH}" || true
     git pull --ff-only || true
   else
     git checkout -q "${BRANCH}" || git checkout -b "${BRANCH}" "origin/${BRANCH}" || true
@@ -264,6 +264,7 @@ echo "Browser started. Complete login, then close the window."
 fi
 
 # gpt-review-update – convenience updater
+# NOTE: quote '.[dev]' to avoid shell globbing; otherwise the extras spec is mangled.
 write_launcher "${BIN_DIR}/gpt-review-update" \
 "set -euo pipefail
 REPO_DIR='${REPO_DIR}'
@@ -276,7 +277,7 @@ git checkout -q \"\$BRANCH\" || git checkout -b \"\$BRANCH\" \"origin/\$BRANCH\"
 git pull --ff-only || true
 \"\$VENV/bin/python\" -m pip install --upgrade pip wheel setuptools
 # Reinstall in editable mode to pick up changes (fallback to core if extras missing)
-\"\$VENV/bin/pip\" install -e .[dev] || \"\$VENV/bin/pip\" install -e .
+\"\$VENV/bin/pip\" install -e '.[dev]' || \"\$VENV/bin/pip\" install -e .
 echo 'Done.'"
 
 # ------------------------------- Post‑install ------------------------------- #

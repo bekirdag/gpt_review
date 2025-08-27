@@ -2,38 +2,42 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
-GPT‑Review ▸ Patch applier
+GPT‑Review ▸ Patch Applier (FULL‑FILE semantics)
 ===============================================================================
 
-Given **one validated patch JSON string** and a repository path, perform the
-requested file operation and commit the change:
+Usage
+-----
+Given **one validated patch JSON** and a repository path, perform the requested
+file operation and commit the change:
 
     python apply_patch.py '<json-string>'  /path/to/repo
     echo "$json" | python apply_patch.py -  /path/to/repo
 
-Supported operations
---------------------
-| op      | Required keys                 | Notes                                   |
-|---------|-------------------------------|-----------------------------------------|
-| create  | file, body | body_b64         | Fails if *file* already exists          |
-| update  | file, body | body_b64         | Fails if *file* missing or locally dirty|
-| delete  | file                         | Fails if missing or directory           |
-| rename  | file, target                 | Target must not exist                   |
-| chmod   | file, mode (644 / 755)       | Accepts 3‑ or 4‑digit octal (0755 ok)   |
+Operations
+----------
+| op      | Required keys                 | Notes                                      |
+|---------|-------------------------------|--------------------------------------------|
+| create  | file, body | body_b64         | Fails if *file* already exists             |
+| update  | file, body | body_b64         | Fails if *file* missing or locally dirty   |
+| delete  | file                             | Fails if missing or path is a directory    |
+| rename  | file, target                     | Target must not exist                      |
+| chmod   | file, mode (644 / 755)           | 3‑ or 4‑digit octal accepted (0755 ok)     |
 
-Safety nets
------------
-* **Path traversal** – rejects any path escaping repo root (../ tricks).
-* **Local modifications** – refuses destructive ops when file differs from HEAD.
-* **Safe chmod** – only 0644 or 0755 allowed (accept both 3/4‑digit forms).
-* **Precise staging** – stage only the affected path(s); never parent dirs.
-* **No‑op commits** – skip commit when there is nothing to stage (idempotent).
-* **No writes under `.git/`** – any attempt to read/write/move into `.git/` is rejected.
+Safety & Guarantees
+-------------------
+* **No traversal**: rejects any path escaping repo root (../ or symlink tricks).
+* **.git guard**: refuses any operation inside `.git/`.
+* **Local changes**: refuses destructive ops if the file differs from HEAD.
+* **Full‑file only**: create/update always write full file bodies (no diffs).
+* **Atomic writes**: data is written to a temp file then atomically replaced.
+* **Precise staging**: only the affected paths are staged/committed.
+* **Idempotent**: no‑op commits are skipped; repeated identical updates are ignored.
+* **Safe chmod**: only 0644 / 0755 (or 3‑digit forms) are allowed on regular files.
 
 Logging
 -------
-Uses the project‑wide daily rotating logger (logger.get_logger). Each high‑level
-step logs an INFO banner; low‑level details log at DEBUG.
+Uses the packaged rotating logger (`gpt_review.get_logger`). INFO for high‑level
+actions; DEBUG for details.
 """
 from __future__ import annotations
 
@@ -44,40 +48,38 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Iterable, Optional
 
-from patch_validator import validate_patch
-from logger import get_logger
+from gpt_review import get_logger
+from patch_validator import validate_patch  # schema validator (raises on error)
 
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Constants & logger
-# -----------------------------------------------------------------------------
-SAFE_MODES = {"644", "755"}  # normalized (no leading zero) whitelist
+# ─────────────────────────────────────────────────────────────────────────────
+SAFE_MODES = {"644", "755"}  # normalized 3‑digit whitelist
 log = get_logger(__name__)
 
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Git helpers
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 def _git(repo: Path, *args: str, capture: bool = False, check: bool = True) -> str:
     """
-    Run a git command inside *repo*.
-
-    Returns stdout if *capture* = True, else empty string.
+    Run a git command inside *repo*. Return stdout if *capture* else "".
     """
-    res = subprocess.run(
+    proc = subprocess.run(
         ["git", "-C", str(repo), *args],
         text=True,
         capture_output=capture,
         check=check,
     )
-    return res.stdout if capture else ""
+    return proc.stdout if capture else ""
 
 
 def _git_ok(repo: Path, *args: str) -> bool:
     """Return True if the git command exits with code 0 (never raises)."""
-    res = subprocess.run(["git", "-C", str(repo), *args], text=True)
-    return res.returncode == 0
+    return subprocess.run(["git", "-C", str(repo), *args], text=True).returncode == 0
 
 
 def _has_local_changes(repo: Path, rel_path: str) -> bool:
@@ -89,39 +91,31 @@ def _has_local_changes(repo: Path, rel_path: str) -> bool:
 
 
 def _is_tracked(repo: Path, rel_path: str) -> bool:
-    """
-    True if *rel_path* is tracked by Git (present in index).
-    """
+    """True if *rel_path* is tracked by Git (present in index)."""
     return _git_ok(repo, "ls-files", "--error-unmatch", "--", rel_path)
 
 
 def _index_has_changes(repo: Path, paths: Iterable[str] | None = None) -> bool:
     """
-    True if there are **staged** changes for the given *paths* (or any, if None).
+    True if there are **staged** changes for the given *paths* (or any if None).
     Uses `git diff --cached --quiet` which exits 0 when no staged changes exist.
     """
     cmd = ["git", "-C", str(repo), "diff", "--cached", "--quiet"]
     path_list = [p for p in (paths or []) if p]
     if path_list:
         cmd.extend(["--", *path_list])
-    res = subprocess.run(cmd, text=True)
-    return res.returncode != 0
+    return subprocess.run(cmd, text=True).returncode != 0
 
 
 def _stage_exact(repo: Path, *paths: str) -> None:
     """
-    Stage **only** the given file paths (no parent‑dir sweeping, no -A).
+    Stage **only** the given file paths (no parent‑dir sweeping).
 
-    Notes
-    -----
     • For deletions staged via `git rm`, re‑adding a missing path is a no‑op.
-    • We skip missing paths here to avoid accidental adds of non-existent files.
     """
     to_add: list[str] = []
     for p in dict.fromkeys(paths):  # de‑dupe while preserving order
-        if not p:
-            continue
-        if (repo / p).exists():
+        if p and (repo / p).exists():
             to_add.append(p)
     if to_add:
         _git(repo, "add", "--", *to_add)
@@ -129,7 +123,7 @@ def _stage_exact(repo: Path, *paths: str) -> None:
 
 def _commit(repo: Path, message: str, paths: Iterable[str]) -> None:
     """
-    Stage *paths* precisely and commit with *message* **restricted** to those paths.
+    Stage *paths* precisely and commit with *message* restricted to those paths.
     """
     path_list = [p for p in paths if p]
     _stage_exact(repo, *path_list)
@@ -138,18 +132,14 @@ def _commit(repo: Path, message: str, paths: Iterable[str]) -> None:
         log.info("No changes detected for commit: %s (skipping)", message)
         return
 
-    # Restrict commit to the exact pathspecs so unrelated staged changes never bleed in.
     _git(repo, "commit", "-m", message, "--", *path_list)
     log.info("Committed: %s", message)
 
-
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Path & content helpers
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 def _ensure_inside(repo: Path, target: Path) -> None:
-    """
-    Reject paths outside *repo* via ValueError.
-    """
+    """Reject any path outside *repo* via ValueError."""
     try:
         target.relative_to(repo)
     except ValueError as exc:
@@ -157,64 +147,29 @@ def _ensure_inside(repo: Path, target: Path) -> None:
 
 
 def _is_under_dot_git(rel: str) -> bool:
-    """
-    Return True if a repo‑relative POSIX path refers to `.git` or a descendant.
-    """
+    """True if a repo‑relative path refers to `.git` or a descendant."""
     s = rel.strip().lstrip("./")
-    if not s:
-        return False
-    return (
-        s == ".git"
-        or s.startswith(".git/")
-        or "/.git/" in s
-        or s.endswith("/.git")
-    )
+    return bool(s) and (s == ".git" or s.startswith(".git/") or "/.git/" in s or s.endswith("/.git"))
 
 
 def _normalize_text(text: str) -> str:
-    """
-    Normalize text payloads:
-
-    * Convert CRLF/CR → LF
-    * Ensure a trailing newline (POSIX)
-    """
+    """Normalize text payloads to LF and ensure a trailing newline."""
     t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     return t if t.endswith("\n") else t + "\n"
 
 
-def _write_file(p: Path, body: Optional[str], body_b64: Optional[str]) -> tuple[int, int]:
-    """
-    Write *body* (text) or *body_b64* (binary) into *p*, ensuring parent dirs.
-
-    Returns
-    -------
-    (written_bytes, previous_size)
-    """
-    p.parent.mkdir(parents=True, exist_ok=True)
-    prev_size = p.stat().st_size if p.exists() else 0
-
-    if body_b64 is not None:
-        data = base64.b64decode(body_b64)
-        p.write_bytes(data)
-        log.debug("Wrote binary file %s (%d bytes)", p, len(data))
-        return len(data), prev_size
-
-    # text
-    text = _normalize_text(body or "")
-    p.write_text(text, encoding="utf-8")
-    log.debug("Wrote text file %s (%d chars)", p, len(text))
-    return len(text.encode("utf-8")), prev_size
-
-
 def _same_contents_text(p: Path, new_text: str) -> bool:
-    """Return True if file *p* already equals *new_text* (after normalization)."""
+    """
+    Return True if file *p* is textually identical to *new_text* **after
+    normalization** (EOLs and trailing newline). Avoids churny commits.
+    """
     if not p.exists():
         return False
     try:
         current = p.read_text(encoding="utf-8")
-        return current == _normalize_text(new_text)
     except UnicodeDecodeError:
         return False
+    return _normalize_text(current) == _normalize_text(new_text)
 
 
 def _same_contents_binary(p: Path, new_b64: str) -> bool:
@@ -222,10 +177,45 @@ def _same_contents_binary(p: Path, new_b64: str) -> bool:
     if not p.exists():
         return False
     try:
-        current = p.read_bytes()
-        return current == base64.b64decode(new_b64)
+        return p.read_bytes() == base64.b64decode(new_b64)
     except Exception:
         return False
+
+
+def _atomic_write_bytes(dest: Path, data: bytes) -> None:
+    """
+    Write *data* atomically into *dest* (same‑dir temp + replace). Ensures
+    parent directories exist and fsyncs before replace.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=str(dest.parent), delete=False) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_path = Path(tmp.name)
+    os.replace(tmp_path, dest)
+
+
+def _write_file(dest: Path, *, body: Optional[str], body_b64: Optional[str]) -> tuple[int, int]:
+    """
+    Write *body* (text) or *body_b64* (binary) into *dest* atomically.
+
+    Returns (written_bytes, previous_size).
+    """
+    prev_size = dest.stat().st_size if dest.exists() else 0
+
+    if body_b64 is not None:
+        data = base64.b64decode(body_b64)
+        _atomic_write_bytes(dest, data)
+        log.debug("Wrote binary file %s (%d bytes)", dest, len(data))
+        return len(data), prev_size
+
+    # text path
+    text = _normalize_text(body or "")
+    data = text.encode("utf-8")
+    _atomic_write_bytes(dest, data)
+    log.debug("Wrote text file %s (%d bytes utf‑8)", dest, len(data))
+    return len(data), prev_size
 
 
 def _normalize_mode(mode: str) -> str:
@@ -243,37 +233,39 @@ def _normalize_mode(mode: str) -> str:
     s = (mode or "").strip()
     if not re.fullmatch(r"[0-7]{3,4}", s):
         raise PermissionError(f"Invalid chmod mode {mode!r} (must be octal)")
-
     normalized = s.lstrip("0") or "0"
     if normalized not in SAFE_MODES:
-        raise PermissionError(
-            f"Unsafe chmod mode {mode!r} (allowed: 0644/644 or 0755/755)"
-        )
+        raise PermissionError("Unsafe chmod (allowed: 0644/644 or 0755/755)")
     return normalized
 
-
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Core apply logic
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 def apply_patch(patch_json: str, repo_path: str) -> None:
     """
-    Main entry – validate, perform operation, commit.
+    Validate patch payload, perform the operation, and commit precisely.
     """
-    patch = validate_patch(patch_json)  # schema-level validation; raises on error
+    # Validate schema first (raises on error)
+    validate_patch(patch_json)
+
+    # Parse JSON into dict (supports being called with either JSON string or dict stringified)
+    patch = json.loads(patch_json)
     repo = Path(repo_path).resolve()
 
     if not (repo / ".git").exists():
         raise FileNotFoundError(f"Not a git repo: {repo}")
 
-    rel = patch.get("file", "")
+    rel: str = patch.get("file") or ""
+    if not rel:
+        raise ValueError("Missing 'file' path in patch payload")
     if _is_under_dot_git(rel):
         raise PermissionError("Refusing to operate inside .git/")
 
     src = (repo / rel).resolve()
     _ensure_inside(repo, src)
 
-    op = patch["op"]
-    log.info("Applying %s → %s", op, rel)
+    op = (patch.get("op") or "").strip().lower()
+    log.info("Applying op=%s path=%s", op, rel)
 
     # Guard against accidental overwrite of locally modified files
     if op in {"update", "delete", "rename", "chmod"} and _has_local_changes(repo, rel):
@@ -284,14 +276,16 @@ def apply_patch(patch_json: str, repo_path: str) -> None:
         body: Optional[str] = patch.get("body")
         body_b64: Optional[str] = patch.get("body_b64")
 
+        if body is None and body_b64 is None:
+            raise ValueError("create/update requires 'body' (text) or 'body_b64' (binary)")
+
         if op == "create":
             if src.exists():
                 raise FileExistsError(src)
         else:  # update
             if not src.exists():
                 raise FileNotFoundError(src)
-
-            # No‑op fast‑path: if contents are identical, skip writing + commit
+            # No‑op fast‑path
             if body is not None and _same_contents_text(src, body):
                 log.info("No content change for %s – skipping update.", rel)
                 return
@@ -299,8 +293,7 @@ def apply_patch(patch_json: str, repo_path: str) -> None:
                 log.info("No binary change for %s – skipping update.", rel)
                 return
 
-        # Write and commit (stage only the target path)
-        _write_file(src, body, body_b64)
+        _write_file(src, body=body, body_b64=body_b64)
         _commit(repo, f"GPT {op}: {rel}", paths=[rel])
         return
 
@@ -312,18 +305,18 @@ def apply_patch(patch_json: str, repo_path: str) -> None:
             raise IsADirectoryError(src)
 
         if _is_tracked(repo, rel):
-            # Precise staging of deletion (removes from index and working tree)
-            _git(repo, "rm", "-f", "--", rel)
+            _git(repo, "rm", "-f", "--", rel)  # stages deletion
             _commit(repo, f"GPT delete: {rel}", paths=[rel])
         else:
-            # Untracked file – remove from working tree only, no commit produced.
             src.unlink()
-            log.info("Deleted untracked file %s (no commit needed).", rel)
+            log.info("Deleted untracked file %s (no commit).", rel)
         return
 
     # ---------------------------- rename -----------------------------------
     if op == "rename":
-        target_rel = patch["target"]
+        target_rel: str = patch.get("target") or ""
+        if not target_rel:
+            raise ValueError("rename requires 'target'")
         if _is_under_dot_git(target_rel):
             raise PermissionError("Refusing to move a path into .git/")
 
@@ -338,24 +331,24 @@ def apply_patch(patch_json: str, repo_path: str) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
 
         if _is_tracked(repo, rel):
-            # Use git mv for accurate rename staging
+            # Accurate rename staging
             _git(repo, "mv", "--", rel, target_rel)
-            log.debug("Used git mv for rename: %s -> %s", rel, target_rel)
-            # Both sides are already staged by git mv; commit them precisely.
+            log.debug("git mv: %s -> %s", rel, target_rel)
             _commit(repo, f"GPT rename: {rel} -> {target_rel}", paths=[rel, target_rel])
         else:
-            # Filesystem move, then stage the new path only (old path was untracked)
             shutil.move(src, target)
-            log.debug("Filesystem move performed: %s -> %s", rel, target_rel)
+            log.debug("fs move: %s -> %s", rel, target_rel)
             _commit(repo, f"GPT add (rename of untracked): {target_rel}", paths=[target_rel])
         return
 
     # ---------------------------- chmod ------------------------------------
     if op == "chmod":
-        mode_raw = patch["mode"]
-        mode = _normalize_mode(mode_raw)  # accept "0755" or "755"
+        mode_raw: str = patch.get("mode") or ""
+        mode = _normalize_mode(mode_raw)
         if not src.exists():
             raise FileNotFoundError(src)
+        if not src.is_file():
+            raise IsADirectoryError(f"chmod only allowed on regular files: {rel}")
 
         desired = int(mode, 8)
         current = src.stat().st_mode & 0o777
@@ -364,17 +357,15 @@ def apply_patch(patch_json: str, repo_path: str) -> None:
             return
 
         os.chmod(src, desired)
-        # Stage and commit only this path so the mode bit change is recorded.
         _commit(repo, f"GPT chmod {mode}: {rel}", paths=[rel])
         return
 
     # -----------------------------------------------------------------------
     raise ValueError(f"Unknown op '{op}' encountered.")
 
-
-# =============================================================================
-# CLI wrapper
-# =============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
 def _cli() -> None:
     """
     Small CLI for manual / scripted invocation.
@@ -383,8 +374,8 @@ def _cli() -> None:
         sys.exit("Usage: apply_patch.py <json-string | ->  <repo>")
 
     patch_arg, repo_arg = sys.argv[1:]
-    json_payload = sys.stdin.read() if patch_arg == "-" else patch_arg
-    apply_patch(json_payload, repo_arg)
+    payload = sys.stdin.read() if patch_arg == "-" else patch_arg
+    apply_patch(payload, repo_arg)
 
 
 if __name__ == "__main__":

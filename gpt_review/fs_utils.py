@@ -7,337 +7,367 @@ GPT‑Review ▸ Filesystem & Git Utilities
 
 Purpose
 -------
-A compact, dependency‑free toolbox for repository inspection and safe Git ops.
-These helpers are used by the orchestrator to:
-  • create/switch iteration branches,
-  • classify files into *code‑like* vs *deferred* (docs/setup/examples),
-  • detect binary files conservatively,
-  • provide language census and compact tree summaries,
-  • read text with normalized EOLs for stable prompts.
+Helper utilities used by the orchestrator and other modules:
+
+* Git helpers:
+    - git(...)                – thin, logged wrapper around subprocess git
+    - checkout_branch(...)    – create/switch branch (idempotent)
+    - current_commit(...)     – HEAD SHA (short), resilient
+
+* Repository scanning & classification:
+    - classify_paths(...)     – split files into code-like vs deferred
+    - is_binary_file(...)     – fast binary detector
+    - read_text_normalized(...) – LF-normalized UTF‑8 text (lossy on errors)
+    - language_census(...)    – ["python:42", "typescript:3", ...]
+    - summarize_repo(...)     – compact tree-like snapshot for prompts
 
 Design
 ------
-* No side effects beyond logging.
-* All paths returned to callers are absolute `Path` objects under *repo*.
-* We prefer `git ls-files` when available for reproducibility; otherwise we
-  walk the filesystem with sane ignores.
-* Binary detection is conservative: known binary extensions, NUL‑byte sniff,
-  and UTF‑8 decode fallback.
-
-Logging
--------
-Uses the project logger so formatters/handlers are consistent everywhere.
+* Pure stdlib (no external deps).
+* Resilient to partial repositories and non-UTF8 files.
+* POSIX paths for all relative paths (stable in prompts & patches).
 """
 from __future__ import annotations
 
 import os
-import re
+import stat
 import subprocess
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Sequence, Tuple
 
 from gpt_review import get_logger
 
 log = get_logger(__name__)
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Git helpers
-# =============================================================================
+# -----------------------------------------------------------------------------
 
-
-def git(repo: Path, *args: str, capture: bool = False, check: bool = True) -> str:
+def git(repo: Path, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
     """
-    Run `git` with *repo* as working tree.
+    Run a git command in *repo* and return CompletedProcess.
 
     Parameters
     ----------
     repo : Path
-        Repository root (must contain `.git/`).
+        Path to the repository root.
     *args : str
-        Git arguments (e.g., "status", "--porcelain").
-    capture : bool
-        If True, return stdout as string; otherwise return "".
+        git subcommands and arguments, e.g., "status", "--porcelain".
     check : bool
-        If True, raise on non‑zero exit.
+        If True, raise CalledProcessError on non-zero exit.
 
     Returns
     -------
-    str
-        Stdout when capture=True; else empty string.
+    subprocess.CompletedProcess[str]
     """
-    res = subprocess.run(
-        ["git", "-C", str(repo), *args],
-        text=True,
-        capture_output=capture,
-    )
-    if check and res.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed: {res.stderr.strip()}")
-    return (res.stdout or "") if capture else ""
+    cmd = ["git", "-C", str(repo), *args]
+    log.debug("git: %s", " ".join(cmd))
+    proc = subprocess.run(cmd, text=True, capture_output=True)
+    if check and proc.returncode != 0:
+        log.error("git failed (rc=%s): %s\n%s", proc.returncode, " ".join(cmd), proc.stderr.strip())
+        proc.check_returncode()
+    return proc
+
+
+def checkout_branch(repo: Path, branch: str) -> None:
+    """
+    Create/switch to *branch* in *repo*. Safe if branch already exists.
+    """
+    try:
+        # Does branch exist?
+        exists = git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0
+        if exists:
+            git(repo, "switch", branch, check=True)
+            log.info("Checked out existing branch '%s'.", branch)
+        else:
+            git(repo, "switch", "-c", branch, check=True)
+            log.info("Created and switched to new branch '%s'.", branch)
+    except Exception as exc:
+        log.exception("Failed to checkout/switch branch '%s': %s", branch, exc)
+        raise
 
 
 def current_commit(repo: Path) -> str:
     """
-    Return HEAD SHA or the literal string '<no-commits-yet>' on fresh repos.
+    Return short HEAD SHA; '<no-commits-yet>' if none.
     """
     try:
-        out = git(repo, "rev-parse", "--verify", "-q", "HEAD", capture=True, check=False).strip()
+        out = git(repo, "rev-parse", "--short", "HEAD").stdout.strip()
         return out or "<no-commits-yet>"
     except Exception:
         return "<no-commits-yet>"
 
 
-def ensure_clean_worktree(repo: Path) -> None:
-    """
-    Raise RuntimeError if repository has local changes (untracked or modified).
-    """
-    status = git(repo, "status", "--porcelain", capture=True)
-    if status.strip():
-        log.error("Dirty working tree:\n%s", status)
-        raise RuntimeError(
-            "Working tree has uncommitted changes. Commit/stash before running GPT‑Review."
-        )
+# -----------------------------------------------------------------------------
+# File classification & reading
+# -----------------------------------------------------------------------------
 
+# Extensions considered "documentation-ish" (deferred to iteration 3)
+_DOC_EXT = {
+    ".md", ".rst", ".adoc", ".org", ".txt",
+    ".markdown", ".mdown", ".mkdn", ".mkd",
+}
 
-def checkout_branch(repo: Path, name: str) -> None:
-    """
-    Create (or reset) and switch to branch *name* anchored at current HEAD.
+# Installation / setup / packaging / CI markers (also deferred until iteration 3)
+_DEFERRED_BASENAMES = {
+    # Python packaging
+    "pyproject.toml", "setup.cfg", "setup.py", "requirements.txt",
+    "requirements-dev.txt", "Pipfile", "Pipfile.lock", "poetry.lock",
+    # JS/TS packaging
+    "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    # Containers / build
+    "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
+    "Makefile",  # often build/installation glue
+    # CI
+    ".gitlab-ci.yml", "azure-pipelines.yml",
+}
 
-        git switch -C <name>
-    """
-    ensure_clean_worktree(repo)
-    git(repo, "switch", "-C", name)
-    log.info("Switched to branch: %s (base=%s)", name, current_commit(repo))
+# Deferred directories (prefix match on first path segment)
+_DEFERRED_DIRS = {
+    ".github", "docs", "doc", "documentation", ".gpt-review", "examples", "example",
+    "samples", "sample", "site", "book", "mkdocs", "guides",
+}
 
+# Transient / build / vendor directories to skip from scans/summaries
+_SKIP_DIRS = {
+    ".git", ".svn", ".hg", ".idea", ".vscode", ".pytest_cache",
+    "__pycache__", "dist", "build", "node_modules", ".venv", "venv", ".mypy_cache",
+    ".tox", ".cache", ".next", ".nuxt", "coverage", ".ruff_cache",
+}
 
-def list_tracked_files(repo: Path) -> List[Path]:
-    """
-    Return tracked files (via `git ls-files`). If Git is unavailable, fall back
-    to walking the filesystem (excluding `.git/`).
-    """
-    try:
-        out = git(repo, "ls-files", capture=True)
-        files = [repo / p for p in out.splitlines() if p.strip()]
-        return files
-    except Exception:
-        # Conservative fallback
-        paths: List[Path] = []
-        for root, dirs, files in os.walk(repo):
-            if ".git" in dirs:
-                dirs.remove(".git")
-            for f in files:
-                paths.append(Path(root) / f)
-        return paths
-
-
-# =============================================================================
-# Classification / detection
-# =============================================================================
-
-# Documentation & meta
-_DOC_PATTERNS: Sequence[str] = (
-    r"(^|/)(README|CHANGELOG|CONTRIBUTING|SECURITY|CODE_OF_CONDUCT)\.(md|rst|txt)$",
-    r"(^|/)docs/.*",
-    r"(^|/)\.github/workflows/.*\.ya?ml$",
-)
-
-# Installation / packaging / setup
-_INSTALL_SETUP_PATTERNS: Sequence[str] = (
-    r"(^|/)setup\.py$",
-    r"(^|/)pyproject\.toml$",
-    r"(^|/)(install|update|cookie_login|software_review)\.sh$",
-    r"(^|/)Dockerfile$",
-    r"(^|/)(Makefile|requirements\.txt|Pipfile(\.lock)?|poetry\.lock)$",
-)
-
-# Examples
-_EXAMPLE_PATTERNS: Sequence[str] = (
-    r"(^|/)examples?/.*",
-    r"(^|/)example_.*",
-    r"(^|/)(samples?|sample_.*)",
-)
-
-# Common binary extensions — a heuristic; we still inspect bytes for \x00
-_BINARY_EXTS: set[str] = {
-    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".avif",
-    ".pdf",
-    ".zip", ".gz", ".tgz", ".xz", ".tar", ".7z", ".rar", ".bz2", ".zst",
-    ".woff", ".woff2", ".ttf", ".otf", ".eot",
-    ".mp3", ".aac", ".flac", ".wav",
-    ".mp4", ".mov", ".avi", ".mkv", ".webm",
-    ".bin", ".exe", ".dll", ".dylib", ".so", ".class",
-    # Often text, but we treat conservatively in automation:
-    ".svg",
+# File extensions to consider "text code-like" even if config-ish
+_TEXT_CODE_EXT = {
+    # Core languages
+    ".py", ".pyi", ".ipynb",
+    ".js", ".jsx", ".ts", ".tsx",
+    ".go", ".rs", ".java", ".kt", ".swift", ".rb",
+    ".c", ".h", ".cpp", ".hpp", ".cc",
+    ".cs", ".m", ".mm",
+    ".php",
+    # Scripts / config that we still treat as code-like
+    ".sh", ".bash", ".zsh", ".ps1",
+    ".toml", ".ini", ".cfg",
+    ".json", ".yaml", ".yml",
+    ".env", ".properties",
+    ".gradle", ".groovy",
+    ".xml", ".xsd",
+    ".proto",
+    ".sql",
 }
 
 
-def matches_any(patterns: Sequence[str], rel_posix_path: str) -> bool:
-    """True if *rel_posix_path* matches any regex in *patterns* (case‑insensitive)."""
-    return any(re.search(p, rel_posix_path, flags=re.IGNORECASE) for p in patterns)
+def _first_segment(rel: Path) -> str:
+    try:
+        return rel.parts[0]
+    except Exception:
+        return ""
 
 
-def is_binary_file(p: Path) -> bool:
+def is_binary_file(path: Path, sniff_bytes: int = 4096) -> bool:
     """
-    Heuristic binary detection:
-      • Known extensions → binary
-      • Contains NUL byte → binary
-      • Fails utf‑8 decode → binary
+    Heuristic binary detector: returns True if NUL byte present in the first
+    *sniff_bytes* or file mode is executable non-text in some edge cases.
+
+    This is intentionally simple and fast.
     """
     try:
-        if p.suffix.lower() in _BINARY_EXTS:
-            return True
-        chunk = p.read_bytes()[: 2048]
+        with path.open("rb") as f:
+            chunk = f.read(sniff_bytes)
         if b"\x00" in chunk:
             return True
-        # Attempt utf‑8 decode (best‑effort)
-        _ = chunk.decode("utf-8")
+        # If it is very high-ASCII density and no newline, likely binary
+        if chunk and (sum(b > 127 for b in chunk) / len(chunk) > 0.95) and b"\n" not in chunk:
+            return True
+        # Executable bit alone does not imply binary; keep it textual.
         return False
     except Exception:
-        # Be conservative on any IO/codec errors
+        # If unreadable, err on the side of non-binary to allow inspection.
+        return False
+
+
+def read_text_normalized(path: Path) -> str:
+    """
+    Read file as UTF‑8 (lossy on errors), normalize EOL to '\n'.
+    """
+    data = path.read_bytes()
+    text = data.decode("utf-8", errors="replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _is_deferred(rel: Path) -> bool:
+    """
+    Return True if *rel* is a documentation/setup/example/CI file we defer until iteration 3.
+    """
+    # Directory-based quick checks
+    if _first_segment(rel) in _DEFERRED_DIRS:
         return True
+
+    # Basename match
+    if rel.name in _DEFERRED_BASENAMES:
+        return True
+
+    # Extension-based docs
+    if rel.suffix.lower() in _DOC_EXT:
+        return True
+
+    # CI workflows
+    if rel.as_posix().startswith(".github/workflows/"):
+        return True
+
+    return False
 
 
 def classify_paths(repo: Path) -> Tuple[List[Path], List[Path]]:
     """
-    Split repository files into two buckets:
+    Walk *repo* and return (code_like, deferred) path lists.
 
-        (code_like, deferred_docs_setup_examples)
-
-    Both lists contain absolute `Path` objects under *repo* (sorted).
+    * Skips transient/vendor dirs.
+    * Treats binary files as code-excluded unless explicitly whitelisted.
+    * Defers docs/setup/examples/CI until iteration 3.
     """
-    all_files = list_tracked_files(repo)
     code_like: List[Path] = []
     deferred: List[Path] = []
 
-    for p in all_files:
-        try:
-            rel = p.relative_to(repo).as_posix()
-        except Exception:
-            # Skip weird paths that cannot be relativized
-            log.debug("Skipping non-relativizable path: %s", p)
-            continue
+    repo = repo.resolve()
+    for root, dirs, files in os.walk(repo):
+        # Prune skip directories in-place to avoid walking into them
+        dirs[:] = [d for d in dirs if d not in _SkipSet()]
+        base = Path(root)
 
-        if matches_any(_DOC_PATTERNS, rel) or matches_any(_INSTALL_SETUP_PATTERNS, rel) or matches_any(
-            _EXAMPLE_PATTERNS, rel
-        ):
-            deferred.append(p)
-        else:
-            code_like.append(p)
+        for name in files:
+            p = base / name
+            # Compute POSIX-relative path
+            try:
+                rel = p.relative_to(repo)
+            except Exception:
+                # Should not happen; skip if outside repo
+                continue
+
+            # Skip git-specific internals and patch tool itself
+            if rel.as_posix().startswith(".git/"):
+                continue
+
+            # Classify deferred
+            if _is_deferred(rel):
+                deferred.append(p)
+                continue
+
+            # Binary files are not code-like for review steps
+            if is_binary_file(p):
+                deferred.append(p)
+                continue
+
+            # Treat as code-like if extension is known, otherwise default to code-like
+            if rel.suffix.lower() in _TEXT_CODE_EXT or rel.suffix:
+                code_like.append(p)
+            else:
+                code_like.append(p)
 
     code_like.sort()
     deferred.sort()
-    log.info(
-        "Path classification: %d total → %d code-like, %d deferred (docs/setup/examples).",
-        len(all_files),
-        len(code_like),
-        len(deferred),
-    )
+    log.debug("classify_paths: code=%d deferred=%d", len(code_like), len(deferred))
     return code_like, deferred
 
 
-# =============================================================================
-# Summaries & language census
-# =============================================================================
-
-_LANG_BY_EXT: Dict[str, str] = {
-    ".py": "python",
-    ".pyi": "python",
-    ".sh": "shell",
-    ".md": "markdown",
-    ".yml": "yaml",
-    ".yaml": "yaml",
-    ".json": "json",
-    ".toml": "toml",
-    ".ini": "ini",
-    ".cfg": "ini",
-    ".js": "javascript",
-    ".jsx": "javascript",
-    ".ts": "typescript",
-    ".tsx": "typescript",
-    ".java": "java",
-    ".kt": "kotlin",
-    ".go": "go",
-    ".rb": "ruby",
-    ".rs": "rust",
-    ".cpp": "cpp",
-    ".cxx": "cpp",
-    ".cc": "cpp",
-    ".c": "c",
-    ".h": "c-header",
-    ".hpp": "cpp-header",
-    ".html": "html",
-    ".css": "css",
-    ".scss": "scss",
-}
-
-
-def language_census(paths: Sequence[Path]) -> List[str]:
+def _SkipSet() -> set:
     """
-    Return a compact census list: ["python:42", "shell:5", …] for prompt context.
+    Build skip set once (function to avoid module import-time surprises).
     """
-    counts: Dict[str, int] = {}
-    for p in paths:
-        lang = _LANG_BY_EXT.get(p.suffix.lower(), "other")
+    return set(_SKIP_DIRS)
+
+
+# -----------------------------------------------------------------------------
+# Language census & repo summary
+# -----------------------------------------------------------------------------
+
+def _lang_for_extension(ext: str) -> str:
+    e = ext.lower()
+    return {
+        ".py": "python",
+        ".pyi": "python",
+        ".ipynb": "python",
+        ".js": "javascript",
+        ".jsx": "javascript",
+        ".ts": "typescript",
+        ".tsx": "typescript",
+        ".go": "go",
+        ".rs": "rust",
+        ".java": "java",
+        ".kt": "kotlin",
+        ".swift": "swift",
+        ".rb": "ruby",
+        ".c": "c",
+        ".h": "c",
+        ".cpp": "cpp",
+        ".hpp": "cpp",
+        ".cc": "cpp",
+        ".cs": "csharp",
+        ".m": "objc",
+        ".mm": "objc++",
+        ".php": "php",
+        ".sh": "shell",
+        ".bash": "shell",
+        ".zsh": "shell",
+        ".ps1": "powershell",
+        ".toml": "toml",
+        ".ini": "ini",
+        ".cfg": "ini",
+        ".json": "json",
+        ".yaml": "yaml",
+        ".yml": "yaml",
+        ".xml": "xml",
+        ".proto": "proto",
+        ".sql": "sql",
+        ".md": "markdown",
+        ".rst": "rst",
+        ".txt": "text",
+    }.get(e, e.lstrip(".") or "other")
+
+
+def language_census(files: Sequence[Path]) -> List[str]:
+    """
+    Return a compact census like ["python:42", "typescript:3", "yaml:7"].
+
+    * Counts by extension → language mapping.
+    * Sorted by descending count, then alphabetically.
+    """
+    counts: dict[str, int] = {}
+    for p in files:
+        lang = _lang_for_extension(p.suffix)
         counts[lang] = counts.get(lang, 0) + 1
-    return [f"{k}:{v}" for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+    items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [f"{lang}:{n}" for lang, n in items]
 
 
-def summarize_repo(repo: Path, max_lines: int = 400) -> str:
+def summarize_repo(repo: Path, *, max_entries: int = 400) -> str:
     """
-    Return a newline‑joined list of relative paths (tracked files), trimmed to
-    *max_lines* to keep prompts compact.
+    Produce a compact, stable summary of the repository for prompts.
+
+    - Lists up to *max_entries* files (POSIX relative paths).
+    - Skips vendor/transient directories.
+    - Distinguishes deferred files with a trailing " (deferred)" marker.
     """
-    try:
-        out = git(repo, "ls-files", capture=True)
-        lines = [ln for ln in out.splitlines() if ln.strip()]
-    except Exception:
-        # Fallback: walk the tree
-        lines = []
-        for p in sorted(list_tracked_files(repo)):
+    repo = repo.resolve()
+    entries: List[str] = []
+    code_like, deferred = classify_paths(repo)
+
+    def rels(paths: Iterable[Path], suffix: str = "") -> List[str]:
+        out: List[str] = []
+        for p in paths:
             try:
-                lines.append(p.relative_to(repo).as_posix())
+                out.append(p.relative_to(repo).as_posix() + suffix)
             except Exception:
-                pass
+                continue
+        return out
 
-    if len(lines) > max_lines:
-        head = "\n".join(lines[: max_lines // 2])
-        tail = "\n".join(lines[-max_lines // 2 :])
-        return f"{head}\n…\n{tail}"
-    return "\n".join(lines)
+    lines = rels(code_like) + rels(deferred, " (deferred)")
+    lines.sort()
+    if len(lines) > max_entries:
+        head = lines[: max_entries // 2]
+        tail = lines[-(max_entries - len(head)) :]
+        lines = head + ["… (truncated) …"] + tail
 
-
-# =============================================================================
-# Text helpers
-# =============================================================================
-
-
-def read_text_normalized(p: Path) -> str:
-    """
-    Read a text file as UTF‑8 and normalize end‑of‑line to LF.
-
-    The patch‑apply layer ensures a trailing newline and permission handling;
-    here we only normalize CRLF/CR so prompts stay stable across platforms.
-    """
-    txt = p.read_text(encoding="utf-8")
-    return txt.replace("\r\n", "\n").replace("\r", "\n")
-
-
-# =============================================================================
-# __all__
-# =============================================================================
-
-__all__ = [
-    # git
-    "git",
-    "current_commit",
-    "ensure_clean_worktree",
-    "checkout_branch",
-    "list_tracked_files",
-    # classification
-    "classify_paths",
-    "is_binary_file",
-    # summaries
-    "language_census",
-    "summarize_repo",
-    # text
-    "read_text_normalized",
-]
+    summary = "\n".join(lines)
+    log.debug("summarize_repo: %d entries (max=%d)", len(lines), max_entries)
+    return summary

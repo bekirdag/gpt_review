@@ -22,13 +22,16 @@ Responsibilities
   - Enter an error‑fix loop: run the provided command, collect logs, ask for
     affected files (JSON list) & full replacements; iterate until success.
 
-• Commit after every file; push branch at the end if requested.
+• Push branch at the end if requested.
 
 Design choices
 --------------
 • Full‑file semantics: the assistant must always return an *entire* file as the
   replacement (never a diff). We enforce this with a tool schema and schema
   validation before writing through `apply_patch`.
+• `apply_patch.py` performs **path‑scoped staging and the actual commit** for each
+  change. This module does not re‑commit the same paths (avoids “nothing to commit”
+  errors and respects the single‑source-of-truth safety layer).
 • Deferral: docs/installation/setup/example files are intentionally skipped
   in iterations 1 & 2 and processed in iteration 3 to avoid churn.
 • Explicit paths: every action uses repo‑root‑relative POSIX paths to prevent
@@ -43,16 +46,14 @@ This module uses:
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
-import shlex
 import subprocess
 import sys
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 from gpt_review import get_logger
 from patch_validator import validate_patch
@@ -162,16 +163,6 @@ def _ensure_branch(repo: Path, prefix: str) -> str:
     log.info("Creating/checkout branch: %s", name)
     _git(repo, "checkout", "-B", name, check=True)
     return name
-
-
-def _commit(repo: Path, message: str, paths: Sequence[str]) -> None:
-    """
-    Stage only *paths* and commit with *message*. Keeps staging path‑scoped.
-    """
-    if not paths:
-        return
-    _git(repo, "add", "--", *paths, check=True)
-    _git(repo, "commit", "-m", message, check=True)
 
 
 def _push(repo: Path, remote: str, branch: str) -> None:
@@ -411,9 +402,13 @@ class ReviewWorkflow:
     # ────────────────────────────────────────────────────────────────────── #
     # Core operations
     # ────────────────────────────────────────────────────────────────────── #
-    def _apply_and_commit(self, patch: dict, commit_msg: str) -> None:
+    def _apply_and_commit(self, patch: dict, _commit_msg: str) -> None:
         """
-        Apply a validated patch dict and commit it (path‑scoped).
+        Apply a validated patch dict.
+
+        Note: `apply_patch.py` performs path‑scoped staging **and** the commit.
+        We deliberately avoid a second commit here to prevent “nothing to commit”
+        failures and to keep all write safeguards in one place.
         """
         from apply_patch import apply_patch  # local import to avoid cycles
 
@@ -425,7 +420,7 @@ class ReviewWorkflow:
             log.exception("Patch apply failed for %s: %s", patch.get("file"), exc)
             raise SystemExit(1) from exc
 
-        _commit(self.repo, commit_msg, [patch["file"]])
+        log.info("Applied patch & committed via apply_patch: %s", patch.get("file"))
 
     def _iter_paths(self, iteration: int) -> List[str]:
         """

@@ -19,7 +19,7 @@ like **path‑scoped staging**, normalization, and safety checks.
 
 Key features
 ------------
-* Fast recursive walk with ignore patterns (e.g., .git/, venv/, node_modules/)
+* Fast recursive walk with pruning of heavy directories (e.g., .git/, venv/, node_modules/)
 * Robust binary sniff (NUL‑byte / control‑density heuristic)
 * Reproducible, stable ordering (POSIX‑style paths, lexicographic sort)
 * Clear classification buckets:
@@ -82,6 +82,7 @@ _DOC_BASENAMES: Set[str] = {
     "README", "CHANGELOG", "CONTRIBUTING", "LICENSE", "SECURITY",
     "CODE_OF_CONDUCT", "CODE-OF-CONDUCT",
 }
+_DOC_DIR_HINTS: Set[str] = {"docs", "doc"}  # include both common spellings
 
 # Setup / install / CI
 _SETUP_BASENAMES: Set[str] = {
@@ -277,8 +278,8 @@ class RepoScanner:
             return "doc"
         if stem.upper() in _DOC_BASENAMES:
             return "doc"
-        if "docs" in (d.lower() for d in dirs):
-            # Treat files inside /docs as docs unless they are clear code (e.g., .py)
+        if any(d.lower() in _DOC_DIR_HINTS for d in dirs):
+            # Treat files inside docs/doc as docs unless they are clear code (e.g., .py)
             if ext not in _TEXT_CODE_EXTS:
                 return "doc"
 
@@ -312,42 +313,36 @@ class RepoScanner:
     # ---------------------------- helpers ----------------------------------- #
     def _iter_files(self, root: Path) -> Iterable[Path]:
         """
-        Yield files under *root*, respecting ignore rules.
+        Yield files under *root*, **pruning** ignored directories to avoid
+        traversing heavyweight trees (e.g., node_modules).
         """
-        for p in root.rglob("*"):
-            # Skip directories
-            if p.is_dir():
-                if self._is_ignored_dir(p):
-                    # We can't prune rglob traversal, but we will skip members later.
-                    pass
-                continue
-            # Skip non-regular files (symlinks etc. are allowed if they resolve to files)
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            # Compute rel parts once
             try:
-                if not p.is_file():
+                rel_parts = Path(dirpath).resolve().relative_to(root).parts
+            except Exception:
+                rel_parts = ()
+
+            # Prune ignored directories in-place (prevents descent)
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in _IGNORE_DIRS and d != ".git"
+            ]
+            # If current path is already inside an ignored dir, skip entirely
+            if any(part in _IGNORE_DIRS for part in rel_parts) or ".git" in rel_parts:
+                continue
+
+            for name in filenames:
+                if any(fnmatch.fnmatch(name, pat) for pat in _IGNORE_FILE_GLOBS):
                     continue
-            except OSError:
-                continue
-
-            # Skip anything under ignored dirs
-            if any(part in _IGNORE_DIRS for part in p.relative_to(root).parts):
-                continue
-
-            # Skip ignored file globs
-            if any(fnmatch.fnmatch(p.name, pat) for pat in _IGNORE_FILE_GLOBS):
-                continue
-
-            # Never traverse into .git/
-            if ".git" in p.parts:
-                continue
-
-            yield p
-
-    def _is_ignored_dir(self, p: Path) -> bool:
-        try:
-            rel = p.relative_to(self.root)
-        except Exception:
-            return False
-        return any(part in _IGNORE_DIRS for part in rel.parts)
+                p = Path(dirpath) / name
+                # Skip non-regular files defensively
+                try:
+                    if not p.is_file():
+                        continue
+                except OSError:
+                    continue
+                yield p
 
     def _relposix(self, p: Path) -> str:
         return p.relative_to(self.root).as_posix()

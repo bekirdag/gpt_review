@@ -519,3 +519,10 @@ def submit_patch_call(
         )
 
     return patch
+
+
+__all__ = [
+    "OpenAIClient",
+    "strict_json_array",
+    "submit_patch_call",
+]

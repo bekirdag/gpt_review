@@ -42,12 +42,11 @@ import fnmatch
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 from gpt_review import get_logger
 from gpt_review.repo_scanner import RepoScanner          # robust underlying scanner
 from gpt_review.fs_utils import (                        # reuse shared helpers
-    read_text_normalized as _read_text_normalized,
     is_binary_file as _is_binary_file,
 )
 
@@ -271,8 +270,9 @@ def classify_path(repo: Path, rel_path: Path | str) -> Category:
 
     if _matches_any(rel, _DOC_GLOBS):
         return Category.DOCS
+    # Align with documented behavior: treat "install" as SETUP for callers.
     if _matches_any(rel, _INSTALL_GLOBS):
-        return Category.INSTALL
+        return Category.SETUP
     if _matches_any(rel, _SETUP_GLOBS):
         return Category.SETUP
     if _matches_any(rel, _EXAMPLE_GLOBS):
@@ -299,7 +299,7 @@ def read_text_file(repo: Path, rel_posix: str, *, max_bytes: int = 1024 * 1024) 
     if _is_binary_file(p):
         raise ValueError(f"Refusing to read binary file as text: {rel_posix}")
 
-    # Use the shared normalization helper; keep a defensive size guard.
+    # Defensive size guard to avoid oversized prompt payloads.
     data = p.read_bytes()[:max_bytes]
     text = data.decode("utf-8", errors="replace")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
