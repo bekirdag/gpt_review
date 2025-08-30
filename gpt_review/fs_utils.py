@@ -11,7 +11,7 @@ Helper utilities used by the orchestrator and other modules:
 
 * Git helpers:
     - git(...)                – thin, logged wrapper around subprocess git
-    - checkout_branch(...)    – create/switch branch (idempotent)
+    - checkout_branch(...)    – create/switch branch (idempotent; orphan fallback)
     - current_commit(...)     – HEAD SHA (short), resilient
 
 * Repository scanning & classification:
@@ -26,11 +26,16 @@ Design
 * Pure stdlib (no external deps).
 * Resilient to partial repositories and non-UTF8 files.
 * POSIX paths for all relative paths (stable in prompts & patches).
+
+Notes
+-----
+Deferral policy is tuned for the orchestrator’s 3‑iteration workflow:
+iterations 1–2 focus on **source/tests/config**, while documentation,
+installation/setup, packaging, and examples are **deferred** to iteration 3.
 """
 from __future__ import annotations
 
 import os
-import stat
 import subprocess
 from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
@@ -69,19 +74,40 @@ def git(repo: Path, *args: str, check: bool = False) -> subprocess.CompletedProc
     return proc
 
 
+def _has_commits(repo: Path) -> bool:
+    """True if the repository has at least one commit."""
+    return git(repo, "rev-parse", "--verify", "-q", "HEAD").returncode == 0
+
+
 def checkout_branch(repo: Path, branch: str) -> None:
     """
     Create/switch to *branch* in *repo*. Safe if branch already exists.
+    Falls back to an **orphan** branch for fresh repositories (no commits).
+    Also falls back to `git checkout` on older git versions lacking `switch`.
     """
     try:
-        # Does branch exist?
         exists = git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0
         if exists:
-            git(repo, "switch", branch, check=True)
+            # Prefer `switch`; fall back to `checkout`.
+            res = git(repo, "switch", branch)
+            if res.returncode != 0:
+                git(repo, "checkout", branch, check=True)
             log.info("Checked out existing branch '%s'.", branch)
-        else:
-            git(repo, "switch", "-c", branch, check=True)
+            return
+
+        # Create new branch
+        if _has_commits(repo):
+            # Normal branch off current HEAD.
+            res = git(repo, "switch", "-c", branch)
+            if res.returncode != 0:
+                git(repo, "checkout", "-b", branch, check=True)
             log.info("Created and switched to new branch '%s'.", branch)
+        else:
+            # Fresh repo – create an orphan branch.
+            res = git(repo, "switch", "--orphan", branch)
+            if res.returncode != 0:
+                git(repo, "checkout", "--orphan", branch, check=True)
+            log.info("Created **orphan** branch '%s' (fresh repository).", branch)
     except Exception as exc:
         log.exception("Failed to checkout/switch branch '%s': %s", branch, exc)
         raise
@@ -110,9 +136,10 @@ _DOC_EXT = {
 
 # Installation / setup / packaging / CI markers (also deferred until iteration 3)
 _DEFERRED_BASENAMES = {
-    # Python packaging
+    # Python packaging & manifests
     "pyproject.toml", "setup.cfg", "setup.py", "requirements.txt",
-    "requirements-dev.txt", "Pipfile", "Pipfile.lock", "poetry.lock",
+    "requirements-dev.txt", "dev-requirements.txt", "Pipfile", "Pipfile.lock",
+    "poetry.lock", "MANIFEST.in",
     # JS/TS packaging
     "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
     # Containers / build
@@ -120,12 +147,16 @@ _DEFERRED_BASENAMES = {
     "Makefile",  # often build/installation glue
     # CI
     ".gitlab-ci.yml", "azure-pipelines.yml",
+    # Top-level docs that may lack extensions
+    "README", "CHANGELOG", "CONTRIBUTING", "LICENSE", "COPYING", "NOTICE",
+    # Common local install/ops scripts in this project
+    "install.sh", "update.sh", "software_review.sh", "cookie_login.sh",
 }
 
 # Deferred directories (prefix match on first path segment)
 _DEFERRED_DIRS = {
     ".github", "docs", "doc", "documentation", ".gpt-review", "examples", "example",
-    "samples", "sample", "site", "book", "mkdocs", "guides",
+    "samples", "sample", "site", "book", "mkdocs", "guides", "ci", ".ci", "docker",
 }
 
 # Transient / build / vendor directories to skip from scans/summaries
@@ -133,9 +164,10 @@ _SKIP_DIRS = {
     ".git", ".svn", ".hg", ".idea", ".vscode", ".pytest_cache",
     "__pycache__", "dist", "build", "node_modules", ".venv", "venv", ".mypy_cache",
     ".tox", ".cache", ".next", ".nuxt", "coverage", ".ruff_cache",
+    "target", "htmlcov", "logs", "docker-build",
 }
 
-# File extensions to consider "text code-like" even if config-ish
+# File extensions to consider "text code-like" even if config-ish (informative only)
 _TEXT_CODE_EXT = {
     # Core languages
     ".py", ".pyi", ".ipynb",
@@ -155,6 +187,16 @@ _TEXT_CODE_EXT = {
     ".sql",
 }
 
+# Heuristic binary extensions (short-circuit before sniff)
+_BINARY_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".avif",
+    ".tar", ".gz", ".tgz", ".zip", ".7z", ".rar", ".xz", ".bz2", ".zst",
+    ".pdf", ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".mp3", ".aac", ".flac", ".wav",
+    ".mp4", ".mov", ".avi", ".mkv", ".webm",
+    ".bin", ".exe", ".dll", ".dylib", ".so", ".class",
+}
+
 
 def _first_segment(rel: Path) -> str:
     try:
@@ -165,24 +207,42 @@ def _first_segment(rel: Path) -> str:
 
 def is_binary_file(path: Path, sniff_bytes: int = 4096) -> bool:
     """
-    Heuristic binary detector: returns True if NUL byte present in the first
-    *sniff_bytes* or file mode is executable non-text in some edge cases.
+    Heuristic binary detector:
+      • Extension short‑circuit for common binaries.
+      • Otherwise read up to *sniff_bytes* and check:
+          - NUL byte present,
+          - or control‑character density (>30%, excluding tab/lf/cr),
+          - or (fallback) very high non‑ASCII density with no newline.
 
-    This is intentionally simple and fast.
+    This is intentionally fast and conservative (prefers True when uncertain).
     """
+    ext = path.suffix.lower()
+    if ext in _BINARY_EXTS:
+        return True
+
     try:
         with path.open("rb") as f:
             chunk = f.read(sniff_bytes)
-        if b"\x00" in chunk:
-            return True
-        # If it is very high-ASCII density and no newline, likely binary
-        if chunk and (sum(b > 127 for b in chunk) / len(chunk) > 0.95) and b"\n" not in chunk:
-            return True
-        # Executable bit alone does not imply binary; keep it textual.
-        return False
     except Exception:
-        # If unreadable, err on the side of non-binary to allow inspection.
+        # If unreadable, err on the safe side
+        return True
+
+    if not chunk:
         return False
+
+    if b"\x00" in chunk:
+        return True
+
+    # Control‑character density (excluding common whitespace)
+    ctrl = sum(1 for b in chunk if b < 32 and b not in (9, 10, 13))
+    if (ctrl / max(1, len(chunk))) > 0.30:
+        return True
+
+    # Legacy fallback: very high non‑ASCII and no newline
+    if (sum(b > 127 for b in chunk) / len(chunk) > 0.95) and b"\n" not in chunk:
+        return True
+
+    return False
 
 
 def read_text_normalized(path: Path) -> str:
@@ -202,7 +262,7 @@ def _is_deferred(rel: Path) -> bool:
     if _first_segment(rel) in _DEFERRED_DIRS:
         return True
 
-    # Basename match
+    # Basename match (handles extensionless doc names too)
     if rel.name in _DEFERRED_BASENAMES:
         return True
 
@@ -222,16 +282,19 @@ def classify_paths(repo: Path) -> Tuple[List[Path], List[Path]]:
     Walk *repo* and return (code_like, deferred) path lists.
 
     * Skips transient/vendor dirs.
-    * Treats binary files as code-excluded unless explicitly whitelisted.
     * Defers docs/setup/examples/CI until iteration 3.
+    * **Excludes binary files** from both lists.
+    * Any non-binary, non-deferred regular file is considered **code-like**.
     """
     code_like: List[Path] = []
     deferred: List[Path] = []
 
     repo = repo.resolve()
+    skip_dirs = set(_SKIP_DIRS)
+
     for root, dirs, files in os.walk(repo):
         # Prune skip directories in-place to avoid walking into them
-        dirs[:] = [d for d in dirs if d not in _SkipSet()]
+        dirs[:] = [d for d in dirs if d not in skip_dirs and d != ".git"]
         base = Path(root)
 
         for name in files:
@@ -243,37 +306,26 @@ def classify_paths(repo: Path) -> Tuple[List[Path], List[Path]]:
                 # Should not happen; skip if outside repo
                 continue
 
-            # Skip git-specific internals and patch tool itself
-            if rel.as_posix().startswith(".git/"):
+            # Skip Git internals (defensive)
+            if rel.as_posix().startswith(".git/") or rel.as_posix() == ".git":
                 continue
 
-            # Classify deferred
+            # Exclude binaries entirely from both lists
+            if is_binary_file(p):
+                continue
+
+            # Deferred (non-binary) first
             if _is_deferred(rel):
                 deferred.append(p)
                 continue
 
-            # Binary files are not code-like for review steps
-            if is_binary_file(p):
-                deferred.append(p)
-                continue
-
-            # Treat as code-like if extension is known, otherwise default to code-like
-            if rel.suffix.lower() in _TEXT_CODE_EXT or rel.suffix:
-                code_like.append(p)
-            else:
-                code_like.append(p)
+            # Everything else: treat as code-like
+            code_like.append(p)
 
     code_like.sort()
     deferred.sort()
     log.debug("classify_paths: code=%d deferred=%d", len(code_like), len(deferred))
     return code_like, deferred
-
-
-def _SkipSet() -> set:
-    """
-    Build skip set once (function to avoid module import-time surprises).
-    """
-    return set(_SKIP_DIRS)
 
 
 # -----------------------------------------------------------------------------
@@ -349,7 +401,6 @@ def summarize_repo(repo: Path, *, max_entries: int = 400) -> str:
     - Distinguishes deferred files with a trailing " (deferred)" marker.
     """
     repo = repo.resolve()
-    entries: List[str] = []
     code_like, deferred = classify_paths(repo)
 
     def rels(paths: Iterable[Path], suffix: str = "") -> List[str]:

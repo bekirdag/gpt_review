@@ -45,9 +45,19 @@ from pathlib import Path
 from typing import List, Sequence, Tuple
 
 from gpt_review import get_logger
-from gpt_review.repo_scanner import RepoScanner          # robust underlying scanner
-from gpt_review.fs_utils import (                        # reuse shared helpers
+
+# Prefer the robust underlying scanner if available; otherwise fall back.
+try:  # pragma: no cover - import availability depends on installation mode
+    from gpt_review.repo_scanner import RepoScanner  # type: ignore
+    _HAVE_REPO_SCANNER = True
+except Exception:  # pragma: no cover
+    RepoScanner = None  # type: ignore[assignment]
+    _HAVE_REPO_SCANNER = False
+
+# Reuse shared helpers from fs_utils for fallback paths
+from gpt_review.fs_utils import (
     is_binary_file as _is_binary_file,
+    classify_paths as _classify_paths,
 )
 
 log = get_logger(__name__)
@@ -138,30 +148,61 @@ def scan_repository(repo_root: Path, *, ignores: Sequence[str] | None = None) ->
         log.debug("scan_repository: 'ignores' parameter is accepted but unused (%s)", list(ignores))
 
     root = Path(repo_root).expanduser().resolve()
-    scanner = RepoScanner(root)
-    idx = scanner.scan()
 
-    binaries = set(idx.binary_files)
-    docs = set(idx.docs_files)
-    setup = set(idx.setup_files)
-    examples = set(idx.example_files)
+    # Preferred path: rich RepoScanner API
+    if _HAVE_REPO_SCANNER:
+        try:
+            scanner = RepoScanner(root)  # type: ignore[call-arg]
+            idx = scanner.scan()
+            binaries = set(idx.binary_files)
+            docs = set(idx.docs_files)
+            setup = set(idx.setup_files)
+            examples = set(idx.example_files)
+            deferred = sorted((docs | setup | examples) - binaries)
+            code = sorted(set(idx.code_files) - binaries)
+            tests = sorted(set(idx.test_files) - binaries)
+            non_binary_all = sorted(set(idx.all_files) - binaries)
+            manifest = RepoScan(
+                root=root,
+                all_files=_stable_unique(non_binary_all),
+                code_and_config=_stable_unique(code + tests),
+                docs_and_extras=_stable_unique(deferred),
+            )
+            log.info(
+                "Scanned repo (RepoScanner): total=%s non‑binary=%s iter12=%s deferred=%s",
+                len(idx.all_files),
+                len(manifest.all_files),
+                len(manifest.code_and_config),
+                len(manifest.docs_and_extras),
+            )
+            return manifest
+        except Exception as exc:
+            log.warning("RepoScanner unavailable or failed (%s); falling back to fs_utils.", exc)
 
-    deferred = sorted((docs | setup | examples) - binaries)
-    code = sorted(set(idx.code_files) - binaries)
-    tests = sorted(set(idx.test_files) - binaries)
+    # Fallback path: reuse fs_utils classification + simple globs for sub‑classes
+    code_like, deferred_paths = _classify_paths(root)
+    rel_code = [p.relative_to(root).as_posix() for p in code_like]
+    rel_deferred = [p.relative_to(root).as_posix() for p in deferred_paths]
 
-    non_binary_all = sorted(set(idx.all_files) - binaries)
+    tests = [rp for rp in rel_code if _matches_any(rp, _TEST_GLOBS)]
+    code = [rp for rp in rel_code if rp not in tests]
+    # Split deferred between docs/setup/examples (best‑effort)
+    docs = [rp for rp in rel_deferred if _matches_any(rp, _DOC_GLOBS)]
+    setup = [rp for rp in rel_deferred if _matches_any(rp, _SETUP_GLOBS) or _matches_any(rp, _INSTALL_GLOBS)]
+    examples = [rp for rp in rel_deferred if _matches_any(rp, _EXAMPLE_GLOBS)]
+    # Union for ordering (allow overlaps to appear once)
+    deferred = _stable_unique(docs + setup + examples)
+
+    non_binary_all = _stable_unique(rel_code + rel_deferred)
 
     manifest = RepoScan(
         root=root,
-        all_files=_stable_unique(non_binary_all),
+        all_files=non_binary_all,
         code_and_config=_stable_unique(code + tests),
-        docs_and_extras=_stable_unique(deferred),
+        docs_and_extras=deferred,
     )
-
     log.info(
-        "Scanned repo: total=%s non‑binary=%s iter12=%s deferred=%s",
-        len(idx.all_files),
+        "Scanned repo (fallback): non‑binary=%s iter12=%s deferred=%s",
         len(manifest.all_files),
         len(manifest.code_and_config),
         len(manifest.docs_and_extras),
@@ -226,7 +267,23 @@ _TEST_GLOBS: Tuple[str, ...] = ("tests/**", "test_*.*", "*_test.*")
 
 
 def _matches_any(path: str, patterns: Sequence[str]) -> bool:
-    return any(fnmatch.fnmatch(path, pat) for pat in patterns)
+    """
+    fnmatch does not treat '**' as "any directories", so we treat any pattern
+    containing '/**' as a simple prefix rule:
+        'docs/**'              → path startswith 'docs/'
+        'docs/examples/**'     → path startswith 'docs/examples/'
+    All other patterns are evaluated with fnmatch.
+    """
+    for pat in patterns:
+        if "/**" in pat:
+            prefix = pat.split("/**", 1)[0]
+            # Ensure prefix match aligns to a path segment boundary
+            if prefix and (path == prefix or path.startswith(prefix.rstrip("/") + "/")):
+                return True
+        else:
+            if fnmatch.fnmatch(path, pat):
+                return True
+    return False
 
 
 def classify_path(repo: Path, rel_path: Path | str) -> Category:
@@ -236,30 +293,30 @@ def classify_path(repo: Path, rel_path: Path | str) -> Category:
     Implementation:
     • Prefer the fresh `RepoScanner` index; if the file appears in its category
       lists we return that category (INSTALL is merged into SETUP).
-    • If not present (e.g., untracked/new), fall back to earlier glob/extension
-      heuristics to keep behavior stable.
+    • If not present (e.g., untracked/new) or the scanner is unavailable,
+      fall back to earlier glob/extension heuristics to keep behavior stable.
     """
     root = Path(repo).expanduser().resolve()
     rel = Path(rel_path).as_posix()
 
-    try:
-        idx = RepoScanner(root).scan()
-        if rel in idx.binary_files:
-            return Category.BINARY
-        if rel in idx.test_files:
-            return Category.TEST
-        if rel in idx.code_files:
-            return Category.CODE
-        if rel in idx.docs_files:
-            return Category.DOCS
-        if rel in idx.example_files:
-            return Category.EXAMPLE
-        if rel in idx.setup_files:
-            # Historically INSTALL was separate; RepoScanner lumps install/setup.
-            return Category.SETUP
-    except Exception:
-        # Indexing failed; continue to heuristic fallback.
-        pass
+    if _HAVE_REPO_SCANNER:
+        try:
+            idx = RepoScanner(root).scan()  # type: ignore[call-arg]
+            if rel in getattr(idx, "binary_files", []):
+                return Category.BINARY
+            if rel in getattr(idx, "test_files", []):
+                return Category.TEST
+            if rel in getattr(idx, "code_files", []):
+                return Category.CODE
+            if rel in getattr(idx, "docs_files", []):
+                return Category.DOCS
+            if rel in getattr(idx, "example_files", []):
+                return Category.EXAMPLE
+            if rel in getattr(idx, "setup_files", []):
+                return Category.SETUP  # INSTALL merged into SETUP
+        except Exception:
+            # Indexing failed; continue to heuristic fallback.
+            pass
 
     # Heuristic fallback (similar to earlier implementation)
     if _is_binary_file(root / rel):
@@ -315,9 +372,20 @@ def languages_present(repo: Path) -> List[Tuple[str, int]]:
     Return a list of (language, file_count) pairs sorted by count desc,
     considering only CODE and TEST categories.
     """
-    idx = RepoScanner(Path(repo).expanduser().resolve()).scan()
+    root = Path(repo).expanduser().resolve()
+    if _HAVE_REPO_SCANNER:
+        try:
+            idx = RepoScanner(root).scan()  # type: ignore[call-arg]
+            rels = list(getattr(idx, "code_files", [])) + list(getattr(idx, "test_files", []))
+        except Exception:
+            rels = []
+    else:
+        # Fallback: classify_paths returns non‑binary “code‑like” + deferred; treat code‑like as code/tests.
+        code_like, _ = _classify_paths(root)
+        rels = [p.relative_to(root).as_posix() for p in code_like]
+
     counts: dict[str, int] = {}
-    for rel in (idx.code_files + idx.test_files):
+    for rel in rels:
         lang = _LANG_BY_EXT.get(Path(rel).suffix.lower())
         if lang:
             counts[lang] = counts.get(lang, 0) + 1

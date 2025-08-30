@@ -17,7 +17,9 @@ documents generated up-front** and strict full‑file review semantics:
             - BUILD GUIDE
             - SDS (Software Design Specifications)
             - PROJECT CODE FILES & INSTRUCTIONS
-          These are saved under .gpt-review/blueprints/*.md and committed.
+          These are saved under the canonical directory
+          `.gpt-review/blueprints/*.md` and written via apply_patch.py
+          (which stages & commits each file).
 
   1) **Plan‑first** (before touching code):
         • Ask the model for an initial *review plan* (description + run/test
@@ -27,26 +29,26 @@ documents generated up-front** and strict full‑file review semantics:
   2) **Iteration 1** (branch "iteration1"):
         • For each *code‑like text* file, request a **COMPLETE file** replacement
           (or KEEP/DELETE). We **send full file contents** (no excerpts).
-        • **Commit after every file** to keep a readable history.
+        • **Commit after every file** is handled by `apply_patch.py`.
         • After all files, ask the model for **new source files**; create them
-          one‑by‑one (full content); **commit each**.
+          one‑by‑one (full content). Each write is committed by `apply_patch.py`.
 
   3) **Iteration 2** (branch "iteration2"):
         • Repeat file‑wise review over *code‑like* files, including newly created.
-        • Ask again for additional **new source files** and create them **one by one**.
+        • Ask again for additional **new source files** and create them one by one.
 
   4) **Iteration 3** (branch "iteration3"):
         • Consistency pass over **all files** (code + deferred).
         • Generate final **plan artifacts**:
             - machine‑readable: `.gpt-review/review_plan.json`
             - human guide     : `REVIEW_GUIDE.md`
-          (both are committed).
-        • Review/generate **deferred** files now (docs/setup/examples) — commit each.
+          (both are written and committed by `apply_patch.py`).
+        • Review/generate **deferred** files now (docs/setup/examples).
 
   5) **Error‑fix loop**:
         • Execute the plan’s commands (run/test). On failure, send logs to the
-          model and apply returned **COMPLETE file** fixes; **commit each**.
-        • Repeat until commands pass or max rounds reached.
+          model and apply returned **COMPLETE file** fixes. Each write is committed
+          by `apply_patch.py`. Repeat until commands pass or max rounds reached.
 
   6) **Push** the final branch and **create a Pull Request** (when possible).
 
@@ -56,7 +58,8 @@ Strictness
 • Docs/install/setup/examples are **deferred** until iteration 3 (except the
   blueprint documents generated up‑front for context).
 • All actions use repo‑root‑relative POSIX paths.
-• We commit **one file per change** to preserve a readable history.
+• We write via `apply_patch.py`, which performs **path‑scoped staging and commits**
+  (one file per change) with safety checks.
 
 CLI
 ---
@@ -94,7 +97,6 @@ from gpt_review.fs_utils import (
     language_census,
     read_text_normalized,
     summarize_repo,
-    git,  # precise, path-scoped commits
 )
 from gpt_review.blueprints_util import (  # central blueprint helpers
     ensure_blueprint_dir,
@@ -273,7 +275,7 @@ def tool_generate_blueprints() -> Dict[str, Any]:
     """
     Blueprint tool: request the four required documents in one response.
 
-    The orchestrator saves them under .gpt-review/blueprints/*.md and commits them.
+    The orchestrator saves them under .gpt-review/blueprints/*.md.
     """
     return {
         "type": "function",
@@ -315,6 +317,7 @@ def _apply_patch(repo: Path, patch: Dict[str, Any]) -> ApplyResult:
     Invoke apply_patch.py with the given patch dict via stdin.
 
     NOTE: apply_patch.py lives at the project **root**, not inside the package.
+    It performs path‑scoped staging **and commits** on success.
     """
     try:
         apply_tool = Path(__file__).resolve().parent.parent / "apply_patch.py"
@@ -332,19 +335,6 @@ def _apply_patch(repo: Path, patch: Dict[str, Any]) -> ApplyResult:
         )
     except Exception as exc:  # pragma: no cover
         return ApplyResult(ok=False, exit_code=1, stdout="", stderr=str(exc))
-
-
-def _commit(repo: Path, message: str, paths: Sequence[str]) -> None:
-    """Stage only *paths* and commit with *message* (path‑scoped)."""
-    if not paths:
-        return
-    try:
-        git(repo, "add", "--", *paths, check=True)
-        git(repo, "commit", "-m", message, check=True)
-        log.info("Committed %s", ", ".join(paths))
-    except Exception as exc:
-        log.exception("Git commit failed: %s", exc)
-        raise
 
 
 def _run_cmd(cmd: str, cwd: Path, timeout: int) -> Tuple[bool, str, int]:
@@ -610,7 +600,7 @@ def _apply_full_file(repo: Path, rel_path: str, action: str, content: Optional[s
     action ∈ {"create","update","keep","delete"}
 
     Side effect:
-      • Commits on success (one file per change), except for keep.
+      • Writes and commits are performed by `apply_patch.py`. For 'keep' we no‑op.
     """
     if action == "keep":
         log.debug("No‑op KEEP for %s", rel_path)
@@ -632,13 +622,8 @@ def _apply_full_file(repo: Path, rel_path: str, action: str, content: Optional[s
             "apply_patch failed for %s (%s): rc=%s\nstdout:\n%s\nstderr:\n%s",
             rel_path, action, res.exit_code, res.stdout, res.stderr,
         )
-        return res
-
-    log.info("Applied: %-6s %s", action, rel_path)
-    try:
-        _commit(repo, f"orchestrator: {action} {rel_path}", [rel_path])
-    except Exception:
-        pass
+    else:
+        log.info("Applied: %-6s %s", action, rel_path)
     return res
 
 
@@ -655,7 +640,7 @@ def _review_files_in_bucket(
     blueprints_summary: str,
 ) -> None:
     """
-    Review each file in *files*; apply changes via `apply_patch.py` and commit them.
+    Review each file in *files*; apply changes via `apply_patch.py`.
     """
     repo_summary = summarize_repo(repo)
     census = language_census(files)
@@ -867,7 +852,8 @@ def _generate_blueprints(
     instructions: str,
 ) -> None:
     """
-    Generate the four blueprint docs if missing, commit them, and log paths.
+    Generate the four blueprint docs if missing, and log paths.
+    Each created file is written & committed by apply_patch.py.
     """
     ensure_blueprint_dir(repo)
     if blueprints_exist(repo):
@@ -923,18 +909,32 @@ def _generate_blueprints(
         "project_instructions": normalize_markdown(args.get("project_instructions") or ""),
     }
 
-    paths = blueprint_paths(repo)
-    to_commit: List[str] = []
-    for key, content in docs.items():
-        path = paths[key]
-        patch = {"op": "create", "file": path.as_posix(), "body": content, "status": "in_progress"}
+    paths = blueprint_paths(repo)  # absolute Paths from blueprints_util
+    repo_root = repo.expanduser().resolve()
+    created: List[str] = []
+
+    # Create **only missing** documents; leave existing ones untouched.
+    for key, path in paths.items():
+        try:
+            rel_posix = path.relative_to(repo_root).as_posix()
+        except Exception:
+            rel_posix = path.as_posix()
+
+        if path.exists():
+            log.info("Blueprint already exists; keeping as is: %s", rel_posix)
+            continue
+
+        content = docs.get(key, "")
+        patch = {"op": "create", "file": rel_posix, "body": content, "status": "in_progress"}
         res = _apply_patch(repo, patch)
         if not res.ok:
             raise RuntimeError(f"Failed to create blueprint {key}: {res.stderr or res.stdout}")
-        to_commit.append(path.as_posix())
+        created.append(rel_posix)
 
-    _commit(repo, "orchestrator: add initial blueprints", to_commit)
-    log.info("Blueprint documents created: %s", ", ".join(to_commit))
+    if created:
+        log.info("Blueprint documents created: %s", ", ".join(created))
+    else:
+        log.info("No blueprint documents were created (unexpected — none missing?).")
 
 
 def _deferred_bucket(repo: Path) -> List[Path]:

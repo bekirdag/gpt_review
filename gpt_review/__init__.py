@@ -18,24 +18,54 @@ Side‑effects
 
 Notes
 -----
-This module imports the **packaged** logger implementation directly to avoid any
-duplication. A thin top‑level `logger.py` shim exists for backward compatibility
-with legacy imports (`from logger import get_logger`), and simply delegates to
-`gpt_review.logger`.
+This module prefers the **packaged** logger implementation. If that import
+fails for any reason (broken install, partial environment), it falls back to
+a minimal console logger so that importing `gpt_review` never crashes.
 """
 from __future__ import annotations
 
 import logging
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
-
-# Initialise the project‑wide logging configuration early.
-# The underlying implementation is idempotent and will not duplicate handlers.
-from gpt_review.logger import get_logger as _configure_logger  # packaged logger
+from typing import Optional
 
 # -----------------------------------------------------------------------------
-# Logging – initialise root logger once
+# Logger bootstrap (prefer packaged implementation; else safe fallback)
 # -----------------------------------------------------------------------------
-_ROOT_LOGGER = _configure_logger()  # sets up "gpt_review" logger
+try:
+    # Primary: packaged implementation (expected in normal installs)
+    from gpt_review.logger import get_logger as _delegate_get_logger  # type: ignore
+except Exception:  # pragma: no cover
+    _delegate_get_logger = None  # type: ignore[assignment]
+
+def _fallback_get_logger(name: Optional[str] = None) -> logging.Logger:
+    """
+    Minimal, idempotent console logger used only if the packaged
+    implementation cannot be imported for some reason.
+    """
+    root_name = "gpt_review"
+    root = logging.getLogger(root_name)
+    if not root.handlers:
+        root.setLevel(logging.DEBUG)
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        fmt = logging.Formatter(
+            fmt="%(asctime)s | %(name)s | %(process)d | %(levelname)-8s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        ch.setFormatter(fmt)
+        root.addHandler(ch)
+        root.propagate = False
+        root.debug("Fallback logger initialised in gpt_review/__init__.py.")
+    if name is None or name == root_name:
+        return root
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = True
+    return logger
+
+# Choose the effective accessor and initialise the root once
+_effective_get_logger = _delegate_get_logger or _fallback_get_logger
+_ROOT_LOGGER = _effective_get_logger(None)  # configure "gpt_review" root
 _ROOT_LOGGER.debug("Logger initialised in %s", __name__)
 
 # -----------------------------------------------------------------------------
@@ -51,14 +81,12 @@ except PackageNotFoundError:
         "Package metadata not found – using fallback version %s", __version__
     )
 
-
 def get_version() -> str:
     """Return the package version string."""
     return __version__
 
-
 # -----------------------------------------------------------------------------
-# Logger accessor (re‑export)
+# Logger accessor (public re‑export)
 # -----------------------------------------------------------------------------
 def get_logger(name: str | None = None) -> logging.Logger:
     """
@@ -70,10 +98,6 @@ def get_logger(name: str | None = None) -> logging.Logger:
         • Explicit module logger name (e.g., __name__) or None for the root
           project logger "gpt_review".
     """
-    # Reuse the same configuration function; it avoids duplicate handlers.
-    from gpt_review.logger import get_logger as _get  # local import to prevent cycles
-
-    return _get(name)
-
+    return _effective_get_logger(name)
 
 __all__ = ["__version__", "get_version", "get_logger"]

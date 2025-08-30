@@ -27,8 +27,8 @@ Design choices
 --------------
 • Output contract is crystal‑clear: **one tool call** to `submit_patch`
   with a **complete file body**. No partial diffs, no prose.
-• For discovery steps (e.g., "list the new files"), we return a plain JSON
-  array (not a tool call). The orchestrator will parse that and then drive
+• For discovery steps (e.g., “list the new files”), we ask for a raw **JSON
+  array** (not a tool call). The orchestrator will parse that and then drive
   per‑file creation via `submit_patch`.
 • We keep prompts compact but unambiguous; the orchestrator adds repo/file
   content and enforces tool_choice=submit_patch at the API layer.
@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import textwrap
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Optional, Sequence
 
 from gpt_review import get_logger
 
@@ -63,15 +63,15 @@ def get_submit_patch_tool() -> dict:
     """
     Return the OpenAI tool/function schema for `submit_patch`.
 
-    We reuse the same contract as the API driver. If importing the internal
-    function fails (e.g., during refactors), we fall back to a local copy to
-    avoid tight coupling.
+    We reuse the canonical definition shipped with the OpenAI client wrapper.
+    If importing that function fails (e.g., during refactors), we fall back to
+    a local copy to avoid tight coupling.
     """
     try:
-        # Prefer the canonical definition shipped with the API driver.
-        from gpt_review.api_driver import _submit_patch_tool as _tool  # type: ignore
+        # Prefer the canonical definition shipped with the API client.
+        from gpt_review.api_client import _submit_patch_tool as _tool  # type: ignore
         tool = _tool()
-        log.debug("Loaded submit_patch tool schema from api_driver.")
+        log.debug("Loaded submit_patch tool schema from api_client.")
         return tool
     except Exception:
         log.debug("Falling back to local submit_patch tool schema.")
@@ -81,8 +81,9 @@ def get_submit_patch_tool() -> dict:
                 "name": "submit_patch",
                 "description": (
                     "Create, update, delete, rename or chmod exactly one file in the repository. "
+                    "For create/update you MUST return a **COMPLETE FILE** in `body` (or `body_b64` for binary) — never a diff. "
                     "Return one patch at a time and set status to 'in_progress' until the last patch, "
-                    "then 'completed'."
+                    "then 'completed'. Use **repo‑relative POSIX paths** in `file` (and `target` for rename)."
                 ),
                 "parameters": {
                     "type": "object",
@@ -119,6 +120,7 @@ PATCH_OUTPUT_RULES = (
     "Output contract:\n"
     "• Respond ONLY by calling the tool `submit_patch`.\n"
     "• Provide a **complete file** in `body` (or `body_b64` for binary) — not a diff.\n"
+    "• One patch == one file; do not bundle multiple edits.\n"
     "• Use the **exact relative path** I provide in `file`.\n"
     "• Use `status=\"in_progress\"` until the very last patch of the whole review, "
     "  then `status=\"completed\"`.\n"
@@ -230,7 +232,7 @@ def build_system_prompt(
         - Keep changes minimal and targeted per file.
         - Maintain behavior; modernize APIs where appropriate.
         - Respect exact relative paths I provide.
-        - {PATCH_OUTPUT_RULES}
+        {PATCH_OUTPUT_RULES}
         """
     ).strip()
 
@@ -419,7 +421,7 @@ def build_error_diagnosis_prompt(
     Ask the assistant to identify impacted files based on a failing run.
 
     Expected response: a **raw JSON array** of objects:
-      { "file": "relative/path", "reason": "why this file is implicated", "order": 1 }
+      { "path": "relative/path", "reason": "why this file is implicated", "order": 1 }
 
     The orchestrator will then ask for fixes **one file at a time** via submit_patch.
     """
@@ -438,9 +440,9 @@ def build_error_diagnosis_prompt(
 
         Identify which files must change to fix these errors and return a **raw JSON array**
         (no prose) with items of shape:
-        {{"file": "relative/path", "reason": "short explanation", "order": 1}}
+        {{"path": "relative/path", "reason": "short explanation", "order": 1}}
 
-        Only include files you are confident need changes. Do not include generated artefacts.
+        Only include files you are confident need changes. Do not include generated artifacts.
         """
     ).strip()
     log.debug("Error diagnosis prompt built (%d chars).", len(msg))
@@ -740,7 +742,7 @@ def build_error_fix_list_prompt(
 
         Rules:
         - Include only files you are confident must change.
-        - Exclude generated artefacts and build outputs.
+        - Exclude generated artifacts and build outputs.
         - Paths MUST be repo‑relative POSIX.
 
         Context:

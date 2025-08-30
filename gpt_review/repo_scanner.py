@@ -63,17 +63,18 @@ _IGNORE_DIRS: Set[str] = {
     ".git", ".hg", ".svn",
     "__pycache__", ".mypy_cache", ".ruff_cache", ".pytest_cache",
     "node_modules", "dist", "build", "target", ".tox", "htmlcov",
-    ".idea", ".vscode", ".DS_Store", ".cache", "logs", "docker-build",
-    "venv", ".venv", "env", ".env",
+    ".idea", ".vscode", ".cache", "logs", "docker-build",
+    "venv", ".venv", "env",
 }
 
-# File globs to ignore (heavy artefacts, coverage, local state, etc.)
+# File globs to ignore (heavy artifacts, coverage, local state, etc.)
 _IGNORE_FILE_GLOBS: Set[str] = {
     "*.pyc", "*.pyo", "*.pyd", "*.so", "*.dylib",
     "*.exe", "*.dll", "*.obj", "*.a", "*.o",
     "*.class", "*.jar",
     "*.log", "*.tmp", "*.swp", "*.swo", "*~",
     ".coverage", "coverage.xml",
+    ".DS_Store", "Thumbs.db",
 }
 
 # Docs / prose
@@ -82,16 +83,25 @@ _DOC_BASENAMES: Set[str] = {
     "README", "CHANGELOG", "CONTRIBUTING", "LICENSE", "SECURITY",
     "CODE_OF_CONDUCT", "CODE-OF-CONDUCT",
 }
-_DOC_DIR_HINTS: Set[str] = {"docs", "doc"}  # include both common spellings
+# Common doc trees (aligned with fs_utils; include blueprint dir)
+_DOC_DIR_HINTS: Set[str] = {
+    "docs", "doc", "documentation", "guides", "mkdocs", "site", "book", ".gpt-review"
+}
 
 # Setup / install / CI
 _SETUP_BASENAMES: Set[str] = {
-    "setup.py", "pyproject.toml", "requirements.txt", "Pipfile",
-    "Pipfile.lock", "poetry.lock", "Makefile", "Dockerfile",
-    "docker-compose.yml", "docker-compose.yaml",
+    "setup.py", "pyproject.toml", "requirements.txt", "requirements-dev.txt",
+    "dev-requirements.txt", "Pipfile", "Pipfile.lock", "poetry.lock",
+    "Makefile", "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
     "install.sh", "update.sh", "software_review.sh", "cookie_login.sh",
     ".pre-commit-config.yaml", ".pre-commit-config.yml",
+    "MANIFEST.in", ".flake8", ".editorconfig",
+    "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    ".gitlab-ci.yml", "azure-pipelines.yml",
 }
+# Globs for families of setup files (kept small & explicit)
+_SETUP_FILE_GLOBS: Set[str] = {"requirements*.txt"}
+
 _SETUP_DIR_HINTS: Set[str] = {".github/workflows", ".github/actions", "ci", ".ci"}
 
 # Example assets & prompts
@@ -100,7 +110,12 @@ _EXAMPLE_BASENAMES: Set[str] = {"example_instructions.txt"}
 
 # Tests
 _TEST_DIR_HINTS: Set[str] = {"tests", "test", "spec", "specs"}
-_TEST_FILE_PATTERNS: Set[str] = {"test_*.py", "*_test.py", "*.spec.js", "*.spec.ts"}
+_TEST_FILE_PATTERNS: Set[str] = {
+    "test_*.py", "*_test.py",
+    "*.spec.js", "*.spec.ts",
+    "*_test.go", "*_test.rs", "*_test.rb", "*_test.ts", "*_test.js",
+    "*_spec.rb",
+}
 
 # File types likely textual code/config (still validated via binary sniff)
 _TEXT_CODE_EXTS: Set[str] = {
@@ -200,7 +215,7 @@ class RepoScanner:
                 idx.example_files.append(rel)
             elif cat == "test":
                 idx.test_files.append(rel)
-                # Test files are also code for our purposes
+                # Treat tests as code for iteration grouping (dedup later).
                 if not is_bin:
                     idx.code_files.append(rel)
             elif cat == "code":
@@ -224,37 +239,42 @@ class RepoScanner:
         • Iterations 1 & 2: **code + tests** only
         • Iteration 3     : code + tests + **docs + setup + examples**
 
-        Parameters
-        ----------
-        iteration : int
-            1‑based iteration number.
-
-        Returns
-        -------
-        list[str]
-            POSIX‑relative file paths in deterministic order.
+        Binary files are **always excluded** from these iteration lists.
         """
         if not hasattr(self, "_cached_index"):
             self._cached_index = self.scan()  # type: ignore[attr-defined]
 
         idx: RepoIndex = self._cached_index  # type: ignore[assignment]
+        bset = set(idx.binary_files)
+
+        def _stable_unique(seq: List[str]) -> List[str]:
+            seen: set[str] = set()
+            out: List[str] = []
+            for s in seq:
+                if s in bset:
+                    continue  # drop binaries from iteration lists
+                if s not in seen:
+                    out.append(s)
+                    seen.add(s)
+            return out
 
         if iteration >= 3:
             combined = (
-                sorted(set(idx.code_files))
-                + sorted(set(idx.test_files))
-                + sorted(set(idx.docs_files))
-                + sorted(set(idx.setup_files))
-                + sorted(set(idx.example_files))
+                idx.code_files + idx.test_files + idx.docs_files + idx.setup_files + idx.example_files
             )
-            ordered = self._stable_unique(combined)
-            log.info("Iteration %d → %d files (incl. docs/setup/examples).", iteration, len(ordered))
+            ordered = _stable_unique(combined)
+            log.info(
+                "Iteration %d → %d files (incl. docs/setup/examples; binaries excluded).",
+                iteration, len(ordered)
+            )
             return ordered
 
-        # Iteration 1 or 2: code + tests only
-        combined = sorted(set(idx.code_files)) + sorted(set(idx.test_files))
-        ordered = self._stable_unique(combined)
-        log.info("Iteration %d → %d files (code + tests).", iteration, len(ordered))
+        combined = idx.code_files + idx.test_files
+        ordered = _stable_unique(combined)
+        log.info(
+            "Iteration %d → %d files (code + tests; binaries excluded).",
+            iteration, len(ordered)
+        )
         return ordered
 
     # ------------------------ classification logic -------------------------- #
@@ -262,48 +282,51 @@ class RepoScanner:
         """
         Classify a file path into broad categories: code, test, doc, setup, example.
 
-        The decision uses directory hints, basenames, and extensions.
+        Precedence notes
+        ----------------
+        • Explicit example/test/setup basenames/dirs win over generic doc-by-extension
+          (so e.g. 'example_instructions.txt' is classified as example, not doc).
         """
         posix = rel  # already posix
 
-        # Directory hints
+        # Directory + basename features
         parts = posix.split("/")
         dirs = parts[:-1]
         base = parts[-1]
         stem, ext = os.path.splitext(base)
         ext = ext.lower()
+        low_dirs = [d.lower() for d in dirs]
 
-        # Docs
-        if ext in _DOC_EXTS:
-            return "doc"
-        if stem.upper() in _DOC_BASENAMES:
-            return "doc"
-        if any(d.lower() in _DOC_DIR_HINTS for d in dirs):
-            # Treat files inside docs/doc as docs unless they are clear code (e.g., .py)
-            if ext not in _TEXT_CODE_EXTS:
-                return "doc"
-
-        # Setup
-        if base in _SETUP_BASENAMES:
+        # --- Setup / CI (basenames, small glob family, and directory hints) ---
+        if base in _SETUP_BASENAMES or any(fnmatch.fnmatch(base, pat) for pat in _SETUP_FILE_GLOBS):
             return "setup"
         for hint in _SETUP_DIR_HINTS:
             if posix.startswith(hint + "/") or f"/{hint}/" in posix:
                 return "setup"
 
-        # Examples
-        if base in _EXAMPLE_BASENAMES:
-            return "example"
-        low_dirs = [d.lower() for d in dirs]
-        if any(h in low_dirs for h in _EXAMPLE_HINTS):
-            return "example"
-
-        # Tests
+        # --- Tests (dir hints or filename patterns) ---
         if any(h in low_dirs for h in _TEST_DIR_HINTS):
             return "test"
         if any(fnmatch.fnmatch(base, pat) for pat in _TEST_FILE_PATTERNS):
             return "test"
 
-        # Code (by extension)
+        # --- Examples (explicit basenames or directory hints) ---
+        if base in _EXAMPLE_BASENAMES:
+            return "example"
+        if any(h in low_dirs for h in _EXAMPLE_HINTS):
+            return "example"
+
+        # --- Docs (extensions, basenames, doc directory hints) ---
+        if ext in _DOC_EXTS:
+            return "doc"
+        if stem.upper() in _DOC_BASENAMES:
+            return "doc"
+        if any(d.lower() in _DOC_DIR_HINTS for d in dirs):
+            # Treat files inside docs/doc trees as docs unless they are clear code (e.g., .py)
+            if ext not in _TEXT_CODE_EXTS:
+                return "doc"
+
+        # --- Code (by extension) ---
         if ext in _TEXT_CODE_EXTS:
             return "code"
 
@@ -324,10 +347,7 @@ class RepoScanner:
                 rel_parts = ()
 
             # Prune ignored directories in-place (prevents descent)
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in _IGNORE_DIRS and d != ".git"
-            ]
+            dirnames[:] = [d for d in dirnames if d not in _IGNORE_DIRS and d != ".git"]
             # If current path is already inside an ignored dir, skip entirely
             if any(part in _IGNORE_DIRS for part in rel_parts) or ".git" in rel_parts:
                 continue
@@ -346,18 +366,6 @@ class RepoScanner:
 
     def _relposix(self, p: Path) -> str:
         return p.relative_to(self.root).as_posix()
-
-    def _stable_unique(self, items: List[str]) -> List[str]:
-        """
-        Preserve first occurrence order while removing duplicates.
-        """
-        seen: set[str] = set()
-        out: List[str] = []
-        for it in items:
-            if it not in seen:
-                out.append(it)
-                seen.add(it)
-        return out
 
     def _seems_binary(self, path: Path) -> bool:
         """

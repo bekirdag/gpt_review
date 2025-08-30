@@ -157,7 +157,12 @@ _SETUP_BASENAMES = {
     ".pre-commit-config.yaml", ".pre-commit-config.yml",
     "install.sh", "update.sh", "software_review.sh", "cookie_login.sh",
 }
-_DEFER_DIR_HINTS = {"docs", "doc", "examples", "example", ".github/workflows", ".github/actions", "ci", ".ci"}
+# Include both single‑segment directory hints (e.g., "docs") and composite
+# subpaths (e.g., ".github/workflows") which require substring checks.
+_DEFER_DIR_HINTS = {
+    "docs", "doc", "examples", "example", "ci", ".ci",
+    ".github/workflows", ".github/actions",
+}
 
 
 def _path_deferred_before_iter3(rel: str) -> bool:
@@ -165,12 +170,28 @@ def _path_deferred_before_iter3(rel: str) -> bool:
     True if *rel* looks like docs/setup/examples/CI that we defer until iteration 3.
     """
     p = PurePosixPath(rel)
+    # Extension-based docs
     if p.suffix.lower() in _DOC_EXTS:
         return True
+    # Specific setup/install basenames
     if p.name in _SETUP_BASENAMES:
         return True
+
+    # Directory hints
     parts = [seg.lower() for seg in p.parts[:-1]]
-    return any(h in parts for h in _DEFER_DIR_HINTS)
+    posix_lower = p.as_posix().lower()
+
+    # Single‑segment directory names
+    for hint in (h for h in _DEFER_DIR_HINTS if "/" not in h):
+        if hint in parts:
+            return True
+
+    # Composite subpaths (contain '/'): match by substring/prefix within the path
+    for hint in (h for h in _DEFER_DIR_HINTS if "/" in h):
+        if posix_lower.startswith(hint + "/") or f"/{hint}/" in posix_lower:
+            return True
+
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -180,9 +201,11 @@ def _is_safe_repo_rel_posix(path: str) -> bool:
     """
     Defensive path guard:
       - POSIX separators only; not absolute; no backslashes; no '..'
-      - not under '.git/' and not '.git' itself; no empty segments
+      - not under '.git/' and not '.git' itself; no empty segments; not '.'
     """
     if not isinstance(path, str) or not path.strip():
+        return False
+    if path in {".", "./"} or path.endswith("/"):
         return False
     if "\\" in path or path.startswith("/"):
         return False
@@ -394,6 +417,11 @@ def review_file_with_api(
     """
     client = _ensure_client(client)
 
+    # Path sanity (fail closed early)
+    if not _is_safe_repo_rel_posix(path):
+        log.warning("Unsafe or invalid review path %r; forcing keep.", path)
+        return FullFileDecision(path=path, action="keep", reason="invalid path")
+
     language_hint = _language_hint_for_path(path)
 
     # Decide textual vs binary based on flag + decoding capability
@@ -506,6 +534,21 @@ def review_file_with_api(
         log.info("Deferring docs/setup/examples/CI change for %s until iteration 3 → keep.", out.path)
         out.action = "keep"
         out.reason = (out.reason or "") + " (deferred until iter 3)"
+
+    # Reconcile create/update choice with on‑disk existence to avoid apply errors
+    exists = (Path(repo) / out.path).exists()
+    if exists and out.action in {"create", "create_binary"}:
+        mapped = "update" if out.action == "create" else "update_binary"
+        log.info("Mapping %s → %s for existing file %s.", out.action, mapped, out.path)
+        out.action = mapped
+    if (not exists) and out.action in {"update", "update_binary"}:
+        mapped = "create" if out.action == "update" else "create_binary"
+        log.info("Mapping %s → %s for missing file %s.", out.action, mapped, out.path)
+        out.action = mapped
+    if (not exists) and out.action == "delete":
+        log.info("Requested delete for non‑existent file %s → keep.", out.path)
+        out.action = "keep"
+        out.reason = (out.reason or "") + " (no such file)"
 
     log.info("Decision for %s → %s%s", out.path, out.action, f"  · {out.reason}" if out.reason else "")
     return out

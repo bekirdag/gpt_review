@@ -25,29 +25,30 @@ Notes
 * **No Git side-effects** in this module: it does not stage/commit changes.
   The orchestrator (or API driver) remains responsible for writing via the
   patch pipeline and for committing one file per change.
-* All paths are **repo-root relative** POSIX style for consistency.
+* Callers often need **repo-root-relative POSIX paths** for patch operations.
+  Use `blueprint_paths_posix(repo)` or `to_posix_paths(..., repo=repo)` for that.
 
 Usage
 -----
     from pathlib import Path
     from gpt_review.blueprints_util import (
-        BLUEPRINT_KEYS, blueprint_paths, blueprints_exist, missing_blueprints,
-        summarize_blueprints, ensure_blueprint_dir,
+        BLUEPRINT_KEYS, BLUEPRINT_LABELS, blueprint_paths, blueprint_paths_posix,
+        blueprints_exist, missing_blueprints, summarize_blueprints, ensure_blueprint_dir,
+        normalize_markdown
     )
 
     repo = Path("/path/to/repo")
     ensure_blueprint_dir(repo)
     if not blueprints_exist(repo):
-        # Call your model to generate docs, then write them via apply_patch.
+        # Generate docs via the model, then write them via apply_patch (repo-relative paths).
         pass
 
     summary = summarize_blueprints(repo, max_chars_per_doc=1500)
-
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 from gpt_review import get_logger
 
@@ -81,6 +82,8 @@ BLUEPRINT_FILENAMES: Mapping[str, str] = {
     "project_instructions": "PROJECT_INSTRUCTIONS.md",
 }
 
+# Repo-relative directory (POSIX) where blueprint documents live.
+BLUEPRINT_DIR_REL: str = ".gpt-review/blueprints"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Path helpers
@@ -89,34 +92,56 @@ def blueprint_dir(repo: Path) -> Path:
     """
     Return the directory where blueprint documents live:
         <repo>/.gpt-review/blueprints
+
+    Returns an absolute Path. Creation is handled by `ensure_blueprint_dir`.
     """
-    return (repo / ".gpt-review" / "blueprints").resolve()
+    return (repo / BLUEPRINT_DIR_REL).resolve()
 
 
 def ensure_blueprint_dir(repo: Path) -> Path:
     """
-    Ensure the blueprint directory exists (idempotent). Returns the path.
+    Ensure the blueprint directory exists (idempotent). Returns the absolute path.
     """
     bp = blueprint_dir(repo)
     bp.mkdir(parents=True, exist_ok=True)
+    log.debug("Ensured blueprint directory exists: %s", bp)
     return bp
 
 
 def blueprint_paths(repo: Path) -> Dict[str, Path]:
     """
     Return a mapping {key → absolute Path} for all blueprint documents.
+
+    This is useful when reading content for summaries. For patch operations,
+    prefer `blueprint_paths_posix(repo)` which returns repo-root-relative POSIX strings.
     """
     base = blueprint_dir(repo)
     return {k: (base / BLUEPRINT_FILENAMES[k]).resolve() for k in BLUEPRINT_KEYS}
 
 
+def blueprint_paths_posix(repo: Path) -> Dict[str, str]:
+    """
+    Return a mapping {key → 'relative/posix/path'} for all blueprint documents.
+
+    The returned paths are **repo-root-relative** and safe to pass to the patch applier.
+    """
+    abs_map = blueprint_paths(repo)
+    return to_posix_paths(abs_map, repo=repo)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Existence checks
+# ─────────────────────────────────────────────────────────────────────────────
 def blueprints_exist(repo: Path) -> bool:
     """
     True iff **all** blueprint documents exist on disk.
     """
     paths = blueprint_paths(repo)
     exist = all(p.exists() for p in paths.values())
-    log.debug("Blueprints exist=%s (%s)", exist, ", ".join(f"{k}={p.exists()}" for k, p in paths.items()))
+    log.debug(
+        "Blueprints exist=%s (%s)",
+        exist,
+        ", ".join(f"{k}={paths[k].exists()}" for k in BLUEPRINT_KEYS),
+    )
     return exist
 
 
@@ -131,7 +156,6 @@ def missing_blueprints(repo: Path) -> List[str]:
     else:
         log.debug("No missing blueprint documents detected.")
     return missing
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Text helpers
@@ -157,7 +181,6 @@ def normalize_markdown(text: str) -> str:
     """
     t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     return t if t.endswith("\n") else t + "\n"
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Prompt-friendly summary
@@ -202,33 +225,35 @@ def summarize_blueprints(repo: Path, *, max_chars_per_doc: int = 1500) -> str:
     log.debug("Prepared blueprints summary (%d chars).", len(summary))
     return summary
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Utility helpers for external callers
 # ─────────────────────────────────────────────────────────────────────────────
-def to_posix_paths(paths: Mapping[str, Path]) -> Dict[str, str]:
+def to_posix_paths(paths: Mapping[str, Path], *, repo: Optional[Path] = None) -> Dict[str, str]:
     """
-    Convert {key → Path} into {key → 'posix/relative/path'} for tool payloads.
+    Convert {key → Path} into {key → 'posix/relative/path'}.
 
-    The returned paths are **relative to the repo root** and use forward slashes.
+    If *repo* is provided, paths are made **relative to the repo root** and
+    guaranteed to use forward slashes; otherwise a best-effort fallback is used.
+
+    NOTE: Prefer passing *repo* so patch operations always receive repo-root-relative paths.
     """
     result: Dict[str, str] = {}
     for key, p in paths.items():
         try:
-            # Attempt to make the path repo‑relative by trimming up to '.gpt-review'.
-            # Callers usually need the *relative* POSIX path for patch operations.
-            rel = p
-            # Find the repo root by walking up until we see '.git' or root.
-            cur = p
-            root = None
-            while cur != cur.parent:
-                if (cur / ".git").exists():
-                    root = cur
-                    break
-                cur = cur.parent
-            if root:
-                rel = p.relative_to(root)
-            result[key] = rel.as_posix()
+            if repo is not None:
+                rel = p.resolve().relative_to(repo.resolve())
+                result[key] = rel.as_posix()
+            else:
+                # Fallback: walk up to find the repo root (dir that contains a .git marker)
+                cur = p.resolve()
+                root = None
+                while cur != cur.parent:
+                    if (cur / ".git").exists():
+                        root = cur
+                        break
+                    cur = cur.parent
+                rel = p.resolve().relative_to(root) if root else p
+                result[key] = rel.as_posix()
         except Exception:
             # Fall back to a POSIX string; better than raising in helpers.
             result[key] = p.as_posix()
@@ -252,3 +277,21 @@ def validate_docs_payload(docs: Mapping[str, str]) -> List[str]:
     if unexpected:
         problems.append(f"unexpected keys: {', '.join(sorted(unexpected))}")
     return problems
+
+
+__all__ = [
+    "BLUEPRINT_KEYS",
+    "BLUEPRINT_LABELS",
+    "BLUEPRINT_FILENAMES",
+    "BLUEPRINT_DIR_REL",
+    "blueprint_dir",
+    "ensure_blueprint_dir",
+    "blueprint_paths",
+    "blueprint_paths_posix",
+    "blueprints_exist",
+    "missing_blueprints",
+    "normalize_markdown",
+    "summarize_blueprints",
+    "to_posix_paths",
+    "validate_docs_payload",
+]

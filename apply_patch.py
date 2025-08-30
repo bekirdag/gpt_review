@@ -25,6 +25,7 @@ Operations
 
 Safety & Guarantees
 -------------------
+* **POSIX repo‑relative paths only**: rejects backslashes, drive‑letter or absolute paths.
 * **No traversal**: rejects any path escaping repo root (../ or symlink tricks).
 * **.git guard**: refuses any operation inside `.git/`.
 * **Local changes**: refuses destructive ops if the file differs from HEAD.
@@ -59,6 +60,7 @@ from patch_validator import validate_patch  # schema validator (raises on error)
 # Constants & logger
 # ─────────────────────────────────────────────────────────────────────────────
 SAFE_MODES = {"644", "755"}  # normalized 3‑digit whitelist
+_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 log = get_logger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -79,7 +81,12 @@ def _git(repo: Path, *args: str, capture: bool = False, check: bool = True) -> s
 
 def _git_ok(repo: Path, *args: str) -> bool:
     """Return True if the git command exits with code 0 (never raises)."""
-    return subprocess.run(["git", "-C", str(repo), *args], text=True).returncode == 0
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        text=True,
+        capture_output=True,   # avoid noisy stderr on failures
+        check=False,
+    ).returncode == 0
 
 
 def _has_local_changes(repo: Path, rel_path: str) -> bool:
@@ -152,6 +159,26 @@ def _is_under_dot_git(rel: str) -> bool:
     return bool(s) and (s == ".git" or s.startswith(".git/") or "/.git/" in s or s.endswith("/.git"))
 
 
+def _normalize_rel_input(rel: str, *, field_name: str) -> str:
+    """
+    Enforce POSIX repo‑relative paths:
+      • reject empty, absolute, or drive‑letter paths
+      • reject backslashes
+      • normalize leading './'
+    """
+    if not isinstance(rel, str) or not rel.strip():
+        raise ValueError(f"Missing or empty {field_name!r}")
+    raw = rel.strip()
+    if "\\" in raw:
+        raise ValueError(f"{field_name} must use POSIX forward slashes, got backslash: {raw!r}")
+    if raw.startswith("/") or _DRIVE_RE.match(raw):
+        raise ValueError(f"{field_name} must be repository‑relative (not absolute): {raw!r}")
+    norm = raw.lstrip("./")
+    if not norm:
+        raise ValueError(f"{field_name} resolves to repository root, which is not a file path.")
+    return norm
+
+
 def _normalize_text(text: str) -> str:
     """Normalize text payloads to LF and ensure a trailing newline."""
     t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
@@ -177,7 +204,11 @@ def _same_contents_binary(p: Path, new_b64: str) -> bool:
     if not p.exists():
         return False
     try:
-        return p.read_bytes() == base64.b64decode(new_b64)
+        decoded = base64.b64decode(new_b64, validate=True)
+    except Exception:
+        return False
+    try:
+        return p.read_bytes() == decoded
     except Exception:
         return False
 
@@ -205,7 +236,10 @@ def _write_file(dest: Path, *, body: Optional[str], body_b64: Optional[str]) -> 
     prev_size = dest.stat().st_size if dest.exists() else 0
 
     if body_b64 is not None:
-        data = base64.b64decode(body_b64)
+        try:
+            data = base64.b64decode(body_b64, validate=True)
+        except Exception as exc:
+            raise ValueError("Invalid base64 payload in 'body_b64'.") from exc
         _atomic_write_bytes(dest, data)
         log.debug("Wrote binary file %s (%d bytes)", dest, len(data))
         return len(data), prev_size
@@ -255,9 +289,8 @@ def apply_patch(patch_json: str, repo_path: str) -> None:
     if not (repo / ".git").exists():
         raise FileNotFoundError(f"Not a git repo: {repo}")
 
-    rel: str = patch.get("file") or ""
-    if not rel:
-        raise ValueError("Missing 'file' path in patch payload")
+    # Validate and normalize primary path
+    rel: str = _normalize_rel_input(patch.get("file") or "", field_name="file")
     if _is_under_dot_git(rel):
         raise PermissionError("Refusing to operate inside .git/")
 
@@ -314,9 +347,8 @@ def apply_patch(patch_json: str, repo_path: str) -> None:
 
     # ---------------------------- rename -----------------------------------
     if op == "rename":
-        target_rel: str = patch.get("target") or ""
-        if not target_rel:
-            raise ValueError("rename requires 'target'")
+        target_rel_raw: str = patch.get("target") or ""
+        target_rel: str = _normalize_rel_input(target_rel_raw, field_name="target")
         if _is_under_dot_git(target_rel):
             raise PermissionError("Refusing to move a path into .git/")
 

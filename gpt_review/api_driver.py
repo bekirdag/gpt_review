@@ -12,23 +12,27 @@ automating a browser. The assistant returns patches via a **function call**
 named `submit_patch`. We validate and apply that patch locally, optionally run
 a shell command (tests/linter), and send the outcome back as the tool's result.
 
-New in this version
--------------------
-• **Blueprint preflight** (optional, enabled by default via env):
-  At the start of a run, ensure the four project blueprints exist under
-  `.gpt-review/blueprints/`:
-    1) WHITEPAPER_AND_ENGINEERING_BLUEPRINT.md
-    2) BUILD_GUIDE.md
-    3) SOFTWARE_DESIGN_SPECIFICATION_SDS.md
-    4) PROJECT_CODE_FILES_AND_INSTRUCTIONS.md
-  If missing, they are created **one file per tool call** (complete contents).
-  A compact **blueprints summary** is then injected into the initial prompts
-  so the assistant aligns all subsequent edits with the project’s requirements.
+What this driver guarantees
+---------------------------
+• **Full‑file outputs**: for create/update, the assistant MUST return a complete
+  file body (never a diff). We validate with the canonical JSON‑Schema.
 
-• **Full‑file guarantees**:
-  Strict tool schema, server‑side JSON validation (`patch_validator`) and
-  path hygiene are preserved. The driver only accepts **complete files** for
-  create/update and rejects prose‑only responses.
+• **Blueprint preflight** (optional, enabled by default via env):
+  At the start of a run, ensure the four project blueprints exist under the
+  canonical directory managed by `gpt_review.blueprints_util`:
+      .gpt-review/blueprints/WHITEPAPER.md
+      .gpt-review/blueprints/BUILD_GUIDE.md
+      .gpt-review/blueprints/SDS.md
+      .gpt-review/blueprints/PROJECT_INSTRUCTIONS.md
+  Missing docs are created **one file per tool call** (complete contents).
+  A compact **blueprints summary** is injected into the initial prompts so the
+  assistant aligns all subsequent edits with the project’s requirements.
+
+• **Strict tool schema + path hygiene**:
+  We accept exactly one file per patch and enforce **repository‑relative POSIX paths**
+  (no absolute paths, no backslashes, no '..', nothing under .git/, no Windows drive
+  letters). Unsafe patches are rejected with a structured tool result so the
+  assistant can correct them.
 
 Design notes
 ------------
@@ -69,7 +73,6 @@ GPT_REVIEW_LOG_TAIL_CHARS              – tail of logs to send (default: 20000)
 
 # Blueprint preflight & summarization
 GPT_REVIEW_INCLUDE_BLUEPRINTS          – "1" to enable (default: 1)
-GPT_REVIEW_BLUEPRINT_DIR               – dir for blueprints (default: .gpt-review/blueprints)
 GPT_REVIEW_BLUEPRINT_SUMMARY_MAX_BYTES – bytes cap for summary (default: 12000)
 """
 from __future__ import annotations
@@ -82,11 +85,21 @@ import sys
 import textwrap
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from gpt_review import get_logger
-from patch_validator import validate_patch
+from patch_validator import validate_patch, is_safe_repo_rel_posix
+
+# Canonical blueprint helpers (single source of truth for names/paths/summary)
+from gpt_review.blueprints_util import (
+    BLUEPRINT_KEYS,
+    BLUEPRINT_LABELS,
+    blueprint_paths,
+    ensure_blueprint_dir,
+    missing_blueprints,
+    summarize_blueprints,
+)
 
 log = get_logger(__name__)
 
@@ -102,17 +115,15 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")    # required at runtime if client 
 INCLUDE_BLUEPRINTS = os.getenv("GPT_REVIEW_INCLUDE_BLUEPRINTS", "1").strip().lower() in {
     "1", "true", "yes", "on", "y", "t"
 }
-BLUEPRINT_DIR = os.getenv("GPT_REVIEW_BLUEPRINT_DIR", ".gpt-review/blueprints")
 BLUEPRINT_SUMMARY_MAX_BYTES = int(os.getenv("GPT_REVIEW_BLUEPRINT_SUMMARY_MAX_BYTES", "12000"))
 
-# Canonical blueprint file specs (repo‑relative POSIX paths)
-_BLUEPRINT_SPECS: Tuple[Tuple[str, str], ...] = (
-    ("WHITEPAPER_AND_ENGINEERING_BLUEPRINT.md", "Whitepaper & Engineering Blueprint"),
-    ("BUILD_GUIDE.md", "Build Guide"),
-    ("SOFTWARE_DESIGN_SPECIFICATION_SDS.md", "Project Software Design Specification (SDS)"),
-    ("PROJECT_CODE_FILES_AND_INSTRUCTIONS.md", "Project Code Files and Instructions"),
-)
-
+# Human titles for the four blueprint docs (stable + descriptive)
+_BLUEPRINT_TITLES: Dict[str, str] = {
+    "whitepaper": "Whitepaper & Engineering Blueprint",
+    "build_guide": "Build Guide",
+    "sds": "Project Software Design Specifications (SDS)",
+    "project_instructions": "Project Code Files and Instructions",
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Utilities
@@ -167,21 +178,10 @@ def _tail(text: str, n_chars: int = LOG_TAIL_CHARS) -> str:
     return text[-n_chars:]
 
 
-def _is_safe_repo_rel_posix(path: str) -> bool:
-    """
-    Defensive path guard:
-      - POSIX separators only; not absolute; no backslashes; no '..'
-      - not under '.git/' and not '.git' itself; no empty segments
-    """
-    if not isinstance(path, str) or not path.strip():
-        return False
-    if "\\" in path or path.startswith("/"):
-        return False
-    if path == ".git" or path.startswith(".git/") or "/.git/" in path:
-        return False
-    if ".." in path.split("/"):
-        return False
-    return str(PurePosixPath(path)) == path
+def _snippet(s: str, limit: int = 240) -> str:
+    """Compact single‑line snippet for logs."""
+    one = (s or "").strip().replace("\n", " ")
+    return (one[:limit] + "…") if len(one) > limit else one
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -342,44 +342,23 @@ def _ensure_client(client: Any | None, api_timeout: int):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Blueprint helpers (preflight)
+# Blueprint helpers (preflight) — unified with blueprints_util
 # ─────────────────────────────────────────────────────────────────────────────
-def _blueprint_dir(repo: Path) -> Path:
-    return (repo / BLUEPRINT_DIR).expanduser().resolve()
-
-
-def _blueprint_rel_paths() -> List[str]:
-    base = PurePosixPath(BLUEPRINT_DIR)
-    return [str(base / name) for name, _ in _BLUEPRINT_SPECS]
-
-
-def _read_file_head(path: Path, max_bytes: int) -> str:
-    try:
-        data = path.read_bytes()
-    except Exception as exc:
-        return f"<<error reading {path.name}: {exc}>>"
-    data = data[:max_bytes]
-    txt = data.decode("utf-8", errors="replace")
-    # Normalize EOL for safety
-    return txt.replace("\r\n", "\n").replace("\r", "\n")
-
-
 def _blueprints_summary(repo: Path) -> Optional[str]:
     """
-    Return a compact, concatenated summary of existing blueprint docs.
+    Return a compact, concatenated summary of existing blueprint docs using the
+    canonical names/locations from `blueprints_util`. The size is bounded by
+    GPT_REVIEW_BLUEPRINT_SUMMARY_MAX_BYTES (roughly even split per doc).
     """
-    bdir = _blueprint_dir(repo)
-    parts: List[str] = []
-    for fname, title in _BLUEPRINT_SPECS:
-        p = bdir / fname
-        if p.exists() and p.is_file():
-            head = _read_file_head(p, BLUEPRINT_SUMMARY_MAX_BYTES // len(_BLUEPRINT_SPECS))
-            parts.append(f"# {title}\n{head}".strip())
-    if not parts:
+    # We use a per‑doc character cap; bytes vs chars is an approximation here,
+    # but good enough for prompt budgeting.
+    per_doc = max(512, BLUEPRINT_SUMMARY_MAX_BYTES // max(1, len(BLUEPRINT_KEYS)))
+    try:
+        summary = summarize_blueprints(repo, max_chars_per_doc=per_doc)
+        return summary or None
+    except Exception as exc:
+        log.warning("Failed to prepare blueprints summary: %s", exc)
         return None
-    summary = "\n\n---\n\n".join(parts)
-    log.debug("Blueprints summary prepared (%d chars).", len(summary))
-    return summary
 
 
 def _ensure_blueprints(
@@ -391,28 +370,40 @@ def _ensure_blueprints(
     user_instructions: str,
 ) -> None:
     """
-    Ensure the four blueprint documents exist under BLUEPRINT_DIR.
-    For each missing doc, request a **single** `submit_patch` create with full content.
+    Ensure the four blueprint documents exist under the canonical directory
+    managed by `blueprints_util`. For each missing doc, request a **single**
+    `submit_patch` create with full content.
     """
-    bdir = _blueprint_dir(repo)
-    bdir.mkdir(parents=True, exist_ok=True)
+    ensure_blueprint_dir(repo)
 
-    to_create: List[Tuple[str, str]] = []
-    for fname, title in _BLUEPRINT_SPECS:
-        p = bdir / fname
-        if not p.exists():
-            to_create.append((str(PurePosixPath(BLUEPRINT_DIR) / fname), title))
-
-    if not to_create:
+    missing = missing_blueprints(repo)
+    if not missing:
         log.info("Blueprint preflight: all documents exist.")
         return
 
-    log.info("Blueprint preflight: %d document(s) missing; creating…", len(to_create))
+    log.info("Blueprint preflight: %d document(s) missing; creating…", len(missing))
 
     tool = _submit_patch_tool()
     tool_name = tool["function"]["name"]
 
-    for rel_path, title in to_create:
+    # Resolve repo‑relative POSIX paths for the four docs
+    abs_paths = blueprint_paths(repo)  # {key: Path (absolute)}
+    # Convert to repo‑relative posix strings without guessing (apply_patch expects relative)
+    rel_paths: Dict[str, str] = {}
+    try:
+        # Compute repo root once
+        repo_root = repo.expanduser().resolve()
+        for k, p in abs_paths.items():
+            rel_paths[k] = p.relative_to(repo_root).as_posix()
+    except Exception:
+        # Extremely defensive fallback (should not happen under a real git repo)
+        for k, p in abs_paths.items():
+            rel_paths[k] = p.as_posix()
+
+    for key in missing:
+        rel_path = rel_paths[key]
+        title = _BLUEPRINT_TITLES.get(key, BLUEPRINT_LABELS.get(key, key))
+
         # Compose a strict, per‑file blueprint creation request
         sys_msg = {
             "role": "system",
@@ -502,8 +493,8 @@ def _ensure_blueprints(
             )
             raise SystemExit(1)
 
-        # Tighten expectations: must be create on EXACT path
-        if patch.get("op") != "create" or patch.get("file") != rel_path or not _is_safe_repo_rel_posix(rel_path):
+        # Tighten expectations: must be create on EXACT path and path must be safe
+        if patch.get("op") != "create" or patch.get("file") != rel_path or not is_safe_repo_rel_posix(rel_path):
             log.error(
                 "Blueprint patch mismatch. Expected create '%s'; got op=%r file=%r",
                 rel_path, patch.get("op"), patch.get("file")
@@ -574,16 +565,21 @@ def run(
     except Exception as exc:
         raise SystemExit(f"Failed to read instructions file: {exc}") from exc
 
+    # Sanity check: repository root should contain a .git directory
+    repo = Path(repo).expanduser().resolve()
+    if not (repo / ".git").exists():
+        raise SystemExit(f"Not a git repository: {repo}")
+
     client = _ensure_client(client, api_timeout)
 
-    # Optional preflight: ensure blueprint documents exist
+    # Optional preflight: ensure blueprint documents exist (canonical names/paths)
     if INCLUDE_BLUEPRINTS:
         try:
             _ensure_blueprints(
                 client=client,
                 model=model,
                 api_timeout=api_timeout,
-                repo=Path(repo).expanduser().resolve(),
+                repo=repo,
                 user_instructions=user_instructions,
             )
         except SystemExit:
@@ -593,7 +589,7 @@ def run(
             raise SystemExit(1) from exc
 
     # Prepare abridged blueprint summary (optional)
-    bp_summary = _blueprints_summary(Path(repo).expanduser().resolve()) if INCLUDE_BLUEPRINTS else None
+    bp_summary = _blueprints_summary(repo) if INCLUDE_BLUEPRINTS else None
 
     tools = [_submit_patch_tool()]
     tool_name = tools[0]["function"]["name"]
@@ -634,8 +630,13 @@ def run(
             raise SystemExit(1) from exc
 
         if not tool_calls:
-            # Nudge: ask assistant to call the function properly.
-            log.warning("Assistant response lacked tool_calls; sending nudge.")
+            # Record assistant content to keep a faithful transcript, then nudge.
+            content = msg.content or ""
+            messages.append({"role": "assistant", "content": content})
+            log.warning(
+                "Assistant response lacked tool_calls; snippet: %r. Sending nudge.",
+                _snippet(content),
+            )
             messages.append(
                 {
                     "role": "user",
@@ -693,9 +694,43 @@ def run(
             )
             continue
 
-        # Helpful visibility before applying the patch
+        # Additional **path hygiene** enforcement (beyond schema):
         op = patch.get("op")
-        file_path = patch.get("file")
+        file_path = patch.get("file") or ""
+        target_path = patch.get("target") or ""
+        if not is_safe_repo_rel_posix(file_path):
+            log.warning("Unsafe or non‑POSIX file path from assistant: %r", file_path)
+            tool_result = {
+                "ok": False,
+                "stage": "path_check",
+                "error": f"Unsafe or non‑POSIX repo‑relative path: {file_path!r}",
+            }
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": tool_name,
+                    "content": json.dumps(tool_result, ensure_ascii=False),
+                }
+            )
+            continue
+        if op == "rename" and not is_safe_repo_rel_posix(target_path):
+            log.warning("Unsafe or non‑POSIX rename target from assistant: %r", target_path)
+            tool_result = {
+                "ok": False,
+                "stage": "path_check",
+                "error": f"Unsafe or non‑POSIX target path for rename: {target_path!r}",
+            }
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": tool_name,
+                    "content": json.dumps(tool_result, ensure_ascii=False),
+                }
+            )
+            continue
+
         log.info("Turn %d: applying patch op=%s file=%s status=%s", turn, op, file_path, patch.get("status"))
 
         # Apply patch

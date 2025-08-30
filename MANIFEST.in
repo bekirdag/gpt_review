@@ -21,30 +21,38 @@ include CHANGELOG.md
 include CONTRIBUTING.md
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2) JSON schema shipped inside the package
+# 2) Top‑level Python modules (also listed in pyproject.toml [tool.setuptools].py-modules)
+# ─────────────────────────────────────────────────────────────────────────────
+include review.py
+include apply_patch.py
+include patch_validator.py
+include logger.py
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3) JSON schema shipped inside the package
 #    (Wheel inclusion handled via [tool.setuptools.package-data])
 # ─────────────────────────────────────────────────────────────────────────────
 recursive-include gpt_review *.json
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3) Example instruction and environment files
+# 4) Example instruction and environment files
 # ─────────────────────────────────────────────────────────────────────────────
 include example_instructions.txt
 include .env.example
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4) Shell helper scripts (installed alongside the package)
+# 5) Shell helper scripts (distributed with sdist)
 # ─────────────────────────────────────────────────────────────────────────────
 include software_review.sh
 include cookie_login.sh
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5) Tests (so downstream packagers/users can run `pytest`)
+# 6) Tests (so downstream packagers/users can run `pytest`)
 # ─────────────────────────────────────────────────────────────────────────────
 recursive-include tests *.py
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6) Exclude local rubbish just in case
+# 7) Exclude local rubbish just in case
 # ─────────────────────────────────────────────────────────────────────────────
 global-exclude *.pyc
 global-exclude __pycache__/

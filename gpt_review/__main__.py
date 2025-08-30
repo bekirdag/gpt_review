@@ -6,18 +6,21 @@ GPT‑Review ▸ Module Entry Point  (python -m gpt_review)
 ===============================================================================
 
 Canonical invocation:
-    python -m gpt_review [args…]
+    python -m gpt_review [<cli args>]
 
-Responsibilities
-----------------
-* Handle a **lightweight** global flag: `--version`
-  - For speed and to avoid side‑effects, we resolve the version **without**
-    importing the package unless necessary.
-* Print a concise startup banner (version, Python, platform) for normal runs.
-* Delegate the rest of the CLI parsing/execution to `review.main`.
+What this does
+--------------
+* Provides a **thin, resilient wrapper** that:
+  - Handles a fast `--version` path without importing the full package.
+  - Prints a concise startup banner (version, Python, platform).
+  - Delegates to the **modern CLI driver** (`gpt_review.cli:main`).
+  - Falls back to historical `review.main` entry points for backward
+    compatibility, if present in the environment.
 
-The console script remains separate and points to the same runtime:
-    gpt-review  →  review.main
+Notes
+-----
+Keeping this entry point robust ensures both `python -m gpt_review` and the
+`gpt-review` console script behave identically.
 """
 from __future__ import annotations
 
@@ -26,12 +29,16 @@ import platform
 import sys
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
+from typing import Callable
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI pre‑parsing (global flags only)
+# ─────────────────────────────────────────────────────────────────────────────
 def _parse_cli(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     """
     Extract global flags (currently just --version) and leave the rest
-    for `review.main()` to parse.
+    for the real CLI driver to parse.
 
     Returns
     -------
@@ -39,38 +46,43 @@ def _parse_cli(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     """
     parser = argparse.ArgumentParser(
         prog="python -m gpt_review",
-        add_help=False,  # `review.main` provides full help/usage
+        add_help=False,  # The CLI provides full usage/help.
     )
-    parser.add_argument("--version", action="store_true")
+    parser.add_argument(
+        "--version", action="store_true", help="Print package version and exit."
+    )
     args, remainder = parser.parse_known_args(argv)
     return args, remainder
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Version resolution
+# ─────────────────────────────────────────────────────────────────────────────
 def _resolve_version() -> str:
     """
     Resolve the installed package version **without importing** gpt_review.
 
-    Falls back to importing `gpt_review` only when distribution metadata
-    is unavailable (e.g., editable installs).
+    Falls back to importing `gpt_review.__version__` only when distribution
+    metadata is unavailable (e.g., editable installs).
     """
     try:
         return _pkg_version("gpt-review")
     except PackageNotFoundError:
-        # Fallback: import only the attribute, at the cost of initialising logging.
         try:
             from gpt_review import __version__  # type: ignore
         except Exception:
-            # Very defensive: last resort constant to ensure CLI stays usable.
-            __version__ = "0.0.0"
+            __version__ = "0.0.0"  # Last‑resort constant; keeps CLI usable.
         return __version__
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging banner
+# ─────────────────────────────────────────────────────────────────────────────
 def _print_banner(version: str) -> None:
     """
     Log a concise runtime banner. Helpful in pasted logs and CI output.
     """
-    # Lazy import keeps `--version` path dependency-light.
-    from gpt_review import get_logger  # local import to avoid side effects on cold path
+    from gpt_review import get_logger  # Local import keeps --version path fast.
 
     log = get_logger(__name__)
     log.info(
@@ -81,60 +93,83 @@ def _print_banner(version: str) -> None:
     )
 
 
-def _import_review_main():
+# ─────────────────────────────────────────────────────────────────────────────
+# Driver import (CLI preferred; legacy fallbacks)
+# ─────────────────────────────────────────────────────────────────────────────
+def _import_driver_main() -> Callable[[], int | None]:
     """
-    Import the CLI driver function `main` with resilience.
+    Locate the concrete CLI driver to execute.
 
-    We prefer the historical top-level `review` module (console script target),
-    but also support a packaged `gpt_review.review` for environments that install
-    the CLI within the package namespace.
+    Preference order:
+      1) gpt_review.cli.main          (modern CLI)
+      2) review.main                   (historical top‑level module)
+      3) gpt_review.review.main        (namespaced legacy)
     """
+    # 1) Preferred modern CLI
     try:
-        from review import main as review_main  # type: ignore
-        return review_main
+        from gpt_review.cli import main as cli_main  # type: ignore
+        return cli_main
     except Exception as exc_first:  # pragma: no cover
-        # Fallback to a namespaced import (keeps the entrypoint robust).
+        # 2) Legacy top‑level `review`
         try:
-            from gpt_review.review import main as review_main  # type: ignore
+            from review import main as review_main  # type: ignore
             return review_main
-        except Exception as exc_second:
-            from gpt_review import get_logger
+        except Exception as exc_second:  # pragma: no cover
+            # 3) Legacy namespaced `gpt_review.review`
+            try:
+                from gpt_review.review import main as review_ns_main  # type: ignore
+                return review_ns_main
+            except Exception as exc_third:  # pragma: no cover
+                # Log all failures coherently and exit.
+                from gpt_review import get_logger
 
-            get_logger(__name__).exception(
-                "Failed to import CLI driver: review.main (%s) and gpt_review.review.main (%s)",
-                exc_first,
-                exc_second,
-            )
-            sys.exit(1)
+                get_logger(__name__).exception(
+                    "Failed to import CLI driver:\n"
+                    "  • gpt_review.cli.main         → %s\n"
+                    "  • review.main                 → %s\n"
+                    "  • gpt_review.review.main      → %s",
+                    exc_first,
+                    exc_second,
+                    exc_third,
+                )
+                sys.exit(1)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry
+# ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
     """
     Top‑level dispatcher for `python -m gpt_review`.
+
+    * Fast‑path `--version`
+    * Print runtime banner
+    * Delegate *all remaining args* to the CLI driver
     """
     args, remaining = _parse_cli(sys.argv[1:])
 
-    # Fast path: print *only* the version and exit 0.
+    # Fast path: print version and exit without importing heavy modules.
     if args.version:
         print(_resolve_version())
         sys.exit(0)
 
+    # Normal path: banner + dispatch to CLI driver.
     version = _resolve_version()
     _print_banner(version)
 
-    # Resolve the actual CLI implementation.
-    review_main = _import_review_main()
+    driver_main = _import_driver_main()
 
-    # Ensure the CLI driver sees the expected argv vector.
+    # Ensure the driver sees the expected argv vector.
     sys.argv = [Path(sys.argv[0]).as_posix(), *remaining]
 
     try:
-        review_main()
+        rc = driver_main()
+        if isinstance(rc, int):
+            sys.exit(rc)
     except SystemExit:
         # Preserve intended exit codes from the underlying CLI.
         raise
     except KeyboardInterrupt:
-        # Graceful Ctrl‑C handling (POSIX convention: 130)
         from gpt_review import get_logger
 
         get_logger(__name__).info("Interrupted by user (Ctrl‑C). Exiting.")

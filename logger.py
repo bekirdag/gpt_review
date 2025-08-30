@@ -1,63 +1,77 @@
+# logger.py
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 ===============================================================================
-GPT‑Review ▸ Unified Logging Facility (shim)
+GPT‑Review ▸ Logging Shim (compatibility module)
 ===============================================================================
 
 Purpose
 -------
-This file is a **compatibility shim** so legacy imports like:
+Provide a small, stable wrapper so legacy imports like:
 
     from logger import get_logger
 
-continue to work. All real configuration lives in the packaged logger at
-`gpt_review.logger`, ensuring there is a single owner of handlers and no
-duplicate configuration.
+continue to work even if the fully featured implementation lives in
+`gpt_review/logger.py` (the packaged module).
 
-Features
+Behavior
 --------
-* Namespace routing:
-    - If you pass a top‑level name like "review" or "apply_patch", we prefix it
-      to "gpt_review.<name>" so it becomes a child of the project root logger.
-* Idempotent behavior:
-    - The packaged logger configures handlers exactly once; this shim never
-      attaches handlers itself, it only delegates.
+* First, delegate to the packaged logger (the "real" implementation).
+* If delegation is not available (unusual), fall back to a minimal console logger.
 """
+
 from __future__ import annotations
 
 import logging
 from typing import Optional
 
-# Delegate to the packaged implementation (single source of truth)
-from gpt_review.logger import get_logger as _pkg_get_logger
+# Prefer the packaged implementation.
+try:
+    from gpt_review.logger import get_logger as _delegate_get_logger  # type: ignore
+except Exception:
+    _delegate_get_logger = None  # type: ignore[assignment]
+
+
+def _fallback_get_logger(name: Optional[str] = None) -> logging.Logger:
+    """
+    Minimal, idempotent console logger used only if the packaged
+    implementation cannot be imported for some reason.
+    """
+    root_name = "gpt_review"
+    root = logging.getLogger(root_name)
+    if not root.handlers:
+        root.setLevel(logging.DEBUG)
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        fmt = logging.Formatter(
+            fmt="%(asctime)s | %(name)s | %(process)d | %(levelname)-8s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        ch.setFormatter(fmt)
+        root.addHandler(ch)
+        root.propagate = False
+        root.debug("Fallback logger initialised in top-level logger.py (shim).")
+    if name is None or name == root_name:
+        return root
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = True
+    return logger
 
 
 def get_logger(name: Optional[str] = None) -> logging.Logger:
     """
-    Return a logger configured with GPT‑Review's handlers & formatting.
-
-    Behaviour
-    ---------
-    • If *name* is None or already starts with "gpt_review", delegate as‑is.
-    • If *name* is a top‑level module (e.g., "review", "apply_patch",
-      "patch_validator"), route it under the project namespace by prefixing
-      "gpt_review.".
+    Return a configured logger. Prefer the packaged implementation; else fallback.
     """
-    routed = name
-    if name and not name.startswith("gpt_review"):
-        routed = f"gpt_review.{name}"
-    return _pkg_get_logger(routed)
+    if _delegate_get_logger is not None:
+        return _delegate_get_logger(name)
+    return _fallback_get_logger(name)
 
 
 __all__ = ["get_logger"]
 
 
 if __name__ == "__main__":  # pragma: no cover
-    # Quick demo without altering global configuration
-    root = get_logger()  # resolves to packaged root logger
-    root.info("Root logger OK (shim → packaged).")
-
-    a = get_logger("review")
-    b = get_logger("gpt_review.review")
-    assert a is b
-    a.info("Top-level 'review' correctly routed to 'gpt_review.review'.")
+    log = get_logger(__name__)
+    log.info("Logging shim is operational.")

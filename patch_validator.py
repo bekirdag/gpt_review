@@ -18,6 +18,8 @@ Public API
     - Raises `jsonschema.ValidationError` on schema violations
     - Raises `json.JSONDecodeError` on malformed JSON
     - Raises `ValueError` on extra safety violations (paths/Base64)
+* `is_safe_repo_rel_posix(path: str) -> bool`
+    - Exported canonical path guard used across modules.
 
 CLI usage
 ---------
@@ -39,6 +41,7 @@ Design notes
 * We compile a `Draft7Validator` for speed and structured errors.
 * Extra guards go beyond the schema:
     - `file`/`target` must be safe repo‑relative **POSIX** paths (no abs/backslashes/.., not .git/).
+      Leading "./" is **not allowed** (aligns with api_driver/workflow). Windows drive letters are rejected.
     - `body_b64` (when present) must be valid Base64 (strict check).
 * Logging is centralised via the project logger.
 """
@@ -65,7 +68,7 @@ except Exception:  # pragma: no cover
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
-log = get_logger("patch_validator")
+log = get_logger(__name__)
 
 # -----------------------------------------------------------------------------
 # Load schema at import‑time (fast & safe)
@@ -102,6 +105,14 @@ def _load_schema() -> Dict[str, Any]:
 
 
 _SCHEMA: Dict[str, Any] = _load_schema()
+
+# Sanity‑check the schema itself (fail fast if broken)
+try:
+    Draft7Validator.check_schema(_SCHEMA)
+except Exception as exc:  # pragma: no cover
+    log.critical("Bundled JSON‑Schema is invalid: %s", exc)
+    raise
+
 _VALIDATOR: Draft7Validator = Draft7Validator(_SCHEMA)
 
 # -----------------------------------------------------------------------------
@@ -110,6 +121,7 @@ _VALIDATOR: Draft7Validator = Draft7Validator(_SCHEMA)
 _ALLOWED_OPS = {"create", "update", "delete", "rename", "chmod"}
 _ALLOWED_STATUS = {"in_progress", "completed"}
 _MODE_RE = re.compile(r"^[0-7]{3,4}$")  # chmod mode (3 or 4 octal digits)
+_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")  # Windows drive letter
 
 
 def _pretty_pointer(exc: ValidationError) -> str:
@@ -124,32 +136,49 @@ def _pretty_pointer(exc: ValidationError) -> str:
     return ".".join(parts)
 
 
-def _is_safe_repo_rel_posix(path: str) -> bool:
+def is_safe_repo_rel_posix(path: str) -> bool:
     """
-    Defensive path guard:
+    Canonical defensive path guard used across GPT‑Review.
+
+    Rules:
       - POSIX separators only
       - not absolute (no leading '/')
       - no backslashes, no parent traversal ('..')
       - not under '.git/' and not '.git' itself
-      - no empty segments and stable normalization
+      - no Windows drive letters (e.g. 'C:...')
+      - no redundant segments (e.g., 'a//b', 'a/./b'), no trailing '/'
+      - leading './' is **not** allowed (normalization would change the string)
+
+    Returns
+    -------
+    bool
+        True if the path is a safe, repo‑relative POSIX string.
     """
     if not isinstance(path, str) or not path.strip():
         return False
-    if "\\" in path:
+
+    raw = path.strip()
+
+    # Reject Windows/backslash, absolute paths, drive letters
+    if "\\" in raw:
         return False
-    if path.startswith("/"):
+    if raw.startswith("/"):
         return False
-    # split on POSIX separator only
-    if ".." in path.split("/"):
+    if _DRIVE_PREFIX_RE.match(raw):
         return False
-    # no .git anywhere in the path
-    if path == ".git" or path.startswith(".git/") or "/.git/" in path or path.endswith("/.git"):
+
+    # Reject parent traversal and .git anywhere
+    if ".." in raw.split("/"):
         return False
-    p = PurePosixPath(path)
-    # reject paths that normalize to something different (e.g., redundant slashes)
-    if str(p) != path:
+    if raw == ".git" or raw.startswith(".git/") or "/.git/" in raw or raw.endswith("/.git"):
         return False
-    # ensure all segments are non-empty
+
+    # Normalization must be stable (rejects './x', 'a//b', 'a/./b', trailing '/')
+    p = PurePosixPath(raw)
+    if str(p) != raw:
+        return False
+
+    # Ensure all segments non‑empty
     return all(seg for seg in p.parts)
 
 
@@ -173,12 +202,10 @@ def _extra_safety_checks(data: Dict[str, Any]) -> None:
     def _check_path_field(key: str) -> None:
         val = data.get(key)
         _require(isinstance(val, str) and val.strip(), f"Missing or empty '{key}'.")
-        _require(_is_safe_repo_rel_posix(val), f"Unsafe/non‑POSIX '{key}': {val!r}.")
+        _require(is_safe_repo_rel_posix(val), f"Unsafe/non‑POSIX '{key}': {val!r}.")
 
     if op in {"create", "update"}:
         _check_path_field("file")
-        # Exactly one of body/body_b64 is already enforced by the schema's oneOf;
-        # here we add a stricter Base64 check when body_b64 is used.
         if "body_b64" in data:
             b64 = data["body_b64"]
             _require(isinstance(b64, str) and b64.strip(), "'body_b64' must be a non‑empty Base64 string.")
@@ -189,14 +216,13 @@ def _extra_safety_checks(data: Dict[str, Any]) -> None:
 
     elif op == "delete":
         _check_path_field("file")
-        # We tolerate presence of 'body'/'body_b64' (schema allows), but log a warning.
+        # If schema remains permissive for extras, warn (no hard failure).
         if "body" in data or "body_b64" in data:
             log.warning("delete patch contains body/body_b64; ignoring extra fields.")
 
     elif op == "rename":
         _check_path_field("file")
         _check_path_field("target")
-        # Optionally prevent degenerate rename
         if data.get("file") == data.get("target"):
             log.warning("rename 'file' and 'target' are identical; no‑op rename will be ignored.")
 
@@ -293,7 +319,7 @@ def _cli(argv: list[str] | None = None) -> int:
 
     # Print schema and exit.
     if args.schema:
-        print(json.dumps(_SCHEMA, indent=2))
+        print(json.dumps(_SCHEMA, indent=2, ensure_ascii=False))
         return 0
 
     # Determine payload source (file, stdin, or positional)
@@ -319,19 +345,20 @@ def _cli(argv: list[str] | None = None) -> int:
         print("✓ Patch is valid.")
         return 0
     except ValidationError as exc:
-        # Pretty print pointer + message for humans, but keep exit code.
         log.error("❌ Patch invalid at %s: %s", _pretty_pointer(exc), exc.message)
         return 1
     except json.JSONDecodeError as exc:
         log.error("❌ Payload is not valid JSON: %s", exc)
         return 1
     except ValueError as exc:
-        # Extra safety guards
         log.error("❌ Patch failed safety checks: %s", exc)
         return 1
     except Exception as exc:  # pragma: no cover
         log.exception("❌ Unexpected error: %s", exc)
         return 1
+
+
+__all__ = ["validate_patch", "is_safe_repo_rel_posix"]
 
 
 if __name__ == "__main__":  # pragma: no cover

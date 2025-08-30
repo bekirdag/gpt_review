@@ -23,7 +23,7 @@ Key features
 * Resilient – falls back to a temp dir, then console‑only, if log dir unwritable.
 * Environment overrides:
     GPT_REVIEW_LOG_DIR   – log directory (default: ./logs)
-    GPT_REVIEW_LOG_LVL   – console level  (DEBUG / INFO / WARNING / …)
+    GPT_REVIEW_LOG_LVL   – console level  (DEBUG / INFO / WARNING / … or numeric)
     GPT_REVIEW_LOG_ROT   – rotation schedule ("midnight", "H", "M", …)
     GPT_REVIEW_LOG_BACK  – number of backup files (default 7)
     GPT_REVIEW_LOG_UTC   – truthy → timestamps & rotation in UTC (1/true/yes/on)
@@ -53,12 +53,45 @@ def _is_truthy(val: str | None) -> bool:
     return val.strip().lower() in {"1", "true", "yes", "on", "y", "t"}
 
 
+def _parse_level(val: str | None, default: int = logging.INFO) -> int:
+    """
+    Parse an environment level value which may be a name ("INFO") or an integer ("20").
+    Falls back to *default* on invalid input.
+    """
+    if val is None:
+        return default
+    s = val.strip()
+    if not s:
+        return default
+    if s.isdigit():
+        try:
+            return int(s)
+        except Exception:
+            return default
+    name = s.upper()
+    name_to_level = {
+        "CRITICAL": logging.CRITICAL,
+        "ERROR": logging.ERROR,
+        "WARNING": logging.WARNING,
+        "WARN": logging.WARNING,
+        "INFO": logging.INFO,
+        "DEBUG": logging.DEBUG,
+        "NOTSET": logging.NOTSET,
+    }
+    return name_to_level.get(name, default)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Defaults & environment overrides
 # ════════════════════════════════════════════════════════════════════════════
 _DEFAULT_DIR = Path("logs")
 _LOG_DIR_ENV = os.getenv("GPT_REVIEW_LOG_DIR", str(_DEFAULT_DIR))
-CONSOLE_LEVEL = os.getenv("GPT_REVIEW_LOG_LVL", "INFO").upper()
+
+# Keep both the raw name (for banner) and parsed numeric level (for handlers)
+_CONSOLE_LEVEL_ENV = os.getenv("GPT_REVIEW_LOG_LVL", "INFO")
+CONSOLE_LEVEL = _parse_level(_CONSOLE_LEVEL_ENV, default=logging.INFO)
+CONSOLE_LEVEL_NAME = (_CONSOLE_LEVEL_ENV or "INFO").strip().upper()
+
 ROTATE_WHEN = os.getenv("GPT_REVIEW_LOG_ROT", "midnight")  # TimedRotatingFileHandler 'when'
 BACKUP_COUNT = int(os.getenv("GPT_REVIEW_LOG_BACK", "7"))
 USE_UTC = _is_truthy(os.getenv("GPT_REVIEW_LOG_UTC"))
@@ -217,7 +250,7 @@ def get_logger(name: str | None = None) -> logging.Logger:
         root.debug(
             "Logger initialised | dir=%s | console=%s | rotate=%s | backups=%s | utc=%s | json-console=%s",
             str(log_dir),
-            CONSOLE_LEVEL,
+            CONSOLE_LEVEL_NAME,
             ROTATE_WHEN,
             BACKUP_COUNT,
             USE_UTC,

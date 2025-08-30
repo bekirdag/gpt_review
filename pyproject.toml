@@ -9,6 +9,8 @@
 # • Add API mode dependency: `openai` (official SDK).
 # • Keep Selenium deps for browser mode.
 # • Consolidate lint/test config and packaging notes.
+# • Point console script to `gpt_review.cli:main` (new CLI).
+# • Drop stale top-level `review` module from py-modules & coverage sources.
 ###############################################################################
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,7 +59,7 @@ dependencies = [
   # JSON‑Schema validation
   "jsonschema>=4.22.0",
 
-  # Git plumbing
+  # Git plumbing (subprocess is used primarily; this remains available)
   "GitPython>=3.1.43",
 
   # Misc HTTP helpers
@@ -98,8 +100,8 @@ Issues = "https://github.com/bekirdag/gpt_review/issues"
 #  Console script entry‑point
 # ─────────────────────────────────────────────────────────────────────────────
 [project.scripts]
-# Provides the CLI command `gpt-review`, which calls review.main()
-gpt-review = "review:main"
+# Provides the CLI command `gpt-review`, which calls gpt_review.cli:main
+gpt-review = "gpt_review.cli:main"
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  setuptools‑specific tweaks
@@ -110,7 +112,7 @@ packages = ["gpt_review"]               # ← ensures `gpt_review` package is in
 include-package-data = true             # ← cooperate with MANIFEST.in when building sdists
 
 # Top‑level modules that live outside the package dir
-py-modules = ["review", "apply_patch", "patch_validator", "logger"]
+py-modules = ["apply_patch", "patch_validator", "logger"]
 
 [tool.setuptools.package-data]
 # Ship JSON schema inside the wheel
@@ -139,7 +141,7 @@ force_grid_wrap         = 0
 # ─────────────────────────────────────────────────────────────────────────────
 [tool.coverage.run]
 branch = true
-source = ["gpt_review", "review", "apply_patch", "patch_validator"]
+source = ["gpt_review", "apply_patch", "patch_validator", "logger"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Flake8 lives in `.flake8`

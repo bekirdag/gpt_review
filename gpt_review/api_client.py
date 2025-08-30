@@ -360,10 +360,17 @@ class OpenAIClient:
             raise RuntimeError(f"Malformed API response (tool={tool_name}): {exc}") from exc
 
         if not calls:
-            # Record assistant content to aid debugging
-            self.messages.append({"role": "assistant", "content": msg.content or ""})
+            # Record assistant content to aid debugging and raise with a snippet.
+            content = msg.content or ""
+            self.messages.append({"role": "assistant", "content": content})
             self.messages = _prune_messages(self.messages, self.max_turn_pairs)
-            raise RuntimeError(f"Assistant did not call the required tool '{tool_name}'.")
+            snippet = content.strip().replace("\n", " ")
+            if len(snippet) > 240:
+                snippet = snippet[:240] + "…"
+            raise RuntimeError(
+                f"Assistant did not call the required tool '{tool_name}'. "
+                f"Last assistant message snippet: {snippet!r}"
+            )
 
         tc = calls[0]
         fn = getattr(tc, "function", None)
@@ -417,7 +424,7 @@ class OpenAIClient:
 
         arr = _extract_json_array(content)
         # Append assistant message to history; avoid clutter with huge arrays.
-        self.messages.append({"role": "assistant", "content": "[…JSON array…]"})
+        self.messages.append({"role": "assistant", "content": f"[…JSON array: {len(arr)} items…]"})
         self.messages = _prune_messages(self.messages, self.max_turn_pairs)
         log.info("Strict JSON array received with %d entries.", len(arr))
 
@@ -508,6 +515,11 @@ def submit_patch_call(
             raise RuntimeError(
                 "Expected a full‑file body/body_b64 in the patch but none was provided."
             )
+
+    # Ensure status is present & valid for downstream schema validation.
+    if patch.get("status") not in {"in_progress", "completed"}:
+        log.warning("Assistant omitted/invalid 'status' → defaulting to 'in_progress'.")
+        patch["status"] = "in_progress"
 
     # Light expected_kind check (the orchestrator may further enforce).
     if expected_kind == "create" and patch.get("op") not in {"create", "update"}:

@@ -172,10 +172,10 @@ if [[ $SHOW_VERSION -eq 1 ]]; then
   if command -v gpt-review >/dev/null 2>&1; then
     exec gpt-review --version
   fi
-  # Fallback to python -m
+  # Fallback to python -m (package provides CLI at gpt_review.cli:main)
   PY_PATH="$(command -v python3 || command -v python || true)"
   [[ -n "$PY_PATH" ]] || die "No Python interpreter found for --version."
-  exec "$PY_PATH" -m gpt_review --version
+  exec "$PY_PATH" -m gpt_review.cli --version
 fi
 
 # ------------------------------ positional args ---------------------------- #
@@ -375,18 +375,18 @@ EOF
     die "Runner resolution failed"
   fi
 
-  info "Using fallback runner: $PY_PATH -m gpt_review"
+  info "Using fallback runner: $PY_PATH -m gpt_review.cli"
   if ! "$PY_PATH" - <<'PY' >/dev/null 2>&1
 import sys
 try:
-    import gpt_review  # noqa: F401
+    import gpt_review.cli  # noqa: F401
 except Exception:
     sys.exit(42)
 sys.exit(0)
 PY
   then
     cat >&2 <<EOF
-The Python interpreter at '$PY_PATH' cannot import the 'gpt_review' module.
+The Python interpreter at '$PY_PATH' cannot import the 'gpt_review.cli' module.
 
 Fixes:
   - Activate the correct virtualenv:
@@ -400,10 +400,10 @@ Current PATH:
   $(command -v python3 || true)
   $(command -v python || true)
 EOF
-    die "Python interpreter found but gpt_review is not installed in it"
+    die "Python interpreter found but gpt_review.cli is not installed in it"
   fi
 
-  RUNNER_CMD=("$PY_PATH" "-m" "gpt_review")
+  RUNNER_CMD=("$PY_PATH" "-m" "gpt_review.cli")
 fi
 
 info "Resolved runner command: $(_join_cmd "${RUNNER_CMD[@]}")"
