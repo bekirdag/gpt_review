@@ -18,7 +18,7 @@ Edit → Run → Fix — until your tests pass.
 | Crash‑safe resume (state file) | ✅ |
 | Daily‑rotating logs | ✅ |
 | **Browser mode**: chatgpt.com primary + chat.openai.com fallback | ✅ |
-| **API mode** (OpenAI‑compatible; e.g., GPT‑5 Pro) | ✅ |
+| **API mode** (GPT-Codex; e.g., gpt-5-codex) | ✅ |
 | Transport toggle `--mode browser|api` | ✅ |
 | Token‑thrifty API loop (rolling history + tailed logs) | ✅ |
 | Chrome/Chromium auto‑detect + correct driver (browser mode) | ✅ |
@@ -28,6 +28,8 @@ Edit → Run → Fix — until your tests pass.
 | **Login helper URL override** (`GPT_REVIEW_LOGIN_URL`) | ✅ |
 | **Root‑safe visible login** (`--no-sandbox` auto) | ✅ |
 | **Snap‑aware profile defaults** (Chromium confinement) | ✅ |
+| Plan-first orchestrator + blueprint docs (.gpt-review) | ✅ |
+| CLI utilities: manifest scan, schema dump, patch validator | ✅ |
 
 ---
 
@@ -47,16 +49,22 @@ Edit → Run → Fix — until your tests pass.
    - [Headless servers (Xvfb + VNC alternative)](#headless-servers-xvfb--vnc-alternative)  
    - [Browser choices: Google Chrome vs Snap Chromium](#browser-choices-google-chrome-vs-snap-chromium)  
 5. [Usage](#usage)  
-6. [Session rules](#session-rules)  
-7. [Environment & configuration](#environment--configuration)  
+6. [Command-line tools](#command-line-tools)  
+   - [gpt-review CLI](#gpt-review-cli)  
+   - [Wrapper: software_review.sh](#wrapper-software_reviewsh)  
+   - [`python -m gpt_review`](#python--m-gpt_review)  
+7. [Session rules](#session-rules)  
+8. [Environment & configuration](#environment--configuration)  
+   - [Shared toggles](#shared-toggles)  
    - [Browser mode variables](#browser-mode-variables)  
    - [API mode variables](#api-mode-variables)  
-8. [Advanced](#advanced)  
-9. [Development](#development)  
-10. [CI pipelines](#ci-pipelines)  
-11. [Troubleshooting](#troubleshooting)  
-12. [Security](#security)  
-13. [License](#license)  
+9. [Advanced](#advanced)  
+10. [Development](#development)  
+11. [CI pipelines](#ci-pipelines)  
+12. [Troubleshooting](#troubleshooting)  
+13. [Security](#security)  
+14. [License](#license)  
+
 
 ---
 
@@ -87,7 +95,7 @@ sequenceDiagram
 ```
 **Transport:**  
 - **Browser mode** uses Selenium to interact with chatgpt.com (with chat.openai.com fallback).  
-- **API mode** calls an OpenAI‑compatible endpoint directly (e.g., GPT‑5 Pro) without launching a browser.
+- **API mode** calls the GPT-Codex endpoint directly (e.g., gpt-5-codex) without launching a browser.
 
 ---
 
@@ -121,16 +129,16 @@ software_review.sh instructions.txt  /path/to/git/repo  --cmd "pytest -q"
 
 ### Quick start (API mode)
 
-> **Requirements:** Python **3.10+**, Git, and an OpenAI‑compatible API key.  
-> Install the Python SDK once: `pip install "openai>=1.0.0"`
+> **Requirements:** Python **3.10+**, Git, and access to the GPT-Codex API (for example `gpt-5-codex`).  
+> Install the Codex SDK once: `pip install gpt-5-codex-client`
 
 ```bash
-export OPENAI_API_KEY="sk-..."
+export GPT_CODEX_API_KEY="sk-..."
 # Optional if using a custom endpoint/proxy:
-# export OPENAI_BASE_URL="https://api.your-endpoint.example/v1"
+# export GPT_CODEX_BASE_URL="https://api.your-endpoint.example/v1"
 
-# Run in API mode against GPT‑5 Pro
-software_review.sh instructions.txt /repo --mode api --model gpt-5-pro --cmd "pytest -q" --auto
+# Run in API mode against GPT-5 Codex
+software_review.sh instructions.txt /repo --mode api --model gpt-5-codex --cmd "pytest -q" --auto
 ```
 
 API mode avoids Selenium/Chrome entirely and is **token‑thrifty**:
@@ -155,9 +163,9 @@ The installer:
 * Installs the package in editable mode.
 * Adds launchers: `gpt-review`, `software_review.sh`, and `cookie_login.sh`.
 
-> **API mode:** ensure the OpenAI SDK is available in the same environment:
+> **API mode:** ensure the GPT-Codex SDK is available in the same environment:
 > ```bash
-> pip install "openai>=1.0.0"
+> pip install gpt-5-codex-client
 > ```
 
 ### pip / virtual‑env
@@ -168,7 +176,7 @@ cd gpt-review
 python -m venv venv && . venv/bin/activate
 pip install -e .[dev]
 # For API mode, add:
-pip install "openai>=1.0.0"
+pip install gpt-5-codex-client
 ```
 
 ### Docker
@@ -289,7 +297,7 @@ mkdir -p "$GPT_REVIEW_PROFILE"
 software_review.sh instructions.txt /repo
 
 # API
-software_review.sh instructions.txt /repo --mode api --model gpt-5-pro
+software_review.sh instructions.txt /repo --mode api --model gpt-5-codex
 ```
 
 ### Full CLI
@@ -301,8 +309,8 @@ software_review.sh instructions.txt /repo --mode api --model gpt-5-pro
 | `--cmd "pytest -q"` | _(none)_ | Command must exit 0 before loop stops |
 | `--auto` | off | Auto‑send **continue** after each patch |
 | `--timeout 600` | 300 | Kill command after *N* seconds |
-| `--mode {browser,api}` | browser | Transport: Selenium or OpenAI API |
-| `--model gpt-5-pro` | env: `GPT_REVIEW_MODEL` | Model name for API mode |
+| `--mode {browser,api}` | browser | Transport: Selenium or GPT-Codex API |
+| `--model gpt-5-codex` | env: `GPT_REVIEW_MODEL` | Model name for API mode |
 | `--api-timeout 120` | env: `GPT_REVIEW_API_TIMEOUT` | API call timeout (seconds) |
 
 ### JSON contract
@@ -325,6 +333,61 @@ software_review.sh instructions.txt /repo --mode api --model gpt-5-pro
 
 ---
 
+## Command-line tools
+
+### gpt-review CLI
+
+`gpt-review` is the primary console script. It accepts either a local Git checkout or a Git URL (cloned into a temporary worktree) plus a plain-text instructions file.
+
+| Subcommand | Purpose | Highlights |
+|-----------|---------|------------|
+| `iterate` | Multi-iteration orchestrator (plan-first workflow) | Blueprint preflight, plan artifacts, per-iteration branches, optional push/PR |
+| `api` | Browser-free patch loop using the API driver | Runs `--cmd` after each patch, blueprint summaries, log tailing |
+| `scan` | Print deterministic manifest of repository contents | `--max-lines` trims output for large repos |
+| `validate` | Validate a single patch payload against the schema | Accepts `--payload`, `--file`, or stdin via `-` |
+| `schema` | Dump the active JSON schema | Handy for tooling integrations |
+| `version` / `--version` | Print package version | Available as a global flag on every command |
+
+**iterate essentials**
+
+- Runs the plan-first step, generates blueprint documents under `.gpt-review/blueprints/`, and writes plan artifacts (`INITIAL_REVIEW_PLAN.md`, `.gpt-review/initial_plan.json`, `.gpt-review/review_plan.json`, `REVIEW_GUIDE.md`).
+- Creates one branch per iteration (`iteration1` → `iteration3` by default); override with `--branch-prefix` or `GPT_REVIEW_BRANCH_PREFIX`.
+- Pushes the final branch to `--remote` (default `origin` or `GPT_REVIEW_REMOTE`) unless `--no-push` is set.
+- Optional `--run "<command>"` enables the error-fix loop until the command passes.
+- Set `GPT_REVIEW_CREATE_PR=1` to attempt a pull request after pushing when GitHub credentials are available.
+- Accepts Git URLs; repositories are cloned into a temporary directory automatically.
+
+**api essentials**
+
+- Uses the strict `submit_patch` tool contract and runs `--cmd` after each successful patch (default `--timeout` 300s).
+- Shares model/timeout flags with `iterate` (`--model`, `--api-timeout`) and honours the same `GPT_REVIEW_MODEL` / `GPT_REVIEW_API_TIMEOUT` defaults.
+- Injects blueprint summaries by default; toggle with `GPT_REVIEW_INCLUDE_BLUEPRINTS` and `GPT_REVIEW_BLUEPRINT_SUMMARY_MAX_BYTES`.
+- Limits conversation history via `GPT_REVIEW_CTX_TURNS` and only sends the tail of logs (`GPT_REVIEW_LOG_TAIL_CHARS`).
+
+### Wrapper: software_review.sh
+
+The shell wrapper provides a memorable entry point and logging conveniences while delegating to `gpt-review`.
+
+| Flag | Purpose |
+|------|---------|
+| `--load-dotenv[=PATH]` | Source `.env` (or the provided path) before running |
+| `--env-dump` | Print the effective mode, profile, timeouts, and API settings |
+| `--fresh` | Remove `<repo>/.gpt-review-state.json` before starting |
+| `--no-log` / `--log-file PATH` | Control wrapper logging (defaults to `logs/wrapper-YYYYMMDD-HHMMSS.log`) |
+| `--api` / `--model` | Convenience aliases that rewrite to `--mode api` / `--model …` |
+| `--version` | Print the underlying `gpt-review` version and exit |
+
+Additional notes:
+
+- Validates that the instructions file exists and that the target is a Git repo or worktree.
+- Derives `--mode` / `--model` when omitted, based on `--api`, `GPT_REVIEW_MODE`, and `GPT_REVIEW_MODEL`.
+- Forwards all remaining arguments untouched, so you can pass `--cmd`, `--auto`, `--timeout`, and other CLI flags.
+
+### `python -m gpt_review`
+
+The module entry point prints a concise startup banner and forwards to the same CLI driver. It supports a fast-path `--version` that avoids importing heavy dependencies, which keeps CI smoke tests and health checks lightweight.
+
+
 ## Session rules
 
 1. **One patch per reply** – ChatGPT must modify **one file at a time**.  
@@ -340,6 +403,17 @@ These rules keep commit history readable and make rollbacks trivial.
 ## Environment & configuration
 
 A `.env.example` is provided.
+
+### Shared toggles
+
+* `GPT_REVIEW_BRANCH_PREFIX` – prefix for iteration branches (default: `iteration`).  
+* `GPT_REVIEW_REMOTE` – Git remote pushed by the orchestrator (default: `origin`).  
+* `GPT_REVIEW_ITERATIONS` – default number of passes for `gpt-review iterate` (1–3, default: `3`).  
+* `GPT_REVIEW_CREATE_PR` – set to `1` to attempt creating a pull request after pushing (requires `gh` or API credentials).  
+* `GPT_REVIEW_MAX_PROMPT_BYTES` – truncate prompts when sending very large files (default: `200000`).  
+* `GPT_REVIEW_HEAD_TAIL_BYTES` – size of head/tail slices used when truncating (default: `60000`).  
+* `GPT_REVIEW_LOG_TAIL_CHARS` – characters from the end of failing logs forwarded to the model (default: `20000`).  
+* `GPT_REVIEW_MAX_ERROR_ROUNDS` – cap on error-fix retries during orchestrated runs (default: `6`).  
 
 ### Browser mode variables
 
@@ -368,19 +442,23 @@ A `.env.example` is provided.
   * `GPT_REVIEW_LOG_LVL` – console level (`INFO` by default)
   * `GPT_REVIEW_LOG_ROT` – rotation schedule (default: `midnight`)
   * `GPT_REVIEW_LOG_BACK` – number of backups (default: `7`)
+  * `GPT_REVIEW_LOG_UTC` – truthy values switch console timestamps to UTC.
+  * `GPT_REVIEW_LOG_JSON` – truthy values emit JSON lines to stdout (useful in CI).
 
 ### API mode variables
 
 * **Endpoint & Identity**
-  * `OPENAI_API_KEY` – API key (required).  
-  * `OPENAI_BASE_URL` / `OPENAI_API_BASE` – custom endpoint (optional).
-  * `OPENAI_ORG_ID` / `OPENAI_ORGANIZATION` – org scoping (optional).
+  * `GPT_CODEX_API_KEY` – API key (required; honours legacy `OPENAI_API_KEY`).  
+  * `GPT_CODEX_BASE_URL` / `GPT_CODEX_API_BASE` – custom endpoint (optional; aliases `OPENAI_BASE_URL` / `OPENAI_API_BASE` still work).
+  * `GPT_CODEX_ORG_ID` / `GPT_CODEX_ORGANIZATION` – org scoping (optional; legacy `OPENAI_ORG_ID` / `OPENAI_ORGANIZATION` recognised).
 
 * **Model & runtime**
-  * `GPT_REVIEW_MODEL` – default model for API mode (e.g., `gpt-5-pro`).  
-  * `GPT_REVIEW_API_TIMEOUT` – per‑request timeout (seconds, default: `120`).  
-  * `GPT_REVIEW_API_LOG_TAIL` – max characters from the end of failing logs to send back (default: `min(12000, CHUNK_SIZE)`).  
-  * `GPT_REVIEW_API_MAX_TURNS` – rolling history window (assistant/user pairs to keep, default: `6`).
+  * `GPT_REVIEW_MODEL` – default model for API mode (e.g., `gpt-5-codex`).  
+  * `GPT_REVIEW_API_TIMEOUT` – per-request timeout (seconds, default: `120`).  
+  * `GPT_REVIEW_CTX_TURNS` – rolling history window (assistant/user pairs to keep, default: `6`).  
+  * `GPT_REVIEW_LOG_TAIL_CHARS` – max characters from the tail of failing logs to send back (default: `20000`).  
+  * `GPT_REVIEW_INCLUDE_BLUEPRINTS` – set to `0` to skip blueprint preflight in API runs (default: `1`).  
+  * `GPT_REVIEW_BLUEPRINT_SUMMARY_MAX_BYTES` – cap for the injected blueprint summary (default: `12000`).
 
 Apply env quickly with:
 
@@ -398,6 +476,17 @@ set +a
 
 Iterations **1–2** focus on code + tests. Iteration **3** may update docs/setup/examples for global consistency.  
 This is enforced by the `RepoScanner` + orchestrator and reflected in prompts.
+
+### Blueprint docs & plan artifacts
+
+The orchestrator and API driver ensure the four blueprint documents live under `.gpt-review/blueprints/` (`WHITEPAPER.md`, `BUILD_GUIDE.md`, `SDS.md`, `PROJECT_INSTRUCTIONS.md`). Missing files are created via the patch pipeline so each commit stays one-file-per-change.
+
+During the plan-first step GPT-Review also writes:
+
+- `.gpt-review/initial_plan.json` and `INITIAL_REVIEW_PLAN.md` with the initial run/test plan.
+- `.gpt-review/review_plan.json` and `REVIEW_GUIDE.md` after iteration 3.
+
+Control the behaviour with `GPT_REVIEW_INCLUDE_BLUEPRINTS` (set to `0` to skip in API runs) and `GPT_REVIEW_BLUEPRINT_SUMMARY_MAX_BYTES` to bound the injected summary size.
 
 ### Safety nets
 
@@ -492,7 +581,7 @@ Two GitHub Actions workflows:
 **API mode**
 
 * **401 Unauthorized**  
-  - Check `OPENAI_API_KEY` and any organisation scoping.
+  - Check `GPT_CODEX_API_KEY` (or legacy `OPENAI_API_KEY`) and any organisation scoping.
 
 * **404/`model_not_found`**  
   - Verify `--model` (or `GPT_REVIEW_MODEL`) is available to your account/endpoint.
@@ -501,17 +590,17 @@ Two GitHub Actions workflows:
   - Rerun later or lower concurrency; API mode already limits history and tails logs to reduce tokens.
 
 * **Connection errors / gateway timeouts**  
-  - Increase `--api-timeout` or set a closer `OPENAI_BASE_URL` proxy.
+  - Increase `--api-timeout` or set a closer `GPT_CODEX_BASE_URL` proxy.
 
 * **Costs creep up**  
-  - Lower `GPT_REVIEW_API_MAX_TURNS` and/or `GPT_REVIEW_API_LOG_TAIL`. Use narrower `--cmd` output when possible.
+  - Lower `GPT_REVIEW_CTX_TURNS` and/or `GPT_REVIEW_LOG_TAIL_CHARS`. Use narrower `--cmd` output when possible.
 
 ---
 
 ## Security
 
 * Never commit secrets. `.env` is ignored by default.  
-* The tool never prints `OPENAI_API_KEY`; avoid echoing it in shells or logs.  
+* The tool never prints `GPT_CODEX_API_KEY` (legacy `OPENAI_API_KEY`); avoid echoing it in shells or logs.  
 * Review logs before sharing externally; redact repository paths if needed.
 
 ---

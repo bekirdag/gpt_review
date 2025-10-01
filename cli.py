@@ -63,7 +63,7 @@ from patch_validator import validate_patch
 log = get_logger(__name__)
 
 # Environment‑backed defaults (kept in sync with modules)
-DEFAULT_MODEL = os.getenv("GPT_REVIEW_MODEL", "gpt-5-pro")
+DEFAULT_MODEL = os.getenv("GPT_REVIEW_MODEL", "gpt-5-codex")
 DEFAULT_API_TIMEOUT = int(os.getenv("GPT_REVIEW_API_TIMEOUT", "120"))
 DEFAULT_ITERATIONS = int(os.getenv("GPT_REVIEW_ITERATIONS", "3"))
 DEFAULT_BRANCH_PREFIX = os.getenv("GPT_REVIEW_BRANCH_PREFIX", "iteration")

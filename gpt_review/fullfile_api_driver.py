@@ -7,7 +7,7 @@ GPT‑Review ▸ Full‑File API Driver (propose complete file replacements)
 
 Purpose
 -------
-For a given file (path + bytes), call an OpenAI‑compatible API and obtain a
+For a given file (path + bytes), call the GPT-Codex API and obtain a
 **single, decisive action**:
 
   • keep              – no change required
@@ -38,10 +38,10 @@ Integration points
     - Send failing logs; ask the model which files to replace; produce decisions.
 
 Environment & defaults
-----------------------
-* `OPENAI_API_KEY`              – required (unless a client is injected)
-* `OPENAI_BASE_URL`             – optional custom endpoint
-* `GPT_REVIEW_MODEL`            – default model name (e.g., "gpt-5-pro")
+-----------------------
+* `GPT_CODEX_API_KEY`           – required (unless a client is injected). Falls back to `OPENAI_API_KEY`.
+* `GPT_CODEX_BASE_URL`          – optional custom endpoint (aliases: `GPT_CODEX_API_BASE`, `OPENAI_BASE_URL`, `OPENAI_API_BASE`).
+* `GPT_REVIEW_MODEL`            – default model name (e.g., "gpt-5-codex")
 * `GPT_REVIEW_API_TIMEOUT`      – per‑request timeout (seconds; default 120)
 * `GPT_REVIEW_MAX_PROMPT_BYTES` – truncate text prompts with head+tail when larger (default 200_000)
 * `GPT_REVIEW_HEAD_TAIL_BYTES`  – bytes for head and tail slices (default 60_000)
@@ -61,17 +61,18 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Optional
 
 from gpt_review import get_logger
+from gpt_review.codex_client import (
+    create_client as create_codex_client,
+    resolve_api_key as resolve_codex_api_key,
+)
 
 log = get_logger(__name__)
 
 # --------------------------------------------------------------------------- #
 # Env‑backed defaults (aligned with orchestrator/api_driver)
 # --------------------------------------------------------------------------- #
-DEFAULT_MODEL = os.getenv("GPT_REVIEW_MODEL", "gpt-5-pro")
+DEFAULT_MODEL = os.getenv("GPT_REVIEW_MODEL", "gpt-5-codex")
 DEFAULT_API_TIMEOUT = int(os.getenv("GPT_REVIEW_API_TIMEOUT", "120"))
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
 MAX_PROMPT_BYTES = int(os.getenv("GPT_REVIEW_MAX_PROMPT_BYTES", str(200_000)))
 HEAD_TAIL_BYTES = int(os.getenv("GPT_REVIEW_HEAD_TAIL_BYTES", str(60_000)))
 
@@ -104,7 +105,7 @@ class FullFileDecision:
 
 
 # --------------------------------------------------------------------------- #
-# Tool schema (OpenAI "function") – forces a clear, machine‑readable reply
+# Tool schema – forces a clear, machine‑readable reply
 # --------------------------------------------------------------------------- #
 def _propose_fullfile_tool() -> Dict[str, Any]:
     return {
@@ -353,22 +354,19 @@ def _build_user_prompt(
 
 
 # --------------------------------------------------------------------------- #
-# OpenAI client (lazy)
+# GPT-Codex client (lazy)
 # --------------------------------------------------------------------------- #
-def _ensure_client(client: Any | None):
+def _ensure_client(client: Any | None, api_timeout: int):
     """
     Permit dependency injection for tests; instantiate official SDK otherwise.
     """
     if client is not None:
         return client
-    try:
-        from openai import OpenAI  # type: ignore
-    except Exception as exc:  # pragma: no cover
-        log.error("OpenAI client is not installed. `pip install openai`")
-        raise
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is not set.")
-    return OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY)
+    if not resolve_codex_api_key():
+        raise RuntimeError(
+            "GPT_CODEX_API_KEY is not set (legacy OPENAI_API_KEY is also checked)."
+        )
+    return create_codex_client(api_timeout)
 
 
 # --------------------------------------------------------------------------- #
@@ -404,18 +402,18 @@ def review_file_with_api(
     iteration : int
         1‑based iteration number (influences gates for docs/setup/examples).
     model : str
-        Model name for OpenAI‑compatible API.
+        Model name for the GPT-Codex API.
     api_timeout : int
         Per‑request timeout (seconds).
     client : Any
-        Optional already‑constructed OpenAI client (facilitates testing).
+        Optional already‑constructed GPT-Codex client (facilitates testing).
 
     Returns
     -------
     FullFileDecision
         The model's decision in a machine‑readable form.
     """
-    client = _ensure_client(client)
+    client = _ensure_client(client, api_timeout)
 
     # Path sanity (fail closed early)
     if not _is_safe_repo_rel_posix(path):
@@ -466,7 +464,7 @@ def review_file_with_api(
             tool_choice={"type": "function", "function": {"name": tool_name}},
         )
     except Exception as exc:
-        log.exception("OpenAI API request failed for %s: %s", path, exc)
+        log.exception("GPT-Codex API request failed for %s: %s", path, exc)
         # Fail closed: keep the file if the request fails
         return FullFileDecision(path=path, action="keep", reason=f"API error: {exc}")
 

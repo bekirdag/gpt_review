@@ -1,0 +1,49 @@
+erDiagram
+    sessions ||--o{ patches : "has"
+    sessions ||--o{ command_runs : "executes"
+    sessions ||--o{ logs : "produces"
+
+    sessions {
+        string id PK
+        string repo
+        string instructions_path
+        string mode
+        string model
+        string run_command
+        string status
+        int current_iteration
+        datetime created_at
+    }
+
+    patches {
+        int id PK
+        string session_id FK
+        string op
+        string file
+        string body
+        string body_b64
+        string target
+        string status
+        string commit_sha
+        datetime inserted_at
+    }
+
+    command_runs {
+        int id PK
+        string session_id FK
+        string command
+        int exit_code
+        float duration_seconds
+        string output_tail
+        bool triggered_by_patch
+        datetime created_at
+    }
+
+    logs {
+        int id PK
+        string session_id FK
+        string level
+        string message
+        json context
+        datetime created_at
+    }

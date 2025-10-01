@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Placeholder for upcoming events controller (CRUD)
+echo "Upcoming events controller files will be generated here based on context."

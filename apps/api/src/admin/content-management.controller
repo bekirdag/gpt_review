@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Placeholder for content management in admin (CRUD pages, sections)
+echo "Content management controller files will be generated here based on context."

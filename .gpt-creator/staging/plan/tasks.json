@@ -1,0 +1,15 @@
+{
+  "generated_at": "2025-09-30T20:56:07Z",
+  "tasks": [
+    {
+      "id": "align-openapi-sql",
+      "title": "Align OpenAPI schemas with SQL tables",
+      "details": "Create tables or update schemas for: commandresult, createsessionrequest, error, patcherror, patchpayload, patchresult, session"
+    },
+    {
+      "id": "document-sql-gap",
+      "title": "Document SQL tables missing from OpenAPI",
+      "details": "Expose or document SQL tables not covered by API: command_runs, logs, patches, sessions"
+    }
+  ]
+}

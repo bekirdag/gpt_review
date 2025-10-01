@@ -6,7 +6,7 @@
 #
 # Changes in this revision
 # ------------------------
-# • Add API mode dependency: `openai` (official SDK).
+# • Add API mode dependency: `gpt-5-codex-client` (Codex SDK).
 # • Keep Selenium deps for browser mode.
 # • Consolidate lint/test config and packaging notes.
 # • Point console script to `gpt_review.cli:main` (new CLI).
@@ -35,7 +35,7 @@ authors = [
   { name = "GPT‑Review Team", email = "opensource@gpt-review.dev" }
 ]
 
-keywords = ["chatgpt", "selenium", "openai", "code-review", "automation", "dev-tool"]
+keywords = ["chatgpt", "selenium", "gpt-codex", "code-review", "automation", "dev-tool"]
 
 classifiers = [
   "Programming Language :: Python :: 3",
@@ -53,8 +53,9 @@ dependencies = [
   "selenium>=4.21.0",
   "webdriver-manager>=4.0.1",
 
-  # OpenAI API client (API mode)
-  "openai>=1.40.0",
+  # GPT-Codex API client (API mode)
+  # GPT-Codex client adapter expects the corresponding SDK to be importable.
+  "gpt-5-codex-client>=1.0.0",
 
   # JSON‑Schema validation
   "jsonschema>=4.22.0",

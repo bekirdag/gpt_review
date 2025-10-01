@@ -64,11 +64,12 @@ Strictness
 CLI
 ---
     python -m gpt_review.orchestrator instructions.txt <repo-or-url> \
-        --model gpt-5-pro --remote origin --api-timeout 120 \
+        --model gpt-5-codex --remote origin --api-timeout 120 \
         --max-error-rounds 6
 
 Environment:
-  OPENAI_API_KEY (required), OPENAI_BASE_URL (optional)
+  GPT_CODEX_API_KEY (required; falls back to OPENAI_API_KEY)
+  GPT_CODEX_BASE_URL (optional; honours GPT_CODEX_API_BASE / OPENAI_BASE_URL / OPENAI_API_BASE)
   ALWAYS_SEND_FULL_FILE=1 (default) → always send full file contents to the API
   GPT_REVIEW_CREATE_PR=1           → attempt to open a GitHub PR at the end
   GITHUB_TOKEN / GH_TOKEN          → token for 'gh' CLI or API auth
@@ -89,6 +90,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from gpt_review import get_logger
+from gpt_review.codex_client import (
+    create_client as create_codex_client,
+    resolve_api_key as resolve_codex_api_key,
+)
 from gpt_review.fs_utils import (
     checkout_branch,
     classify_paths,
@@ -111,11 +116,7 @@ log = get_logger(__name__)
 # =============================================================================
 # Config (env‑overridable)
 # =============================================================================
-
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")  # optional
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")    # required at runtime
-
-DEFAULT_MODEL = os.getenv("GPT_REVIEW_MODEL", "gpt-5-pro")
+DEFAULT_MODEL = os.getenv("GPT_REVIEW_MODEL", "gpt-5-codex")
 DEFAULT_API_TIMEOUT = int(os.getenv("GPT_REVIEW_API_TIMEOUT", "120"))
 
 MAX_PROMPT_BYTES = int(os.getenv("GPT_REVIEW_MAX_PROMPT_BYTES", str(200_000)))
@@ -126,28 +127,19 @@ MAX_ERROR_ROUNDS = int(os.getenv("GPT_REVIEW_MAX_ERROR_ROUNDS", "6"))
 ALWAYS_SEND_FULL_FILE = os.getenv("ALWAYS_SEND_FULL_FILE", "1").strip().lower() not in {"0", "false", "no", ""}
 
 # =============================================================================
-# OpenAI client shim (local; avoids cross‑module tight coupling)
+# GPT-Codex client shim (local; avoids cross‑module tight coupling)
 # =============================================================================
 
-def _ensure_openai_client(api_timeout: int):
-    """
-    Return an OpenAI client instance. Raises on missing key.
-
-    Type matches the official `openai>=1.0.0` SDK.
-    """
-    if not OPENAI_API_KEY:
+def _ensure_codex_client(api_timeout: int):
+    """Return a GPT-Codex client instance. Raises on missing key."""
+    if not resolve_codex_api_key():
         raise RuntimeError(
-            "OPENAI_API_KEY is not set. Export it before running the orchestrator."
+            "GPT_CODEX_API_KEY is not set. Export it before running the orchestrator."
         )
-    try:
-        from openai import OpenAI  # type: ignore
-    except Exception as exc:  # pragma: no cover
-        raise RuntimeError("The 'openai' package is not installed. pip install openai") from exc
-    return OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY)
-
+    return create_codex_client(api_timeout)
 
 # =============================================================================
-# Tool schemas (OpenAI "functions")
+# Tool schemas (GPT-Codex functions)
 # =============================================================================
 
 def tool_propose_full_file() -> Dict[str, Any]:
@@ -1051,7 +1043,7 @@ def run_iterations(
     """
     High‑level orchestration entrypoint (blueprints + plan‑first + 3 iterations + error fix + PR).
     """
-    client = _ensure_openai_client(api_timeout)
+    client = _ensure_codex_client(api_timeout)
     instr = instructions_path.read_text(encoding="utf-8").strip()
 
     # Blueprints first (generate if missing)
@@ -1251,7 +1243,7 @@ def _cli() -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="gpt-review-iterate")
     p.add_argument("instructions", help="Path to plain‑text project instructions.")
     p.add_argument("repo", help="Path to the Git repository OR a Git URL.")
-    p.add_argument("--model", default=DEFAULT_MODEL, help="OpenAI model id (default: %(default)s)")
+    p.add_argument("--model", default=DEFAULT_MODEL, help="GPT-Codex model id (default: %(default)s)")
     p.add_argument("--api-timeout", type=int, default=DEFAULT_API_TIMEOUT, help="HTTP timeout (seconds).")
     p.add_argument("--remote", default=os.getenv("GPT_REVIEW_REMOTE", "origin"), help="Git remote name to push.")
     p.add_argument(

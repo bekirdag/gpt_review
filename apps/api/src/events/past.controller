@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Placeholder for past events controller (CRUD, history)
+echo "Past events controller files will be generated here based on context."

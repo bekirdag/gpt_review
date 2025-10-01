@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Placeholder for login logic (e.g., JWT strategy, login)
+echo "Login related files will be generated here based on context."

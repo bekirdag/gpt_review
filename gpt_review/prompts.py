@@ -61,9 +61,9 @@ log = get_logger(__name__)
 # =============================================================================
 def get_submit_patch_tool() -> dict:
     """
-    Return the OpenAI tool/function schema for `submit_patch`.
+    Return the GPT-Codex tool/function schema for `submit_patch`.
 
-    We reuse the canonical definition shipped with the OpenAI client wrapper.
+    We reuse the canonical definition shipped with the Codex client wrapper.
     If importing that function fails (e.g., during refactors), we fall back to
     a local copy to avoid tight coupling.
     """

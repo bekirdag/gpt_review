@@ -21,6 +21,9 @@
 selenium>=4.21.0
 webdriver-manager>=4.0.1   # ChromeType import lives under webdriver_manager.core.utils in 4.x
 
+# GPT-Codex API client (API mode)
+gpt-5-codex-client>=1.0.0
+
 # JSON‑Schema validation
 jsonschema>=4.22.0
 

@@ -1,0 +1,19 @@
+flowchart TD
+    A[User instructions + repo] --> B{CLI entry}
+    B -->|iterate| C[Multi-iteration orchestrator]
+    B -->|api| D[API driver]
+    C --> E[Blueprint preflight]
+    C --> F[Iteration branches + plan artifacts]
+    D --> E
+    E --> G[GPT-Codex client / Browser transport]
+    G --> H[Language model]
+    H --> G
+    G --> I[Patch validator]
+    I --> J[apply_patch.py]
+    J --> K[Git commit]
+    K --> L[Run command]
+    L -->|success| M[Session completes]
+    L -->|failure| H
+    C --> N[Optional push/PR]
+    B --> O[Wrapper logging]
+    O --> P[Rotating logs]

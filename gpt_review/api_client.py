@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
-GPT‑Review ▸ OpenAI API Client Wrapper (Strict Tools + Plan‑First Support)
+GPT‑Review ▸ GPT-Codex Client Wrapper (Strict Tools + Plan‑First Support)
 ===============================================================================
 
 Purpose
 -------
-A small, dependency‑light wrapper around the OpenAI Chat Completions API that
-the orchestrator (or other drivers) can use to:
+A small, dependency‑light wrapper around the GPT-Codex chat completions client
+that the orchestrator (or other drivers) can use to:
 
   • keep a short rolling history (token‑aware),
   • force a structured **tool call** returning a *complete file* patch that
@@ -28,8 +28,9 @@ Design notes
 
 Environment
 -----------
-OPENAI_API_KEY           – required
-OPENAI_BASE_URL|API_BASE – optional (OpenAI‑compatible base)
+GPT_CODEX_API_KEY        – required (falls back to legacy OPENAI_API_KEY)
+GPT_CODEX_BASE_URL       – optional custom endpoint (aliases: GPT_CODEX_API_BASE,
+                           OPENAI_BASE_URL, OPENAI_API_BASE)
 GPT_REVIEW_CTX_TURNS     – max assistant/tool “turn pairs” to retain (default 6)
 
 Compatibility
@@ -41,10 +42,10 @@ This module preserves the legacy helper functions:
 
 and an object interface:
 
-    OpenAIClient(...).ask_json_array(...)
-    OpenAIClient(...).call_submit_patch(...)
-    OpenAIClient(...).call_propose_review_plan(...)
-    OpenAIClient(...).call_propose_error_fixes(...)
+    CodexClient(...).ask_json_array(...)
+    CodexClient(...).call_submit_patch(...)
+    CodexClient(...).call_propose_review_plan(...)
+    CodexClient(...).call_propose_error_fixes(...)
 
 Logging
 -------
@@ -58,6 +59,11 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from gpt_review import get_logger
+from gpt_review.codex_client import (
+    create_client as create_codex_client,
+    resolve_base_url as resolve_codex_base_url,
+    resolve_api_key as resolve_codex_api_key,
+)
 
 log = get_logger(__name__)
 
@@ -65,8 +71,6 @@ log = get_logger(__name__)
 # Tunables
 # ─────────────────────────────────────────────────────────────────────────────
 DEFAULT_CTX_TURNS = int(os.getenv("GPT_REVIEW_CTX_TURNS", "6"))
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -74,7 +78,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # ─────────────────────────────────────────────────────────────────────────────
 def _submit_patch_tool() -> Dict[str, Any]:
     """
-    OpenAI tool/function schema for `submit_patch`.
+    Tool/function schema for `submit_patch`.
 
     Enforces complete file bodies for create/update, supports delete/rename/chmod,
     and constrains enums to match the canonical JSON‑Schema.
@@ -265,14 +269,14 @@ def _extract_json_array(text: str) -> List[Any]:
 # Client
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
-class OpenAIClient:
+class CodexClient:
     """
-    Thin wrapper around the OpenAI Chat Completions API.
+    Thin wrapper around the GPT-Codex chat completions API.
 
     Attributes
     ----------
     model : str
-        Model name (e.g., "gpt-5-pro").
+        Model name (e.g., "gpt-5-codex").
     timeout_s : int
         Per‑request timeout in seconds.
     max_turn_pairs : int
@@ -293,29 +297,24 @@ class OpenAIClient:
     def __post_init__(self) -> None:
         self.messages = [{"role": "system", "content": _system_prompt()}]
         log.info(
-            "OpenAI client initialised | model=%s | timeout=%ss | base=%s",
+            "GPT-Codex client initialised | model=%s | timeout=%ss | base=%s",
             self.model,
             self.timeout_s,
-            OPENAI_BASE_URL or "<default>",
+            resolve_codex_base_url() or "<default>",
         )
 
     # --- SDK bootstrap ----------------------------------------------------- #
     def _ensure_sdk(self) -> Any:
-        """
-        Import and instantiate the official OpenAI client on first use.
-        """
+        """Import and instantiate the GPT-Codex SDK on first use."""
         if self._sdk is not None:
             return self._sdk
-        if not OPENAI_API_KEY:
-            raise RuntimeError("OPENAI_API_KEY is not set in the environment.")
+        api_key = resolve_codex_api_key()
+        if not api_key:
+            raise RuntimeError(
+                "GPT_CODEX_API_KEY is not set in the environment (legacy OPENAI_API_KEY is also checked)."
+            )
 
-        try:
-            from openai import OpenAI  # type: ignore
-        except Exception as exc:  # pragma: no cover
-            log.error("OpenAI SDK not installed. Run: pip install 'openai>=1.0.0'")
-            raise
-
-        self._sdk = OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY)
+        self._sdk = create_codex_client(self.timeout_s)
         return self._sdk
 
     # --- Conversation helpers --------------------------------------------- #
@@ -349,7 +348,7 @@ class OpenAIClient:
                 timeout=self.timeout_s,  # type: ignore[call-arg]
             )
         except Exception as exc:
-            log.exception("OpenAI request (tool=%s) failed: %s", tool_name, exc)
+            log.exception("GPT-Codex request (tool=%s) failed: %s", tool_name, exc)
             raise
 
         try:
@@ -413,7 +412,7 @@ class OpenAIClient:
                 timeout=self.timeout_s,  # type: ignore[call-arg]
             )
         except Exception as exc:
-            log.exception("OpenAI request for JSON array failed: %s", exc)
+            log.exception("GPT-Codex request for JSON array failed: %s", exc)
             raise
 
         try:
@@ -473,7 +472,7 @@ class OpenAIClient:
 # ─────────────────────────────────────────────────────────────────────────────
 # Public helpers (backward‑compatible)
 # ─────────────────────────────────────────────────────────────────────────────
-def strict_json_array(client: OpenAIClient, prompt: str) -> List[dict]:
+def strict_json_array(client: CodexClient, prompt: str) -> List[dict]:
     """
     Convenience wrapper that delegates to `client.ask_json_array`.
     """
@@ -481,7 +480,7 @@ def strict_json_array(client: OpenAIClient, prompt: str) -> List[dict]:
 
 
 def submit_patch_call(
-    client: OpenAIClient,
+    client: CodexClient,
     prompt: str,
     *,
     rel_path: str,
@@ -534,7 +533,7 @@ def submit_patch_call(
 
 
 __all__ = [
-    "OpenAIClient",
+    "CodexClient",
     "strict_json_array",
     "submit_patch_call",
 ]

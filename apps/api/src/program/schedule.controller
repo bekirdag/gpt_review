@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Placeholder for Program Schedule controller (CRUD, filtering, etc.)
+echo "Schedule controller files will be generated here based on context."

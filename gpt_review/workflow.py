@@ -84,7 +84,7 @@ log = get_logger(__name__)
 # -----------------------------------------------------------------------------
 # Defaults & environment toggles
 # -----------------------------------------------------------------------------
-DEFAULT_MODEL = os.getenv("GPT_REVIEW_MODEL", "gpt-5-pro")
+DEFAULT_MODEL = os.getenv("GPT_REVIEW_MODEL", "gpt-5-codex")
 DEFAULT_API_TIMEOUT = int(os.getenv("GPT_REVIEW_API_TIMEOUT", "120"))
 DEFAULT_ITERATIONS = 3
 DEFAULT_BRANCH_PREFIX = os.getenv("GPT_REVIEW_BRANCH_PREFIX", "iteration")
@@ -328,7 +328,7 @@ class ReviewWorkflow:
         self.instructions = self._read_instructions(cfg.instructions_path)
 
         # Late‑bound components
-        self._client = None  # type: ignore[assignment]  # OpenAIClient
+        self._client = None  # type: ignore[assignment]  # CodexClient
         self._scan = None    # optional: file_scanner facade
 
         # Bookkeeping
@@ -353,16 +353,16 @@ class ReviewWorkflow:
 
     def _init_clients(self) -> None:
         """
-        Connect the OpenAI client wrapper (tool‑forced).  Keep imports local
+        Connect the GPT-Codex client wrapper (tool‑forced). Keep imports local
         so other entry points don't pay this cost unless needed.
         """
         try:
-            from gpt_review.api_client import OpenAIClient
+            from gpt_review.api_client import CodexClient
         except Exception as exc:
             log.exception("Failed to import API client: %s", exc)
             raise SystemExit(1) from exc
 
-        self._client = OpenAIClient(
+        self._client = CodexClient(
             model=self.cfg.model,
             timeout_s=self.cfg.api_timeout,
         )
@@ -658,7 +658,7 @@ class ReviewWorkflow:
         )
 
     # ────────────────────────────────────────────────────────────────────── #
-    # OpenAI interactions
+    # GPT-Codex interactions
     # ────────────────────────────────────────────────────────────────────── #
     def _require_api(self) -> None:
         if self._client is None:

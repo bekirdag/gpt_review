@@ -24,7 +24,7 @@
 #   --no-log               Do not write a wrapper log (console only)
 #   --log-file PATH        Write wrapper + tool output to PATH (implies tee)
 #   --api                  Convenience: use API driver (equivalent to --mode api)
-#   --model NAME           Convenience: model for API mode (e.g. gpt-5-pro)
+#   --model NAME           Convenience: model for API mode (e.g. gpt-5-codex)
 #
 # Notes
 #   - You can also pass --mode/--model directly after the positional args; this
@@ -36,9 +36,9 @@
 #       GPT_REVIEW_CHUNK_SIZE, GPT_REVIEW_COMMAND_TIMEOUT, GPT_REVIEW_LOG_DIR,
 #       CHROME_BIN
 #     API mode adds:
-#       OPENAI_API_KEY, OPENAI_BASE_URL (or OPENAI_API_BASE), GPT_REVIEW_MODEL,
-#       GPT_REVIEW_CTX_TURNS, GPT_REVIEW_LOG_TAIL_CHARS, GPT_REVIEW_API_TIMEOUT,
-#       GPT_REVIEW_MODE=api (if you want API mode by default)
+#       GPT_CODEX_API_KEY (legacy OPENAI_API_KEY), GPT_CODEX_BASE_URL (or GPT_CODEX_API_BASE / OPENAI_BASE_URL / OPENAI_API_BASE),
+#       GPT_REVIEW_MODEL, GPT_REVIEW_CTX_TURNS, GPT_REVIEW_LOG_TAIL_CHARS,
+#       GPT_REVIEW_API_TIMEOUT, GPT_REVIEW_MODE=api (if you want API mode by default)
 ###############################################################################
 
 set -euo pipefail
@@ -88,7 +88,7 @@ Wrapper options (before positional args):
   --no-log               Do not write a wrapper log (console only)
   --log-file PATH        Write output to PATH (implies tee)
   --api                  Use API mode (no browser) [same as --mode api]
-  --model NAME           API model name (e.g. gpt-5-pro)
+  --model NAME           API model name (e.g. gpt-5-codex)
 
 Positional arguments:
   instructions.txt       Plain-text instructions shown to the assistant
@@ -115,9 +115,10 @@ Environment (current -> default):
   GPT_REVIEW_MODE             = ${GPT_REVIEW_MODE:-<unset>}       (default CLI mode: browser)
 
 API mode extras:
-  OPENAI_API_KEY              = $( [[ -n "${OPENAI_API_KEY:-}" ]] && echo "<set>" || echo "<unset>" )
-  OPENAI_BASE_URL             = ${OPENAI_BASE_URL:-${OPENAI_API_BASE:-<unset>}}
-  GPT_REVIEW_MODEL            = ${GPT_REVIEW_MODEL:-gpt-5-pro}
+  GPT_CODEX_API_KEY           = $( [[ -n "${GPT_CODEX_API_KEY:-${OPENAI_API_KEY:-}}" ]] && echo "<set>" || echo "<unset>" )
+  GPT_CODEX_BASE_URL          = ${GPT_CODEX_BASE_URL:-${GPT_CODEX_API_BASE:-${OPENAI_BASE_URL:-${OPENAI_API_BASE:-<unset>}}}}
+  GPT_CODEX_ORG_ID            = ${GPT_CODEX_ORG_ID:-${GPT_CODEX_ORGANIZATION:-${OPENAI_ORG_ID:-${OPENAI_ORGANIZATION:-<unset>}}}}
+  GPT_REVIEW_MODEL            = ${GPT_REVIEW_MODEL:-gpt-5-codex}
   GPT_REVIEW_CTX_TURNS        = ${GPT_REVIEW_CTX_TURNS:-6}
   GPT_REVIEW_LOG_TAIL_CHARS   = ${GPT_REVIEW_LOG_TAIL_CHARS:-20000}
   GPT_REVIEW_API_TIMEOUT      = ${GPT_REVIEW_API_TIMEOUT:-120}
@@ -125,7 +126,7 @@ API mode extras:
 Examples:
   $(basename "$0") docs/example_instructions.txt  ~/proj  --cmd "pytest -q" --auto
   $(basename "$0") --load-dotenv --env-dump instructions.txt /repo
-  $(basename "$0") instructions.txt /repo --api --model gpt-5-pro --cmd "npm test --silent" --auto
+  $(basename "$0") instructions.txt /repo --api --model gpt-5-codex --cmd "npm test --silent" --auto
 EOF
 }
 
@@ -297,7 +298,7 @@ if [[ "$MODE_EFFECTIVE" == "api" ]]; then
   elif [[ -n "$WRAP_MODEL" ]]; then
     MODEL_EFFECTIVE="$WRAP_MODEL"
   else
-    MODEL_EFFECTIVE="${GPT_REVIEW_MODEL:-gpt-5-pro}"
+    MODEL_EFFECTIVE="${GPT_REVIEW_MODEL:-gpt-5-codex}"
   fi
 fi
 
@@ -325,9 +326,9 @@ CMD TIMEOUT    : ${GPT_REVIEW_COMMAND_TIMEOUT:-300} (s)
 LOG DIR        : ${GPT_REVIEW_LOG_DIR:-logs}
 CHROME BIN     : ${CHROME_BIN:-<auto>}
 MODE           : ${MODE_EFFECTIVE}
-OPENAI KEY     : $( [[ -n "${OPENAI_API_KEY:-}" ]] && echo "<set>" || echo "<unset>" )
-OPENAI URL     : ${OPENAI_BASE_URL:-${OPENAI_API_BASE:-<unset>}}
-API MODEL      : ${MODEL_EFFECTIVE:-${GPT_REVIEW_MODEL:-gpt-5-pro}}
+CODEX KEY      : $( [[ -n "${GPT_CODEX_API_KEY:-${OPENAI_API_KEY:-}}" ]] && echo "<set>" || echo "<unset>" )
+CODEX URL      : ${GPT_CODEX_BASE_URL:-${GPT_CODEX_API_BASE:-${OPENAI_BASE_URL:-${OPENAI_API_BASE:-<unset>}}}}
+API MODEL      : ${MODEL_EFFECTIVE:-${GPT_REVIEW_MODEL:-gpt-5-codex}}
 EOT
 fi
 
@@ -345,12 +346,23 @@ if [[ $WRAP_LOG -eq 1 ]]; then
 fi
 
 # -------------------------- API preflight warnings ------------------------- #
-# Respect both OPENAI_BASE_URL and alias OPENAI_API_BASE
+# Normalise Codex/OpenAI base URL aliases (supporting legacy env names)
+if [[ -z "${GPT_CODEX_BASE_URL:-}" && -n "${GPT_CODEX_API_BASE:-}" ]]; then
+  export GPT_CODEX_BASE_URL="${GPT_CODEX_API_BASE}"
+fi
+if [[ -z "${GPT_CODEX_BASE_URL:-}" && -n "${OPENAI_BASE_URL:-${OPENAI_API_BASE:-}}" ]]; then
+  export GPT_CODEX_BASE_URL="${OPENAI_BASE_URL:-${OPENAI_API_BASE:-}}"
+fi
+# Preserve backwards compatibility for tooling that still reads OPENAI_BASE_URL
+if [[ -z "${OPENAI_BASE_URL:-}" && -n "${GPT_CODEX_BASE_URL:-}" ]]; then
+  export OPENAI_BASE_URL="${GPT_CODEX_BASE_URL}"
+fi
 if [[ -z "${OPENAI_BASE_URL:-}" && -n "${OPENAI_API_BASE:-}" ]]; then
   export OPENAI_BASE_URL="${OPENAI_API_BASE}"
 fi
-if [[ "$MODE_EFFECTIVE" == "api" && -z "${OPENAI_API_KEY:-}" ]]; then
-  warn "API mode selected but OPENAI_API_KEY is not set. The run will likely fail."
+
+if [[ "$MODE_EFFECTIVE" == "api" && -z "${GPT_CODEX_API_KEY:-${OPENAI_API_KEY:-}}" ]]; then
+  warn "API mode selected but GPT_CODEX_API_KEY (or legacy OPENAI_API_KEY) is not set. The run will likely fail."
 fi
 
 # ------------------------------ runner resolution -------------------------- #

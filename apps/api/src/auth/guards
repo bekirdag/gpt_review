@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Placeholder for guards (e.g., JWT Auth Guard, Role Guards)
+echo "Guard related files will be generated here based on context."

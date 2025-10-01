@@ -1,0 +1,98 @@
+# docker-compose.yml template for gpt-creator stack (API, web, admin, db, proxy)
+version: "3.9"
+services:
+  db:
+    image: mysql:8.0
+    container_name: yoga_db
+    mem_limit: 1536m
+    mem_reservation: 1g
+    environment:
+      MYSQL_ROOT_PASSWORD: aWfLNIJbxsPE4oE1QzWf7Ilr1VtTQPWi
+      MYSQL_ROOT_HOST: '%'
+      MYSQL_DATABASE: gpt_review_db
+      MYSQL_USER: gc_gpt_review_user
+      MYSQL_PASSWORD: r8QzDoQFdSUOmvhlW1b0dWlnRcaajAiH
+    ports:
+      - "3307:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-paWfLNIJbxsPE4oE1QzWf7Ilr1VtTQPWi"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - db_data:/var/lib/mysql
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    container_name: yoga_api
+    mem_limit: 1024m
+    mem_reservation: 512m
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: mysql://gc_gpt_review_user:r8QzDoQFdSUOmvhlW1b0dWlnRcaajAiH@db:3306/gpt_review_db
+      PORT: 3000
+    command: sh -c "npm install && npm run start:dev"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ../apps/api:/workspace/apps/api
+      - api_node_modules:/workspace/apps/api/node_modules
+
+  web:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.web
+    container_name: yoga_web
+    mem_limit: 768m
+    mem_reservation: 384m
+    environment:
+      NODE_ENV: development
+      VITE_API_BASE: ${VITE_API_BASE:-http://localhost:3000/api/v1}
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    ports:
+      - "5173:5173"
+    volumes:
+      - ../apps/web:/workspace/apps/web
+      - web_node_modules:/workspace/apps/web/node_modules
+
+  admin:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.admin
+    container_name: yoga_admin
+    mem_limit: 768m
+    mem_reservation: 384m
+    environment:
+      NODE_ENV: development
+      VITE_API_BASE: ${VITE_API_BASE:-http://localhost:3000/api/v1}
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    ports:
+      - "5174:5173"
+    volumes:
+      - ../apps/admin:/workspace/apps/admin
+      - admin_node_modules:/workspace/apps/admin/node_modules
+
+  proxy:
+    image: nginx:alpine
+    container_name: yoga_proxy
+    mem_limit: 256m
+    mem_reservation: 128m
+    depends_on:
+      - web
+      - admin
+      - api
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+
+volumes:
+  db_data: {}
+  api_node_modules: {}
+  web_node_modules: {}
+  admin_node_modules: {}

@@ -1,0 +1,51 @@
+{
+  "project_root": "/Users/bekirdag/Documents/apps/gpt_review",
+  "generated_at": "2025-09-30T20:56:07Z",
+  "artifacts": [
+    {
+      "type": "sds",
+      "confidence": 0.92,
+      "path": "/Users/bekirdag/Documents/apps/gpt_review/.gpt-review/blueprints/SDS.md"
+    },
+    {
+      "type": "pdr",
+      "confidence": 0.95,
+      "path": "/Users/bekirdag/Documents/apps/gpt_review/my-project/docs/PDR.md"
+    },
+    {
+      "type": "jira",
+      "confidence": 0.88,
+      "path": "/Users/bekirdag/Documents/apps/gpt_review/my-project/docs/Jira Backlog.md"
+    },
+    {
+      "type": "sds",
+      "confidence": 0.92,
+      "path": "/Users/bekirdag/Documents/apps/gpt_review/my-project/docs/SDS.md"
+    },
+    {
+      "type": "openapi",
+      "confidence": 0.94,
+      "path": "/Users/bekirdag/Documents/apps/gpt_review/my-project/openapi/openapi.yaml"
+    },
+    {
+      "type": "sql",
+      "confidence": 0.65,
+      "path": "/Users/bekirdag/Documents/apps/gpt_review/my-project/db/seed.sql"
+    },
+    {
+      "type": "sql",
+      "confidence": 0.8,
+      "path": "/Users/bekirdag/Documents/apps/gpt_review/my-project/db/schema.sql"
+    },
+    {
+      "type": "mermaid",
+      "confidence": 0.7,
+      "path": "/Users/bekirdag/Documents/apps/gpt_review/my-project/mermaid/system-overview.mmd"
+    },
+    {
+      "type": "mermaid",
+      "confidence": 0.7,
+      "path": "/Users/bekirdag/Documents/apps/gpt_review/my-project/mermaid/data-model.mmd"
+    }
+  ]
+}

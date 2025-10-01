@@ -1,0 +1,10 @@
+type	confidence	path
+sds	0.92	/Users/bekirdag/Documents/apps/gpt_review/.gpt-review/blueprints/SDS.md
+pdr	0.95	/Users/bekirdag/Documents/apps/gpt_review/my-project/docs/PDR.md
+jira	0.88	/Users/bekirdag/Documents/apps/gpt_review/my-project/docs/Jira Backlog.md
+sds	0.92	/Users/bekirdag/Documents/apps/gpt_review/my-project/docs/SDS.md
+openapi	0.94	/Users/bekirdag/Documents/apps/gpt_review/my-project/openapi/openapi.yaml
+sql	0.65	/Users/bekirdag/Documents/apps/gpt_review/my-project/db/seed.sql
+sql	0.80	/Users/bekirdag/Documents/apps/gpt_review/my-project/db/schema.sql
+mermaid	0.70	/Users/bekirdag/Documents/apps/gpt_review/my-project/mermaid/system-overview.mmd
+mermaid	0.70	/Users/bekirdag/Documents/apps/gpt_review/my-project/mermaid/data-model.mmd

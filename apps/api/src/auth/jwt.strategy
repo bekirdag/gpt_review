@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Placeholder for JWT strategy logic (for authentication)
+echo "JWT strategy files will be generated here based on context."

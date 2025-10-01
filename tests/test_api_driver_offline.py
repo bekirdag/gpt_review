@@ -6,7 +6,7 @@ Offline unit test for the API driver (`gpt_review.api_driver`).
 Goals
 -----
 • Exercise the end-to-end control flow in API mode **without** network access.
-• Inject a fake OpenAI client that always returns a `submit_patch` tool call
+• Inject a fake GPT-Codex client that always returns a `submit_patch` tool call
   (first invalid, then valid in the error-flow test) so we can verify the loop.
 • Stub `subprocess.run` to:
     - emulate `apply_patch.py` success (returncode=0),
@@ -74,9 +74,9 @@ class _FakeChat:
         self.completions = _FakeCompletions(responses)
 
 
-class FakeOpenAIClient:
+class FakeCodexClient:
     """
-    Minimal stand-in for the modern OpenAI client:
+    Minimal stand-in for the GPT-Codex client:
         client.chat.completions.create(...)
     """
 
@@ -155,7 +155,7 @@ def test_api_driver_completes_with_single_completed_patch(tmp_path, stub_subproc
         "status": "completed",
     }
 
-    fake_client = FakeOpenAIClient(responses=[patch_payload])
+    fake_client = FakeCodexClient(responses=[patch_payload])
 
     # Act
     from gpt_review.api_driver import run as api_run
@@ -207,7 +207,7 @@ def test_api_driver_handles_validation_error_then_nudge(tmp_path, stub_subproces
         "status": "completed",
     }
 
-    fake_client = FakeOpenAIClient(responses=[bad_payload, good_payload])
+    fake_client = FakeCodexClient(responses=[bad_payload, good_payload])
 
     from gpt_review.api_driver import run as api_run
 

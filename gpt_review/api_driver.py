@@ -7,7 +7,7 @@ GPT‑Review ▸ API Driver (no browser)
 
 Purpose
 -------
-Drive the same "edit → run → fix" loop using an OpenAI‑compatible API without
+Drive the same "edit → run → fix" loop using the GPT-Codex API without
 automating a browser. The assistant returns patches via a **function call**
 named `submit_patch`. We validate and apply that patch locally, optionally run
 a shell command (tests/linter), and send the outcome back as the tool's result.
@@ -48,7 +48,7 @@ Design notes
 
 • **Dependency‑light**:
   - Accepts an injected `client` (used by offline tests).
-  - Otherwise, instantiates `OpenAI` using OPENAI_API_KEY / OPENAI_BASE_URL.
+  - Otherwise, instantiates the GPT-Codex client using GPT_CODEX_API_KEY.
 
 Public API
 ----------
@@ -65,8 +65,8 @@ run(
 
 Environment
 -----------
-OPENAI_API_KEY                         – required at runtime (unless client injected)
-OPENAI_BASE_URL                        – optional gateway base URL
+GPT_CODEX_API_KEY                      – required at runtime (falls back to OPENAI_API_KEY)
+GPT_CODEX_BASE_URL                     – optional gateway base URL (aliases supported)
 
 GPT_REVIEW_CTX_TURNS                   – rolling turn pairs (default: 6)
 GPT_REVIEW_LOG_TAIL_CHARS              – tail of logs to send (default: 20000)
@@ -89,6 +89,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from gpt_review import get_logger
+from gpt_review.codex_client import (
+    create_client as create_codex_client,
+    resolve_api_key as resolve_codex_api_key,
+)
 from patch_validator import validate_patch, is_safe_repo_rel_posix
 
 # Canonical blueprint helpers (single source of truth for names/paths/summary)
@@ -108,9 +112,6 @@ log = get_logger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 DEFAULT_CTX_TURNS = int(os.getenv("GPT_REVIEW_CTX_TURNS", "6"))
 LOG_TAIL_CHARS = int(os.getenv("GPT_REVIEW_LOG_TAIL_CHARS", "20000"))
-
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")  # optional
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")    # required at runtime if client not injected
 
 INCLUDE_BLUEPRINTS = os.getenv("GPT_REVIEW_INCLUDE_BLUEPRINTS", "1").strip().lower() in {
     "1", "true", "yes", "on", "y", "t"
@@ -188,9 +189,7 @@ def _snippet(s: str, limit: int = 240) -> str:
 # Tool schema – mirrors gpt_review/schema.json (kept in sync manually)
 # ─────────────────────────────────────────────────────────────────────────────
 def _submit_patch_tool() -> Dict[str, Any]:
-    """
-    OpenAI tool/function schema for `submit_patch`.
-    """
+    """Tool/function schema for `submit_patch`."""
     return {
         "type": "function",
         "function": {
@@ -319,26 +318,23 @@ def _apply_patch(repo: Path, patch: Dict[str, Any]) -> ApplyResult:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OpenAI client
+# GPT-Codex client
 # ─────────────────────────────────────────────────────────────────────────────
 def _ensure_client(client: Any | None, api_timeout: int):
     """
     Return a usable client. If *client* is provided (e.g., tests), use it.
-    Otherwise instantiate the official SDK client.
+    Otherwise instantiate the GPT-Codex SDK client.
     """
     if client is not None:
         return client
-    try:
-        from openai import OpenAI  # type: ignore
-    except Exception as exc:  # pragma: no cover
-        log.error("OpenAI client is not installed. pip install openai")
-        raise
 
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is not set in the environment.")
+    if not resolve_codex_api_key():
+        raise RuntimeError(
+            "GPT_CODEX_API_KEY is not set in the environment (legacy OPENAI_API_KEY is also checked)."
+        )
 
-    # 'timeout' can be set per-call; here we keep the client simple.
-    return OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY)
+    # 'timeout' can be set per-call; the adapter injects it when the SDK allows it.
+    return create_codex_client(api_timeout)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -617,7 +613,7 @@ def run(
                 timeout=api_timeout,  # type: ignore[call-arg]
             )
         except Exception as exc:
-            log.exception("OpenAI API request failed: %s", exc)
+            log.exception("GPT-Codex API request failed: %s", exc)
             raise SystemExit(1) from exc
 
         # Extract the first tool call (we force tool_choice, so it should exist)

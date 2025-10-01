@@ -316,11 +316,11 @@ Next steps:
   2) Run a review session (browser mode):
        software_review.sh instructions.txt /path/to/repo --cmd "pytest -q" --auto
      Or API mode (no browser):
-       software_review.sh instructions.txt /path/to/repo --api --model gpt-5-pro --cmd "pytest -q" --auto
+      software_review.sh instructions.txt /path/to/repo --api --model gpt-5-codex --cmd "pytest -q" --auto
 
 Tips:
   • Configure environment in a ./.env file (see .env.example in the repo).
-  • API mode requires OPENAI_API_KEY and (optionally) OPENAI_BASE_URL.
+  • API mode requires GPT_CODEX_API_KEY (legacy OPENAI_API_KEY) and, optionally, GPT_CODEX_BASE_URL.
 
 EOT
 

@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Placeholder for user management controller (CRUD, admin access)
+echo "User management controller files will be generated here based on context."

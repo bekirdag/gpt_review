@@ -283,9 +283,9 @@ Launchers:
 
 Examples:
   software_review.sh instructions.txt /path/to/repo --cmd "pytest -q" --auto
-  software_review.sh instructions.txt /repo --api --model \${GPT_REVIEW_MODEL:-gpt-5-pro} --cmd "npm test --silent" --auto
+  software_review.sh instructions.txt /repo --api --model \${GPT_REVIEW_MODEL:-gpt-5-codex} --cmd "npm test --silent" --auto
 
 Tip:
-  Configure environment in .env (see .env.example). API mode requires OPENAI_API_KEY.
+  Configure environment in .env (see .env.example). API mode requires GPT_CODEX_API_KEY (legacy OPENAI_API_KEY also works).
 
 EOT
